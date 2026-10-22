@@ -75,8 +75,9 @@ IOReturn NativeAdrenoUserClient::open(uint32_t abi_version,NativeAdrenoVm *vm,
     vm_=vm;submit_=submit;ring_=ring;input_bits_=input_bits;output_bits_=output_bits;
     next_handle_=1;open_=true;
     queues_[0]={0,true};
-    /* Each client is a new GPU context for the CP: its first submission clears the BR/BV synchronization state. */
-    ring_->requestContextReset();
+    /* Each client is a new GPU context for the CP (useContext before each submission). */
+    static uint32_t contexts;
+    do context_=__atomic_add_fetch(&contexts,1,__ATOMIC_RELAXED); while(!context_);
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoUserClient::setScope(uint32_t queue_base,uint64_t window_start,uint64_t window_bytes)
@@ -334,6 +335,7 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
     }
     uint32_t fence=0;
     used_=true;
+    ring_->useContext(context_);
     const IOReturn status=submit_->submit(buffers,request->buffer_count,
         queue_base_+static_cast<uint32_t>(request->queue),&fence);
     if(status)return status;

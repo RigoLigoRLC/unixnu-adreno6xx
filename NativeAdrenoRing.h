@@ -52,6 +52,7 @@ class NativeAdrenoRing final {
     uint64_t ring_iova_=0,fence_iova_=0;
     uint32_t next_=0,rptr_shadow_=0,seqno_=0,completed_=0,submissions_=0;
     bool attached_=false,poisoned_=false,reset_pending_=false;
+    uint32_t context_=0;
     IOReturn poison();
     IOReturn readRptr(uint32_t *);
     IOReturn emitPrologue(uint32_t at,bool reset,uint32_t *end);
@@ -83,6 +84,11 @@ public:
     /* The next framed submission starts with the A7XX context entry of a6xx_set_pagetable() (BR/BV counters, on-chip
      * timestamps and resource table cleared between thread syncs); a new user client requests it, as Linux does per context. */
     void requestContextReset() {reset_pending_=true;}
+    /* The client whose submission comes next. A change of client is a context switch: as a6xx_set_pagetable() does whenever the
+     * submitting context differs from the ring's last one, the next framed prologue carries the context entry. Turnip's BR/BV barriers
+     * keep on-chip timestamps and counters that only that entry resets, so clients sharing the ring without it left one client's
+     * counters to the next, and the threads waited on each other for good (int-249..254: BR in a later IB than BV, no fault). */
+    void useContext(uint32_t context) {if(context!=context_) {context_=context;reset_pending_=true;}}
     /* Polls the CP-written timestamp after invalidating the fence page. Never
      * writes registers and never advances the ring. Timeout is not poison. */
     NativeAdrenoRingFence wait(uint32_t fence,const NativeAdrenoRingClock *,

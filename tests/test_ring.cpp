@@ -126,6 +126,19 @@ int main()
         CHECK(r.submitFramed(words,1,&end)==kIOReturnSuccess && end==2);
         CHECK(peer.writes.back().second==69+11+1+31 && op(ring[69+2])==0x46 && op(ring[69+7])==0x17 && ring[69+8]==3);
     }
+    /* A change of submitting client is a context switch: the next framed prologue carries the context entry, the same client's
+     * next one does not. */
+    {
+        reset();NativeAdrenoRing r;CHECK(attach(r)==kIOReturnSuccess);
+        const uint32_t words[1]={0x11111111};
+        uint32_t end=0;
+        r.useContext(1);
+        CHECK(r.submitFramed(words,1,&end)==kIOReturnSuccess && peer.writes.back().second==11+26+1+31);
+        fence[1]=1;r.useContext(1);
+        CHECK(r.submitFramed(words,1,&end)==kIOReturnSuccess && peer.writes.back().second==69+11+1+31);
+        fence[1]=2;r.useContext(2);
+        CHECK(r.submitFramed(words,1,&end)==kIOReturnSuccess && peer.writes.back().second==112+11+26+1+31);
+    }
     /* Wrap-around emission keeps packets contiguous modulo the ring. */
     {
         reset();NativeAdrenoRing r;CHECK(attach(r)==kIOReturnSuccess);

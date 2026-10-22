@@ -44,6 +44,7 @@ class NativeAdrenoUserClient final {
     /* Scope on the shared ring and GPU space: this client's queues are the submit object's queues [queue_base_, +MaxQueues), and with a
      * window (window_bytes_ nonzero) every mapping must lie inside [window_start_, +window_bytes_), which GetDeviceInfo reports as the VA. */
     uint32_t queue_base_=0;
+    uint32_t context_=0;   /* this client's GPU context for NativeAdrenoRing::useContext */
     /* A client owns a queue range once setScope() gave it one or it has submitted into the default one (a single client that never scopes owns
      * range 0). Before either, queue_base_ is only the default 0, which a scoped client may own, so a check of "this client's own range" would
      * test someone else's jobs. */
