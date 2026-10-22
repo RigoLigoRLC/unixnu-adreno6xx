@@ -427,6 +427,16 @@ IOReturn NativeAdrenoVm::peekWords(uint64_t iova,uint32_t *out,size_t count) con
     }
     return kIOReturnBadArgument;
 }
+IOReturn NativeAdrenoVm::faultState(uint32_t out[4]) const
+{
+    if(!out || !attached_ || poisoned_)return kIOReturnBadArgument;
+    uint64_t offset=0;
+    for(const auto &region:regions_)if(region.state && region.state->context_offset)offset=region.state->context_offset;
+    if(!offset)return kIOReturnNotReady;
+    static const uint32_t regs[4]={0x58,0x60,0x64,0x68};
+    for(unsigned i=0;i<4;++i)if(io_.read32(io_.cookie,(size_t)offset+regs[i],&out[i]))return kIOReturnIOError;
+    return kIOReturnSuccess;
+}
 IOReturn NativeAdrenoVm::holdJob(uint64_t handle)
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;

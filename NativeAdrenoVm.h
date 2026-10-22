@@ -115,6 +115,8 @@ public:
     IOReturn describe(uint64_t handle,uint64_t *iova,size_t *bytes,unsigned *permissions) const;
     /* Up to `count` dwords of a mapped kernel-owned BO at a GPU address (through the kernel's own mapping), for the board log. */
     IOReturn peekWords(uint64_t iova,uint32_t *out,size_t count) const;
+    /* The context bank's fault record for the board log: FSR, FAR (lo, hi) and FSYNR0. Reads only; never clears a fault. */
+    IOReturn faultState(uint32_t out[4]) const;
     /* Only a scheduler's actual successful GPU completion may call this.
      * A timeout, interrupt bit alone or CPU-written timestamp is insufficient. */
     IOReturn retireJobAfterCompletion(uint64_t handle);
