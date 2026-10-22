@@ -43,7 +43,7 @@ enum NativeAdrenoRingFence {
     NativeAdrenoRingFencePoisoned,
     NativeAdrenoRingFenceArgument
 };
-enum : uint32_t {NativeAdrenoRingStallWords = 20};   /* NativeAdrenoRing::stallState */
+enum : uint32_t {NativeAdrenoRingStallWords = 22};   /* NativeAdrenoRing::stallState */
 class NativeAdrenoRing final {
     NativeAdrenoRingIo io_{};
     NativeAdrenoRingCache cache_{};

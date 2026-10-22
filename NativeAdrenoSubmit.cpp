@@ -21,9 +21,18 @@ extern "C" {volatile uint32_t native_adreno_wc_audit[6];}
 extern "C" {volatile uint32_t native_adreno_fence_wait[8];}
 /* The CP's state once a fence stopped advancing (NativeAdrenoRing::stallState): [0] the fence, [1] the timed-out waits of it so far, then
  * the ring's words. Taken at the 10th and again at the 1000th timed-out wait of the fence that is the next to complete. native_adreno_stall_mem
- * holds, from the same moment, the SMMU context's FSR, FAR (lo, hi) and FSYNR0, then 16 words of the BR and of the BV IB1 from 12 words
- * before the fetch address (the CP prefetches, so the waiting packet lies before it). */
-extern "C" {volatile uint32_t native_adreno_stall[2+NativeAdrenoRingStallWords];volatile uint32_t native_adreno_stall_mem[4+32];}
+ * holds, from the same moment, the SMMU context's FSR, FAR (lo, hi) and FSYNR0, then 16 words each of the BR IB1, the BV IB1 and the BV IB2,
+ * each followed by how many words before its fetch address the 16 start (the CP prefetches, so the waiting packet lies before it). */
+extern "C" {volatile uint32_t native_adreno_stall[2+NativeAdrenoRingStallWords];volatile uint32_t native_adreno_stall_mem[4+3*17];}
+/* 16 words ending 4 after the fetch address, or from the start of its buffer when it is closer; out[16] says how many lie before it. */
+static void peekFetch(const NativeAdrenoVm *vm,uint64_t fetch,volatile uint32_t *slot)
+{
+    uint32_t words[16]={},before=12;
+    while(before && vm->peekWords(fetch-4*before,words,16))before-=4;
+    if(!before && vm->peekWords(fetch,words,16))before=0xff;
+    for(unsigned i=0;i<16;++i)slot[i]=words[i];
+    slot[16]=before;
+}
 static uint32_t stall_fence,stall_timeouts;
 /* The IBs of the last submissions: [slot] fence, iova low/high, bytes, then the first 28 dwords of the first IB (read as the kernel maps it). */
 extern "C" {volatile uint32_t native_adreno_ib_log[4][4+28];volatile uint32_t native_adreno_ib_log_count;}
@@ -219,13 +228,13 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed)
     const uint32_t next=observed+1;   /* the fence the CP is working on */
     if(next!=stall_fence) {stall_fence=next;stall_timeouts=0;}
     if(++stall_timeouts!=10 && stall_timeouts!=1000)return;
-    uint32_t words[NativeAdrenoRingStallWords]={},mem[4+32]={};
+    uint32_t words[NativeAdrenoRingStallWords]={},fault[4]={};
     if(ring_->stallState(words))return;
-    (void)vm_->faultState(mem);
-    const uint64_t br=((uint64_t)words[11]<<32|words[10])-48,bv=(uint64_t)words[17]-48;   /* BV IB1 base: low word only */
-    (void)vm_->peekWords(br,&mem[4],16);
-    (void)vm_->peekWords(((uint64_t)words[11]<<32)|bv,&mem[20],16);
-    for(uint32_t i=0;i<4+32;++i)native_adreno_stall_mem[i]=mem[i];
+    (void)vm_->faultState(fault);
+    for(uint32_t i=0;i<4;++i)native_adreno_stall_mem[i]=fault[i];
+    peekFetch(vm_,(uint64_t)words[11]<<32|words[10],&native_adreno_stall_mem[4]);
+    peekFetch(vm_,(uint64_t)words[11]<<32|words[17],&native_adreno_stall_mem[4+17]);   /* BV IB1 base: the low word only */
+    peekFetch(vm_,(uint64_t)words[21]<<32|words[20],&native_adreno_stall_mem[4+34]);
     for(uint32_t i=0;i<NativeAdrenoRingStallWords;++i)native_adreno_stall[2+i]=words[i];
     native_adreno_stall[1]=stall_timeouts;
     native_adreno_stall[0]=next;
