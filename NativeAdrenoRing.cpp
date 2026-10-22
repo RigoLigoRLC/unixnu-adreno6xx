@@ -78,6 +78,16 @@ IOReturn NativeAdrenoRing::readRptr(uint32_t *value)
     if(rptr>=ring_bytes_/4)return poison(); /* unusable read pointer */
     *value=rptr;rptr_shadow_=rptr;return kIOReturnSuccess;
 }
+IOReturn NativeAdrenoRing::stallState(uint32_t *out)
+{
+    static const uint32_t regs[NativeAdrenoRingStallWords]={
+        0x0210,0x0211,0x0212,0x0213,0x0201,0x0821,0x0825,0x0824,RingRptr,RingWptr,
+        0x0928,0x0929,0x092a,0x092b,0x092c,0x092d,0x0a66,0x0a6d,0x0a70,0x0a74};
+    if(!out)return kIOReturnBadArgument;
+    for(uint32_t i=0;i<NativeAdrenoRingStallWords;++i)
+        if(io_.read32(io_.cookie,regs[i],&out[i]))return poison();
+    return kIOReturnSuccess;
+}
 /* Packs one TYPE7 packet into words; returns the next free index or 0 when the header cannot be built. */
 static size_t packet(uint32_t *words,size_t at,uint32_t opcode,const uint32_t *payload,uint32_t count)
 {

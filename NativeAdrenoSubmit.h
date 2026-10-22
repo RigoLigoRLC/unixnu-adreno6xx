@@ -40,6 +40,7 @@ class NativeAdrenoSubmit final {
     NativeAdrenoVm *vm_=nullptr;
     NativeAdrenoRing *ring_=nullptr;
     NativeAdrenoSubmitStats stats_{};
+    void noteStall(uint32_t observed);   /* the CP's state for a fence that stopped advancing (native_adreno_stall) */
     bool attached_=false,poisoned_=false;
     uint32_t audit_tick_=0;   /* submissions since attach; every eighth one audits its IB lines */
     Job *find(uint32_t fence);

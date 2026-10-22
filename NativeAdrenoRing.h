@@ -43,6 +43,7 @@ enum NativeAdrenoRingFence {
     NativeAdrenoRingFencePoisoned,
     NativeAdrenoRingFenceArgument
 };
+enum : uint32_t {NativeAdrenoRingStallWords = 20};   /* NativeAdrenoRing::stallState */
 class NativeAdrenoRing final {
     NativeAdrenoRingIo io_{};
     NativeAdrenoRingCache cache_{};
@@ -91,6 +92,11 @@ public:
      * this ring issued are accepted. Never writes a register. */
     NativeAdrenoRingFence observeFence(uint32_t fence,const NativeAdrenoRingClock *,
         uint32_t timeout_us,uint32_t *observed);
+    /* Reads the CP's state for a fence that stopped advancing into out[NativeAdrenoRingStallWords]: RBBM_STATUS..STATUS3,
+     * RBBM_INT_0_STATUS, CP_HW_FAULT, CP_STATUS_1, CP_PROTECT_STATUS, CP_RB_RPTR, CP_RB_WPTR, CP_IB1_BASE (lo, hi),
+     * CP_IB1_REM_SIZE, CP_IB2_BASE (lo, hi), CP_IB2_REM_SIZE, CP_BV_RB_RPTR, CP_BV_IB1_BASE lo, CP_BV_IB1_REM_SIZE,
+     * CP_BV_IB2_REM_SIZE. Never writes a register; a failed read is poison. */
+    IOReturn stallState(uint32_t *out);
     bool poisoned() const {return poisoned_;}
     uint32_t outstanding() const {return seqno_-completed_;}
     uint32_t lastSubmitted() const {return seqno_;}      /* the newest fence number handed out */
