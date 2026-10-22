@@ -78,6 +78,16 @@ IOReturn NativeAdrenoRing::readRptr(uint32_t *value)
     if(rptr>=ring_bytes_/4)return poison(); /* unusable read pointer */
     *value=rptr;rptr_shadow_=rptr;return kIOReturnSuccess;
 }
+IOReturn NativeAdrenoRing::ibBefore(uint32_t rptr,uint64_t *iova,uint32_t *dwords) const
+{
+    if(!ring_ || !iova || !dwords)return kIOReturnBadArgument;
+    const uint32_t mask=(uint32_t)(ring_bytes_/4-1);
+    const uint32_t header=ring_[(rptr-4)&mask];
+    if((header>>28)!=7u || ((header>>16)&0x7fu)!=0x3fu || (header&0x3fffu)!=3)return kIOReturnUnsupported;
+    *iova=(uint64_t)ring_[(rptr-2)&mask]<<32|ring_[(rptr-3)&mask];
+    *dwords=ring_[(rptr-1)&mask]&0xfffffu;
+    return kIOReturnSuccess;
+}
 IOReturn NativeAdrenoRing::stallState(uint32_t *out)
 {
     static const uint32_t regs[NativeAdrenoRingStallWords]={

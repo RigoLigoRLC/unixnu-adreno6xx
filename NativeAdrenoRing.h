@@ -97,6 +97,9 @@ public:
      * CP_IB1_REM_SIZE, CP_IB2_BASE (lo, hi), CP_IB2_REM_SIZE, CP_BV_RB_RPTR, CP_BV_IB1_BASE lo, CP_BV_IB1_REM_SIZE,
      * CP_BV_IB2_REM_SIZE. Never writes a register; a failed read is poison. */
     IOReturn stallState(uint32_t *out);
+    /* The CP_INDIRECT_BUFFER packet that ends just before ring index rptr (what a thread whose read pointer is rptr executes): its GPU
+     * address and size in dwords. kIOReturnUnsupported when the words there are not that packet. */
+    IOReturn ibBefore(uint32_t rptr,uint64_t *iova,uint32_t *dwords) const;
     bool poisoned() const {return poisoned_;}
     uint32_t outstanding() const {return seqno_-completed_;}
     uint32_t lastSubmitted() const {return seqno_;}      /* the newest fence number handed out */
