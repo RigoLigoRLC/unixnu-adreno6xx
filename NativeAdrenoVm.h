@@ -115,8 +115,14 @@ public:
     IOReturn describe(uint64_t handle,uint64_t *iova,size_t *bytes,unsigned *permissions) const;
     /* Up to `count` dwords of a mapped kernel-owned BO at a GPU address (through the kernel's own mapping), for the board log. */
     IOReturn peekWords(uint64_t iova,uint32_t *out,size_t count) const;
+    /* The same after cleaning and invalidating the CPU cache lines over the words: a BO zeroed through the kernel's cacheable mapping keeps
+     * clean lines of those zeros there, which a plain read returns instead of what the client wrote through its own mapping since. */
+    IOReturn peekWordsUncached(uint64_t iova,uint32_t *out,size_t count) const;
     /* The context bank's fault record for the board log: FSR, FAR (lo, hi) and FSYNR0. Reads only; never clears a fault. */
     IOReturn faultState(uint32_t out[4]) const;
+    /* Map handles count up and are never reused, so they order mappings in time: the next one, and the one over a GPU address (0: none). */
+    uint64_t nextHandle() const {return next_handle_;}
+    uint64_t handleAt(uint64_t iova) const;
     /* Only a scheduler's actual successful GPU completion may call this.
      * A timeout, interrupt bit alone or CPU-written timestamp is insufficient. */
     IOReturn retireJobAfterCompletion(uint64_t handle);

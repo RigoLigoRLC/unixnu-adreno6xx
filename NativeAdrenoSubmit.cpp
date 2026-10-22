@@ -23,14 +23,16 @@ extern "C" {volatile uint32_t native_adreno_fence_wait[8];}
  * the ring's words. Taken at the 10th and again at the 1000th timed-out wait of the fence that is the next to complete. native_adreno_stall_mem
  * holds, from the same moment, the SMMU context's FSR, FAR (lo, hi) and FSYNR0, then for the BR IB1, the BV IB1 and the BV IB2 17 words: the
  * dword index in the IB where the 16 words that follow start (the IB1s are found from the ring packet before each read pointer, so the index
- * counts from the IB's start; for the BV IB2 only the fetch address is known and the index is 0xffff0000 + words before it), then the words. */
-extern "C" {volatile uint32_t native_adreno_stall[2+NativeAdrenoRingStallWords];volatile uint32_t native_adreno_stall_mem[4+3*17];}
+ * counts from the IB's start; for the BV IB2 only the fetch address is known and the index is 0xffff0000 + words before it), then the words.
+ * The last 4: the map handle that was next when the stalled job was submitted, then the handles of the mappings under the BR IB1, the BV IB1
+ * and the BV IB2 (0: unmapped). A handle at or above the first was mapped after the submission: its memory was freed and reused under the GPU. */
+extern "C" {volatile uint32_t native_adreno_stall[2+NativeAdrenoRingStallWords];volatile uint32_t native_adreno_stall_mem[4+3*17+4];}
 /* 16 words of the IB at start, from 12 dwords before the dword the thread has reached (size minus what remains). */
 static void peekIb(const NativeAdrenoVm *vm,uint64_t start,uint32_t size,uint32_t remaining,volatile uint32_t *slot)
 {
     uint32_t words[16]={};
     const uint32_t reached=remaining<=size?size-remaining:0,first=reached>12?reached-12:0;
-    if(vm->peekWords(start+4ull*first,words,16))for(unsigned i=0;i<16;++i)words[i]=0xdeadbeef;
+    if(vm->peekWordsUncached(start+4ull*first,words,16))for(unsigned i=0;i<16;++i)words[i]=0xdeadbeef;
     slot[0]=first;
     for(unsigned i=0;i<16;++i)slot[1+i]=words[i];
 }
@@ -38,8 +40,8 @@ static void peekIb(const NativeAdrenoVm *vm,uint64_t start,uint32_t size,uint32_
 static void peekFetch(const NativeAdrenoVm *vm,uint64_t fetch,volatile uint32_t *slot)
 {
     uint32_t words[16]={},before=12;
-    while(before && vm->peekWords(fetch-4*before,words,16))before-=4;
-    if(!before && vm->peekWords(fetch,words,16))for(unsigned i=0;i<16;++i)words[i]=0xdeadbeef;
+    while(before && vm->peekWordsUncached(fetch-4*before,words,16))before-=4;
+    if(!before && vm->peekWordsUncached(fetch,words,16))for(unsigned i=0;i<16;++i)words[i]=0xdeadbeef;
     slot[0]=0xffff0000u+before;
     for(unsigned i=0;i<16;++i)slot[1+i]=words[i];
 }
@@ -209,14 +211,14 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
         if(ring_->poisoned()) {
             *job=Job{};++stats_.poisoned_jobs;
             for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
-            job->count=handle_count;job->queue=queue;job->active=true;
+            job->count=handle_count;job->queue=queue;job->active=true;job->vm_next=vm_->nextHandle();
             return poison();
         }
         while(handle_count) {vm_->retireJobAfterCompletion(handles[--handle_count]);++stats_.references_retired;}
         return status;
     }
     for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
-    job->count=handle_count;job->fence=value;job->queue=queue;job->active=true;
+    job->count=handle_count;job->fence=value;job->queue=queue;job->active=true;job->vm_next=vm_->nextHandle();
     ++stats_.submissions;
     if(outstanding()>stats_.peak_jobs)stats_.peak_jobs=outstanding();
     *fence=value;
@@ -248,6 +250,16 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed)
     if(!ring_->ibBefore(words[16],&ib,&size))peekIb(vm_,ib,size,words[18],&native_adreno_stall_mem[4+17]);
     else peekFetch(vm_,(uint64_t)words[11]<<32|words[17],&native_adreno_stall_mem[4+17]);   /* BV IB1 base: the low word only */
     peekFetch(vm_,(uint64_t)words[21]<<32|words[20],&native_adreno_stall_mem[4+34]);
+    {
+        const Job *job=find(next);
+        uint64_t brIb=(uint64_t)words[11]<<32|words[10],bvIb=(uint64_t)words[11]<<32|words[17];
+        if(!ring_->ibBefore(words[8],&ib,&size))brIb=ib;
+        if(!ring_->ibBefore(words[16],&ib,&size))bvIb=ib;
+        native_adreno_stall_mem[55]=job?(uint32_t)job->vm_next:0;
+        native_adreno_stall_mem[56]=(uint32_t)vm_->handleAt(brIb);
+        native_adreno_stall_mem[57]=(uint32_t)vm_->handleAt(bvIb);
+        native_adreno_stall_mem[58]=(uint32_t)vm_->handleAt((uint64_t)words[21]<<32|words[20]);
+    }
     for(uint32_t i=0;i<NativeAdrenoRingStallWords;++i)native_adreno_stall[2+i]=words[i];
     native_adreno_stall[1]=stall_timeouts;
     native_adreno_stall[0]=next;

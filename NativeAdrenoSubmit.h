@@ -36,6 +36,7 @@ class NativeAdrenoSubmit final {
         uint64_t handles[16]{};
         uint32_t queue=0;
         bool active=false;
+        uint64_t vm_next=0;   /* NativeAdrenoVm::nextHandle() at submission: a mapping with a handle from it on came later */
     } jobs_[8];
     NativeAdrenoVm *vm_=nullptr;
     NativeAdrenoRing *ring_=nullptr;

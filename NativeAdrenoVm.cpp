@@ -427,6 +427,30 @@ IOReturn NativeAdrenoVm::peekWords(uint64_t iova,uint32_t *out,size_t count) con
     }
     return kIOReturnBadArgument;
 }
+IOReturn NativeAdrenoVm::peekWordsUncached(uint64_t iova,uint32_t *out,size_t count) const
+{
+    if(!out || !attached_ || poisoned_ || !count)return kIOReturnBadArgument;
+    for(size_t i=0;i<NativeAdrenoVmMaxObjects;++i) {
+        const Mapping &m=mappings_[i];
+        if(!m.memory || !m.memory->mapping() || iova<m.iova || iova-m.iova>=m.memory->bytes())continue;
+        const size_t offset=(size_t)(iova-m.iova),first=offset&~(size_t)4095;
+        const size_t end=offset+4*count<m.memory->bytes()?offset+4*count:m.memory->bytes();
+        const size_t bytes=((end+4095)&~(size_t)4095)-first;
+        IOReturn status=NativeAdrenoMaintainOwnedPages(static_cast<unsigned char *>(m.memory->mapping())+first,bytes,NativeAdrenoCleanInvalidate);
+        if(status)return status;
+        return peekWords(iova,out,count);
+    }
+    return kIOReturnBadArgument;
+}
+uint64_t NativeAdrenoVm::handleAt(uint64_t iova) const
+{
+    if(!attached_ || !mappings_)return 0;
+    for(size_t i=0;i<NativeAdrenoVmMaxObjects;++i) {
+        const Mapping &m=mappings_[i];
+        if(m.memory && iova>=m.iova && iova-m.iova<m.memory->bytes())return m.handle;
+    }
+    return 0;
+}
 IOReturn NativeAdrenoVm::faultState(uint32_t out[4]) const
 {
     if(!out || !attached_ || poisoned_)return kIOReturnBadArgument;
