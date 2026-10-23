@@ -103,6 +103,12 @@ public:
      * CP_IB1_REM_SIZE, CP_IB2_BASE (lo, hi), CP_IB2_REM_SIZE, CP_BV_RB_RPTR, CP_BV_IB1_BASE lo, CP_BV_IB1_REM_SIZE,
      * CP_BV_IB2_REM_SIZE. Never writes a register; a failed read is poison. */
     IOReturn stallState(uint32_t *out);
+    /* Writes CP_RB_WPTR again with the value already published: for a CP that went idle with work in the ring (a lost write pointer
+     * notification); harmless when the CP already saw it. */
+    IOReturn kick();
+    /* a6xx_bus_clear_pending_transactions without the GX side: GBIF client requests halted, then all AXI requests, each until its
+     * acknowledge or a bounded spin, then the halt cleared. ack[0] and ack[1] are the acknowledge words (bit 0 client, bit 1 arbiter). */
+    IOReturn drainBus(uint32_t *ack);
     /* The CP_INDIRECT_BUFFER packet that ends just before ring index rptr (what a thread whose read pointer is rptr executes): its GPU
      * address and size in dwords. kIOReturnUnsupported when the words there are not that packet. */
     IOReturn ibBefore(uint32_t rptr,uint64_t *iova,uint32_t *dwords) const;

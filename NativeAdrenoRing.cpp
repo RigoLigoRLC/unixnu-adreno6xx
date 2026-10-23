@@ -98,6 +98,24 @@ IOReturn NativeAdrenoRing::stallState(uint32_t *out)
         if(io_.read32(io_.cookie,regs[i],&out[i]))return poison();
     return kIOReturnSuccess;
 }
+IOReturn NativeAdrenoRing::kick()
+{
+    if(!attached_ || poisoned_)return kIOReturnNotReady;
+    if(io_.barrier(io_.cookie) || io_.write32(io_.cookie,RingWptr,next_))return poison();
+    return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoRing::drainBus(uint32_t *ack)
+{
+    enum : uint32_t {GbifHalt = 0x3c45, GbifHaltAck = 0x3c46, ClientHalt = 1u, ArbHalt = 2u};
+    if(!attached_ || poisoned_ || !ack)return kIOReturnNotReady;
+    ack[0]=ack[1]=0;
+    if(io_.write32(io_.cookie,GbifHalt,ClientHalt))return poison();
+    for(unsigned i=0;i<20000 && !(ack[0]&ClientHalt);++i)if(io_.read32(io_.cookie,GbifHaltAck,&ack[0]))return poison();
+    if(io_.write32(io_.cookie,GbifHalt,ClientHalt|ArbHalt))return poison();
+    for(unsigned i=0;i<20000 && !(ack[1]&ArbHalt);++i)if(io_.read32(io_.cookie,GbifHaltAck,&ack[1]))return poison();
+    if(io_.write32(io_.cookie,GbifHalt,0))return poison();
+    return kIOReturnSuccess;
+}
 /* Packs one TYPE7 packet into words; returns the next free index or 0 when the header cannot be built. */
 static size_t packet(uint32_t *words,size_t at,uint32_t opcode,const uint32_t *payload,uint32_t count)
 {

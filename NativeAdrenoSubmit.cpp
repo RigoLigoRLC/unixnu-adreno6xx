@@ -46,6 +46,10 @@ static void peekFetch(const NativeAdrenoVm *vm,uint64_t fetch,volatile uint32_t 
     for(unsigned i=0;i<16;++i)slot[1+i]=words[i];
 }
 static uint32_t stall_fence,stall_timeouts;
+/* What the stall handler tried: [0] attempts, [1] the fence of the last attempt, [2] attempts after which that fence completed, [3] the
+ * timed-out waits that fence had seen when it did. */
+/* [4] bus drains, [5] client halt acknowledge, [6] arbiter halt acknowledge, [7] the fence of the last drain, [8] drains after which that fence completed */
+extern "C" {volatile uint32_t native_adreno_unstick[9];}
 /* The IBs of the last submissions: [slot] fence, iova low/high, bytes, then the first 28 dwords of the first IB (read as the kernel maps it). */
 extern "C" {volatile uint32_t native_adreno_ib_log[4][4+28];volatile uint32_t native_adreno_ib_log_count;}
 IOReturn NativeAdrenoSubmit::poison()
@@ -238,7 +242,26 @@ IOReturn NativeAdrenoSubmit::observeFence(uint32_t fence,const NativeAdrenoRingC
 void NativeAdrenoSubmit::noteStall(uint32_t observed)
 {
     const uint32_t next=observed+1;   /* the fence the CP is working on */
-    if(next!=stall_fence) {stall_fence=next;stall_timeouts=0;}
+    if(next!=stall_fence) {
+        if(native_adreno_unstick[1]==stall_fence && stall_timeouts>100) {
+            native_adreno_unstick[2]=native_adreno_unstick[2]+1;native_adreno_unstick[3]=stall_timeouts;
+        }
+        if(native_adreno_unstick[7]==stall_fence && stall_timeouts>400)native_adreno_unstick[8]=native_adreno_unstick[8]+1;
+        stall_fence=next;stall_timeouts=0;
+    }
+    /* Still stopped well after that: the way a6xx drains the bus before a reset, which lets a write that was never acknowledged end. */
+    if(stall_timeouts+1==400) {
+        uint32_t ack[2]={};
+        native_adreno_unstick[4]=native_adreno_unstick[4]+1;native_adreno_unstick[7]=stall_fence;
+        (void)ring_->drainBus(ack);
+        native_adreno_unstick[5]=ack[0];native_adreno_unstick[6]=ack[1];
+    }
+    /* A fence that stops while the CP sits idle with work in the ring: the translations are dropped and the write pointer is given
+     * again (int-317 hung with RBBM idle, RPTR short of WPTR, both threads at the same cache clean). */
+    if(stall_timeouts+1==100) {
+        native_adreno_unstick[0]=native_adreno_unstick[0]+1;native_adreno_unstick[1]=stall_fence;
+        (void)vm_->invalidateTlb();(void)ring_->kick();
+    }
     if(++stall_timeouts!=10 && stall_timeouts!=1000)return;
     uint32_t words[NativeAdrenoRingStallWords]={},fault[4]={};
     if(ring_->stallState(words))return;
