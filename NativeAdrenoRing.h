@@ -23,6 +23,10 @@ struct NativeAdrenoRingIo {
     int (*write32)(void *,uint32_t reg,uint32_t value);
     int (*read32)(void *,uint32_t reg,uint32_t *value);
     int (*barrier)(void *);
+    /* Optional: the GMU's AHB fence status (bit 0: a write to a fenced GPU register was dropped while the GPU power domain was not
+     * ready); with clear set, also clears it. Without it, WPTR writes are not checked. */
+    void *fence_cookie;
+    int (*fence_status)(void *,int clear,uint32_t *status);
 };
 struct NativeAdrenoRingCache {
     void *cookie;
@@ -54,6 +58,7 @@ class NativeAdrenoRing final {
     bool attached_=false,poisoned_=false,reset_pending_=false;
     uint32_t context_=0;
     IOReturn poison();
+    IOReturn writeWptr(uint32_t value);
     IOReturn readRptr(uint32_t *);
     IOReturn emitPrologue(uint32_t at,bool reset,uint32_t *end);
     IOReturn emitFence(uint32_t at,uint32_t seqno,uint32_t *end);

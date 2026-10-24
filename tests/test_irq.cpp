@@ -25,7 +25,7 @@ static int read32(void *c,uint32_t reg,uint32_t *v)
     *v=peer.regs[reg];return 0;
 }
 static int barrier(void *c){CHECK(c==&peer);++peer.barriers;return peer.barriers==peer.fail_barrier;}
-static NativeAdrenoRingIo io{&peer,write32,read32,barrier};
+static NativeAdrenoRingIo io{&peer,write32,read32,barrier,nullptr,nullptr};
 static void reset(void)
 {
     peer=Peer{};peer.cleared=0xffffffff;

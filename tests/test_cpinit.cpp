@@ -26,7 +26,7 @@ static int publish(void *c,const volatile uint32_t *w,size_t bytes)
 {CHECK(c==&peer && w && bytes==32768);++peer.publish;return peer.publish==peer.fail_publish;}
 static int acquire(void *c,volatile uint32_t *w,size_t bytes)
 {CHECK(c==&peer && w && bytes==4096);++peer.acquire;return 0;}
-static NativeAdrenoRingIo io{&peer,write32,read32,barrier};
+static NativeAdrenoRingIo io{&peer,write32,read32,barrier,nullptr,nullptr};
 static NativeAdrenoRingCache cache{&peer,publish,acquire};
 static NativeAdrenoRingClock clock_{&peer,nullptr,nullptr};
 static void reset(void)

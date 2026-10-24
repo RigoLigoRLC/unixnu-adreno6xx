@@ -47,7 +47,19 @@ static int acquire(void *cookie,volatile uint32_t *words,size_t bytes)
 static uint64_t now(void *cookie){CHECK(cookie==&peer);return clock_us;}
 static int idle(void *cookie){CHECK(cookie==&peer);clock_us+=1000;return 0;}
 static uint32_t ring[8192];static uint32_t fence[1024];
-static NativeAdrenoRingIo io{&peer,write32,read32,barrier};
+static NativeAdrenoRingIo io{&peer,write32,read32,barrier,nullptr,nullptr};
+/* The GMU's AHB fence: the next `dropped` WPTR writes are flagged as dropped; a clear resets the flag. */
+static unsigned dropped=0,fence_reads=0,fence_clears=0;static bool flagged=false;
+static int fence_status(void *cookie,int clear,uint32_t *status)
+{
+    CHECK(cookie==&peer && status);
+    if(clear){++fence_clears;flagged=false;return 0;}
+    ++fence_reads;
+    if(!flagged && dropped){--dropped;flagged=true;}
+    *status=flagged?1u:0u;
+    if(flagged && !dropped)flagged=false;   /* the next read after the last drop sees the write land */
+    return 0;
+}
 static NativeAdrenoRingCache cache{&peer,publish,acquire};
 static NativeAdrenoRingClock clock_{&peer,now,idle};
 static void reset(void)
@@ -138,6 +150,19 @@ int main()
         CHECK(r.submitFramed(words,1,&end)==kIOReturnSuccess && peer.writes.back().second==69+11+1+31);
         fence[1]=2;r.useContext(2);
         CHECK(r.submitFramed(words,1,&end)==kIOReturnSuccess && peer.writes.back().second==112+11+26+1+31);
+    }
+    /* WPTR is a fenced write: a dropped write is given again until the GMU reports it landed. */
+    {
+        reset();NativeAdrenoRing r;
+        NativeAdrenoRingIo fenced=io;fenced.fence_cookie=&peer;fenced.fence_status=fence_status;
+        CHECK(r.attach(&fenced,&cache,ring,sizeof(ring),0x100000,fence,sizeof(fence),0x108000)==kIOReturnSuccess);
+        const uint32_t one[1]={0xabc};uint32_t end=0;
+        size_t before=0;for(auto &w:peer.writes)before+=w.first==0x0807;
+        dropped=3;fence_reads=0;
+        CHECK(r.submit(one,1,&end)==kIOReturnSuccess);
+        size_t after=0;for(auto &w:peer.writes)after+=w.first==0x0807;
+        CHECK(after-before==4 && fence_clears==3 && fence_reads==4);   /* the first write and three repeats */
+        dropped=0;CHECK(r.kick()==kIOReturnSuccess);
     }
     /* Wrap-around emission keeps packets contiguous modulo the ring. */
     {

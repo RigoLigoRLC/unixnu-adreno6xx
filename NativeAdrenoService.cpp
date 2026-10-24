@@ -52,6 +52,10 @@ extern "C" {volatile uint64_t native_adreno_fence_phys=0;}
 class NativeAdrenoGpuClient;
 static IOUserClient *createGpuClient(task_t,void *,UInt32,OSDictionary *,NativeAdrenoUserClient *);
 
+struct NativeAdrenoGpuWindow {
+    volatile uint8_t *base;
+    size_t bytes;
+};
 class NativeAdrenoGpuService : public IOService {
     OSDeclareDefaultStructors(NativeAdrenoGpuService)
     OSSharedPtr<IOMemoryMap> maps_[2];
@@ -73,7 +77,9 @@ class NativeAdrenoGpuService : public IOService {
     bool core_ready_=false;
     struct RingCache {NativeAdrenoMemory *ring;NativeAdrenoMemory *fence;};
     RingCache ring_cache_{};
+    NativeAdrenoGpuWindow ring_window_{};   /* the ring keeps a pointer to it: it must outlive start() */
     static int gpu_read32(void *,uint32_t,uint32_t *);
+    static int gmu_fence_status(void *,int clear,uint32_t *status);
     static int gpu_write32(void *,uint32_t,uint32_t);
     static int gpu_barrier(void *);
     static int ring_publish(void *,const volatile uint32_t *,size_t);
@@ -141,10 +147,6 @@ static int smmu_barrier(void *cookie)
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     return 0;
 }
-struct NativeAdrenoGpuWindow {
-    volatile uint8_t *base;
-    size_t bytes;
-};
 int NativeAdrenoGpuService::gpu_read32(void *cookie,uint32_t reg,uint32_t *value)
 {
     NativeAdrenoGpuWindow *window=static_cast<NativeAdrenoGpuWindow *>(cookie);
@@ -160,6 +162,15 @@ int NativeAdrenoGpuService::gpu_write32(void *cookie,uint32_t reg,uint32_t value
     if(!window || !window->base || at+4>window->bytes)return 1;
     *reinterpret_cast<volatile uint32_t *>(window->base+at)=value;
     return 0;
+}
+/* GMU_AHB_FENCE_STATUS (0x23b13) and GMU_AHB_FENCE_STATUS_CLR (0x23b14) in the GMU core window, whose byte offset is the GPU word
+ * offset times 4 minus SHENG_GMU_CORE_GPU_DELTA (0x6a000). */
+int NativeAdrenoGpuService::gmu_fence_status(void *cookie,int clear,uint32_t *status)
+{
+    const ShengGmuIo *io=static_cast<const ShengGmuIo *>(cookie);
+    if(!io || !io->read32 || !status)return 1;
+    if(clear)return io->write32(io->cookie,ShengGmuCore,0x23b14u*4u-0x6a000u,0x7u);
+    return io->read32(io->cookie,ShengGmuCore,0x23b13u*4u-0x6a000u,status);
 }
 int NativeAdrenoGpuService::gpu_barrier(void *cookie)
 {
@@ -431,10 +442,11 @@ bool NativeAdrenoGpuService::start(IOService *provider)
                                         if(ring_status) {
                                             IOLog("NativeAdreno: ring/SQE setup stopped at 0x%x\n",ring_status);
                                         } else {
-                                            NativeAdrenoGpuWindow gpu_window={
+                                            ring_window_={
                                                 reinterpret_cast<volatile uint8_t *>(maps_[0]->getVirtualAddress()),
                                                 static_cast<size_t>(windows[0].bytes)};
-                                            NativeAdrenoRingIo ring_io{&gpu_window,gpu_write32,gpu_read32,gpu_barrier};
+                                            NativeAdrenoRingIo ring_io{&ring_window_,gpu_write32,gpu_read32,gpu_barrier,
+                                                gmu_io_bound_?&gmu_io_:nullptr,gmu_io_bound_?gmu_fence_status:nullptr};
                                             ring_cache_={&ring_mem_,&fence_mem_};
                                             NativeAdrenoRingCache cache{&ring_cache_,ring_publish,fence_acquire};
                                             ring_status=ring_.attach(&ring_io,&cache,ring_mem_.mapping(),
@@ -456,7 +468,7 @@ bool NativeAdrenoGpuService::start(IOService *provider)
                                                 NativeAdrenoGpuWindow cp_window={
                                                     reinterpret_cast<volatile uint8_t *>(maps_[0]->getVirtualAddress()),
                                                     static_cast<size_t>(windows[0].bytes)};
-                                                NativeAdrenoRingIo cp_io{&cp_window,gpu_write32,gpu_read32,gpu_barrier};
+                                                NativeAdrenoRingIo cp_io{&cp_window,gpu_write32,gpu_read32,gpu_barrier,nullptr,nullptr};
                                                 ring_status=pwrup_mem_.allocate(0x1000,40,true,0x1000);
                                                 if(!ring_status)ring_status=vm_.map(&pwrup_mem_,1,
                                                     pwrup_iova,3,0,2,&pwrup_map_);

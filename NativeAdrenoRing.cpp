@@ -71,6 +71,33 @@ IOReturn NativeAdrenoRing::poison()
 {
     poisoned_=true;return kIOReturnIOError;
 }
+/* WPTR as a fenced register write: the GMU drops a write to CP_RB_WPTR that arrives while the GPU domain is not ready and flags it in
+ * its AHB fence status; the write is then given again, at most 200 times. i491: a fence stalled on almost every submission until the
+ * stall handler wrote WPTR again (5361 of 5397). [0] writes, [1] writes that were dropped at least once, [2] repeated writes, [3] writes
+ * still dropped after the last try. */
+extern "C" {volatile uint32_t native_adreno_wptr_fence[4];}
+IOReturn NativeAdrenoRing::writeWptr(uint32_t value)
+{
+    native_adreno_wptr_fence[0]=native_adreno_wptr_fence[0]+1;
+    if(io_.write32(io_.cookie,RingWptr,value))return poison();
+    if(!io_.fence_status)return kIOReturnSuccess;
+    uint32_t status=0;
+    for(unsigned tries=0;;++tries) {
+        if(io_.barrier(io_.cookie) || io_.fence_status(io_.fence_cookie,0,&status))return poison();
+        if(!(status&1u)) {
+            if(tries)native_adreno_wptr_fence[1]=native_adreno_wptr_fence[1]+1;
+            return kIOReturnSuccess;
+        }
+        if(tries==200) {
+            native_adreno_wptr_fence[3]=native_adreno_wptr_fence[3]+1;
+            (void)io_.fence_status(io_.fence_cookie,1,&status);
+            return kIOReturnSuccess;   /* the stall handler gives WPTR again later */
+        }
+        native_adreno_wptr_fence[2]=native_adreno_wptr_fence[2]+1;
+        (void)io_.fence_status(io_.fence_cookie,1,&status);
+        if(io_.write32(io_.cookie,RingWptr,value))return poison();
+    }
+}
 IOReturn NativeAdrenoRing::readRptr(uint32_t *value)
 {
     uint32_t rptr=0;
@@ -101,8 +128,8 @@ IOReturn NativeAdrenoRing::stallState(uint32_t *out)
 IOReturn NativeAdrenoRing::kick()
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
-    if(io_.barrier(io_.cookie) || io_.write32(io_.cookie,RingWptr,next_))return poison();
-    return kIOReturnSuccess;
+    if(io_.barrier(io_.cookie))return poison();
+    return writeWptr(next_);
 }
 IOReturn NativeAdrenoRing::drainBus(uint32_t *ack)
 {
@@ -280,7 +307,7 @@ IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,u
     }
     if(cache_.publish(cache_.cookie,ring_,ring_bytes_))return poison();
     if(io_.barrier(io_.cookie))return poison();
-    if(io_.write32(io_.cookie,RingWptr,end))return poison();
+    if(writeWptr(end))return kIOReturnIOError;
     next_=end;*fence=++seqno_;++submissions_;
     if(reset)reset_pending_=false;
     return kIOReturnSuccess;
