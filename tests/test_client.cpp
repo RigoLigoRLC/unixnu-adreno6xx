@@ -64,7 +64,7 @@ struct Path {
     NativeAdrenoUserClient client;
 };
 static uint32_t ringmem[8192],fencemem[1024];
-static NativeAdrenoRingIo ringio{&cp,cwrite,cread,cbarrier};
+static NativeAdrenoRingIo ringio{&cp,cwrite,cread,cbarrier,nullptr,nullptr};
 static NativeAdrenoRingCache ringcache{&cp,cpublish,cacquire};
 static NativeAdrenoRingClock ringclock{&cp,cnow,cidle};
 static int timeread(void *c,uint32_t address,uint32_t *value)

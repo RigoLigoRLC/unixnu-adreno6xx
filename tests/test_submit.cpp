@@ -67,7 +67,7 @@ struct Path {
 };
 static uint32_t ringmem[8192],fencemem[1024];
 static std::vector<uint64_t> dram_reads;
-static NativeAdrenoRingIo ringio{&cp,cwrite,cread,cbarrier};
+static NativeAdrenoRingIo ringio{&cp,cwrite,cread,cbarrier,nullptr,nullptr};
 static NativeAdrenoRingCache ringcache{&cp,cpublish,cacquire};
 static NativeAdrenoRingClock ringclock{&cp,cnow,cidle};
 static void smmuReset(void)
