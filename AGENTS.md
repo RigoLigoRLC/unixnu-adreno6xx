@@ -18,9 +18,10 @@
   `build/adreno6xx/libAdreno6xx.a`; `bash scripts/build.sh TAG` in the device
   repository runs the complete build. Keep dependent compilation and packaging
   under the coordinating build owner.
-- Current delivery: build `49g` completed eight build stages and its 512 MiB FAT
-  write plus sync on 2026-10-25. Boot and GPU runtime results are pending.
-  Report hardware observations separately from build and deployment.
+- Current delivery: `49i` completed eight stages and its FAT write plus sync.
+  `49h` reached the desktop and reported a command-db BCM validation failure;
+  the ACV fixed-vote correction is in `49i`, whose GPU results are pending.
+  CP and Vulkan hardware execution have not been recorded.
 - Preserve the upstream MIT license and the GPL-2.0-only SPDX/copyright notices
   on adapted Qualcomm procedures and tables. COPYING contains GPL v2.
 - Do not hash files. Do not add tests or run extra verification unless the user

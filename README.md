@@ -38,11 +38,12 @@ this component and the required ArmSmmu4K/AdrenoPM4 sources into
 archive into the kernel. The recipe defers the IOKit class constructors until
 the runtime publication setup.
 
-On 2026-10-25, build `49g` completed all eight build stages and its 512 MiB FAT
-was written and synced to the device. This image includes deferred class
-construction and verbose boot output. Device boot and GPU runtime results
-remain pending. The earlier `49d` image stopped at the kernel handoff; it
-supplied no successful GPU execution result.
+On 2026-10-25, `49h` booted to the desktop and USB captured the GPU worker.
+Startup stopped while validating command-db BCM auxiliary data, before GMU
+startup. The ACV fixed vote now accepts zero unit/width fields, following the
+stock A660 encoding. Build `49i` completed all eight stages and its 512 MiB FAT
+was written and synced; its GPU results remain pending. CP and Vulkan execution
+have not yet been recorded on this device.
 
 ## Licenses and sources
 

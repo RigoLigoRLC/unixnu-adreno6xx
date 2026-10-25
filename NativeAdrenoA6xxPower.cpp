@@ -3,6 +3,7 @@
  * GPUCC, GCC, RPMh, QMP and A6xx GPU drivers. Copyright (c) 2016-2021,
  * The Linux Foundation. All rights reserved. */
 #include "NativeAdrenoA6xxPower.h"
+#include <IOKit/IOLib.h>
 
 namespace {
 constexpr uint32_t Bit(unsigned bit)
@@ -13,6 +14,8 @@ constexpr uint32_t Bit(unsigned bit)
 struct Resource {
     uint32_t address;
     uint32_t length;
+    uint32_t recordOffset;
+    uint32_t auxiliaryOffset;
     uint8_t auxiliary[512];
 };
 
@@ -176,23 +179,58 @@ IOReturn NativeAdrenoA6xxPower::buildTables()
         "gfx.lvl", "mx.lvl", "cx.lvl", "SH0", "MC0", "ACV", "CN0"
     };
     Resource resources[7]{};
-    uint32_t magic;
-    IOReturn result = read(NativeAdrenoA6xxCommandDb, 4, &magic);
+    uint32_t headers[8][2]{};
+    uint32_t version = 0;
+    uint32_t magic = 0;
+    unsigned headerCount = 0;
+    unsigned seen = 0;
+    auto reject = [&](const char *reason, IOReturn status, unsigned resource,
+        uint32_t offset, uint32_t actual, uint32_t expected) -> IOReturn {
+        report_.domain = NativeAdrenoA6xxCommandDb;
+        report_.offset = offset;
+        report_.value = actual;
+        report_.expected = expected;
+        report_.mask = 0xffffffff;
+        report_.status = status;
+        IOLog("NativeAdrenoA6xx: command-db rejected reason=%s resource=%u version=%x magic=%x seen=%x offset=%x actual=%x expected=%x\n",
+            reason, resource, version, magic, seen, offset, actual, expected);
+        for (unsigned index = 0; index < headerCount; ++index) {
+            IOLog("NativeAdrenoA6xx: command-db header[%u] at=%x raw=%08x,%08x slave=%u records=%x auxiliary=%x count=%u\n",
+                index, 8 + index * 16, headers[index][0], headers[index][1],
+                headers[index][0] & 0xffff, 144 + (headers[index][0] >> 16),
+                144 + (headers[index][1] & 0xffff), headers[index][1] >> 16);
+        }
+        for (unsigned index = 0; index < 7; ++index) {
+            const Resource &entry = resources[index];
+            IOLog("NativeAdrenoA6xx: command-db resource[%u]=%s found=%u record=%x address=%x auxiliary=%x bytes=%u first=%08x,%08x\n",
+                index, names[index], (seen >> index) & 1, entry.recordOffset,
+                entry.address, entry.auxiliaryOffset, entry.length,
+                little32(entry.auxiliary), little32(entry.auxiliary + 4));
+        }
+
+        return status;
+    };
+
+    IOReturn result = read(NativeAdrenoA6xxCommandDb, 0, &version);
     if (result) {
-        return result;
+        return reject("version-read", result, 7, 0, 0, 0);
+    }
+    result = read(NativeAdrenoA6xxCommandDb, 4, &magic);
+    if (result) {
+        return reject("magic-read", result, 7, 4, 0, 0x0c0330db);
     }
     if (magic != 0x0c0330db) {
-        report_.status = kIOReturnBadMedia;
-        return report_.status;
+        return reject("magic", kIOReturnBadMedia, 7, 4, magic, 0x0c0330db);
     }
 
-    unsigned seen = 0;
     for (unsigned slave = 0; slave < 8; ++slave) {
-        uint32_t header[2];
+        uint32_t *header = headers[slave];
+        headerCount = slave + 1;
         for (unsigned word = 0; word < 2; ++word) {
             result = read(NativeAdrenoA6xxCommandDb, 8 + 16 * slave + 4 * word, &header[word]);
             if (result) {
-                return result;
+                return reject("slave-header-read", result, 7,
+                    8 + 16 * slave + 4 * word, 0, 0);
             }
         }
         if (!(header[0] & 0xffff)) {
@@ -203,8 +241,8 @@ IOReturn NativeAdrenoA6xxPower::buildTables()
         const uint32_t auxiliary = 144 + (header[1] & 0xffff);
         const uint32_t count = header[1] >> 16;
         if (count > 4096 || records > 0x20000 || count * 24 > 0x20000 - records) {
-            report_.status = kIOReturnBadMedia;
-            return report_.status;
+            return reject("slave-record-extent", kIOReturnBadMedia, 7,
+                8 + 16 * slave + 4, header[1], 0x20000);
         }
 
         for (uint32_t index = 0; index < count; ++index) {
@@ -212,7 +250,8 @@ IOReturn NativeAdrenoA6xxPower::buildTables()
             for (unsigned word = 0; word < 6; ++word) {
                 result = read(NativeAdrenoA6xxCommandDb, records + index * 24 + word * 4, &record[word]);
                 if (result) {
-                    return result;
+                    return reject("resource-record-read", result, 7,
+                        records + index * 24 + word * 4, 0, 0);
                 }
             }
 
@@ -223,22 +262,37 @@ IOReturn NativeAdrenoA6xxPower::buildTables()
                 const uint32_t length = record[5] & 0xffff;
                 const uint32_t offset = auxiliary + (record[5] >> 16);
                 const uint32_t slaveId = header[0] & 0xffff;
-                if ((seen & Bit(name)) || !record[4] || (record[4] & 3) ||
-                    ((record[4] >> 16) & 7) != slaveId ||
-                    slaveId != (name < 3 ? 3u : 5u) ||
-                    length > sizeof(resources[name].auxiliary) ||
-                    offset > 0x20000 || length > 0x20000 - offset) {
-                    report_.status = kIOReturnBadMedia;
-                    return report_.status;
+                const uint32_t recordOffset = records + index * 24;
+                if (seen & Bit(name)) {
+                    return reject("duplicate-resource", kIOReturnBadMedia,
+                        name, recordOffset, seen, seen & ~Bit(name));
                 }
 
                 resources[name].address = record[4];
                 resources[name].length = length;
+                resources[name].recordOffset = recordOffset;
+                resources[name].auxiliaryOffset = offset;
+                if (!record[4] || (record[4] & 3)) {
+                    return reject("resource-address", kIOReturnBadMedia,
+                        name, recordOffset + 16, record[4], 4);
+                }
+                if (((record[4] >> 16) & 7) != slaveId ||
+                    slaveId != (name < 3 ? 3u : 5u)) {
+                    return reject("resource-slave", kIOReturnBadMedia,
+                        name, recordOffset + 16, record[4], (name < 3 ? 3u : 5u) << 16);
+                }
+                if (length > sizeof(resources[name].auxiliary) ||
+                    offset > 0x20000 || length > 0x20000 - offset) {
+                    return reject("resource-auxiliary-extent", kIOReturnBadMedia,
+                        name, recordOffset + 20, record[5], 512);
+                }
+
                 for (unsigned byte = 0; byte < length; ++byte) {
                     uint32_t value;
                     result = read(NativeAdrenoA6xxCommandDb, (offset + byte) & ~3u, &value);
                     if (result) {
-                        return result;
+                        return reject("resource-auxiliary-read", result,
+                            name, (offset + byte) & ~3u, 0, 0);
                     }
                     resources[name].auxiliary[byte] = uint8_t(value >> (8 * ((offset + byte) & 3)));
                 }
@@ -247,24 +301,36 @@ IOReturn NativeAdrenoA6xxPower::buildTables()
         }
     }
     if (seen != 0x7f) {
-        report_.value = seen;
-        report_.expected = 0x7f;
-        report_.status = kIOReturnNotFound;
-        return report_.status;
+        return reject("required-resources", kIOReturnNotFound, 7, 0, seen, 0x7f);
     }
 
     uint32_t gpuVote;
     uint32_t gmuVote;
-    if (!arcVote(resources[0], resources[1], 64, &gpuVote) ||
-        !arcVote(resources[2], resources[1], 48, &gmuVote)) {
-        report_.status = kIOReturnUnsupported;
-        return report_.status;
+    if (!arcVote(resources[0], resources[1], 64, &gpuVote)) {
+        return reject("gpu-arc-level", kIOReturnUnsupported, 0,
+            resources[0].auxiliaryOffset, little32(resources[0].auxiliary), 64);
+    }
+    if (!arcVote(resources[2], resources[1], 48, &gmuVote)) {
+        return reject("gmu-arc-level", kIOReturnUnsupported, 2,
+            resources[2].auxiliaryOffset, little32(resources[2].auxiliary), 48);
     }
     for (unsigned index = 3; index < 7; ++index) {
-        if (resources[index].length != 8 || !little32(resources[index].auxiliary) ||
-            !little16(resources[index].auxiliary + 4)) {
-            report_.status = kIOReturnBadMedia;
-            return report_.status;
+        const Resource &resource = resources[index];
+        if (resource.length != 8) {
+            return reject("bcm-auxiliary-size", kIOReturnBadMedia, index,
+                resource.recordOffset + 20, resource.length, 8);
+        }
+        // ACV uses the fixed A660 y vote of 8 without unit/width arithmetic.
+        if (index == 5) {
+            continue;
+        }
+        if (!little32(resource.auxiliary)) {
+            return reject("bcm-unit", kIOReturnBadMedia, index,
+                resource.auxiliaryOffset, 0, 1);
+        }
+        if (!little16(resource.auxiliary + 4)) {
+            return reject("bcm-width", kIOReturnBadMedia, index,
+                resource.auxiliaryOffset + 4, little32(resource.auxiliary + 4), 1);
         }
     }
 
