@@ -1,0 +1,110 @@
+/* SPDX-License-Identifier: MIT */
+#include "NativeAdrenoA6xxZap.h"
+#include <IOKit/IOLib.h>
+#include <string.h>
+
+extern "C" const uint8_t native_adreno_zap_metadata_image[];
+extern "C" const uint64_t native_adreno_zap_metadata_image_size;
+extern "C" const uint8_t native_adreno_zap_shader_image[];
+extern "C" const uint64_t native_adreno_zap_shader_image_size;
+
+namespace {
+uint32_t word(const uint8_t *p)
+{
+    return uint32_t(p[0])|(uint32_t(p[1])<<8)|(uint32_t(p[2])<<16)|(uint32_t(p[3])<<24);
+}
+
+/* SCM64 arguments follow qcom_scm-smc.c: x1 encodes argument count and type,
+ * x2 onward hold PAS ID and physical addresses. An interrupted call resumes
+ * with x0=1 and the secure world's x6 continuation value. */
+int64_t pas(uint32_t command,uint32_t info,uint64_t arg1,uint64_t arg2,
+    int64_t *transport)
+{
+    uint64_t function=0x42000200u|command;
+    uint64_t continuation=0;
+    for(unsigned attempt=0;attempt<16;++attempt) {
+        register uint64_t x0 __asm__("x0")=function;
+        register uint64_t x1 __asm__("x1")=info;
+        register uint64_t x2 __asm__("x2")=13;
+        register uint64_t x3 __asm__("x3")=arg1;
+        register uint64_t x4 __asm__("x4")=arg2;
+        register uint64_t x5 __asm__("x5")=0;
+        register uint64_t x6 __asm__("x6")=continuation;
+        register uint64_t x7 __asm__("x7")=0;
+        __asm__ volatile("dsb sy\n\tsmc #0\n\tisb" :
+            "+r"(x0),"+r"(x1),"+r"(x2),"+r"(x3),"+r"(x4),
+            "+r"(x5),"+r"(x6),"+r"(x7) : :
+            "x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","memory","cc");
+        *transport=int64_t(x0);
+        if(x0==1) {
+            function=1;
+            continuation=x6;
+            continue;
+        }
+        if(int64_t(x0)==-12) {
+            function=0x42000200u|command;
+            continuation=0;
+            IOSleep(1);
+            continue;
+        }
+        return int64_t(x1);
+    }
+    return -1;
+}
+}
+
+IOReturn NativeAdrenoA6xxZap::load(const NativeAdrenoA6xxWindow &window,void *reservedCpu)
+{
+    if(phase_ || !reservedCpu || !window.physical || window.bytes<0x1000 ||
+        native_adreno_zap_metadata_image_size<148 ||
+        native_adreno_zap_shader_image_size>window.bytes) {
+        return kIOReturnBadArgument;
+    }
+    phase_=1;
+    const uint8_t *image=native_adreno_zap_metadata_image;
+    if(word(image)!=0x464c457f || image[4]!=1 || image[5]!=1 ||
+        word(image+28)!=52 || image[44]!=3 || image[45]!=0) {
+        return kIOReturnBadArgument;
+    }
+    const uint8_t *shader=image+52+2*32;
+    const uint32_t fileBytes=word(shader+16),memoryBytes=word(shader+20);
+    if(word(shader)!=1 || !(word(shader+24)&(1u<<27)) ||
+        fileBytes!=native_adreno_zap_shader_image_size || memoryBytes<fileBytes ||
+        memoryBytes>window.bytes) {
+        return kIOReturnBadArgument;
+    }
+    const size_t metadataBytes=size_t((native_adreno_zap_metadata_image_size+4095)&~UINT64_C(4095));
+    IOReturn status=metadata_.allocate(metadataBytes,40,true,metadataBytes);
+    if(status) {
+        return status;
+    }
+    memcpy(metadata_.mapping(),image,size_t(native_adreno_zap_metadata_image_size));
+    status=metadata_.publishForDevice(0,metadataBytes,false);
+    if(status) {
+        return status;
+    }
+
+    phase_=2;
+    result_=pas(1,0x82,metadata_.spans()[0].physical,0,&transport_);
+    if(transport_ || result_) {
+        return kIOReturnNotPermitted;
+    }
+    phase_=3;
+    result_=pas(2,3,window.physical,(uint64_t(memoryBytes)+4095)&~UINT64_C(4095),&transport_);
+    if(transport_ || result_) {
+        return kIOReturnNotPermitted;
+    }
+
+    phase_=4;
+    memset(reservedCpu,0,size_t(window.bytes));
+    memcpy(reservedCpu,native_adreno_zap_shader_image,fileBytes);
+    __asm__ volatile("dsb sy" ::: "memory");
+
+    phase_=5;
+    result_=pas(5,1,0,0,&transport_);
+    if(transport_ || result_) {
+        return kIOReturnNotPermitted;
+    }
+    phase_=6;
+    return kIOReturnSuccess;
+}

@@ -22,8 +22,11 @@ IOReturn NativeAdrenoCpInit::poison()
 {
     poisoned_=true;return kIOReturnIOError;
 }
-uint32_t NativeAdrenoCpInit::meInitMask()
+uint32_t NativeAdrenoCpInit::meInitMask(NativeAdrenoGeneration generation)
 {
+    if(generation==NativeAdrenoA642L) {
+        return 0x16f;
+    }
     return (1u<<0)|(1u<<1)|(1u<<3)|(1u<<6)|(1u<<8);
 }
 IOReturn NativeAdrenoCpInit::run(const NativeAdrenoRingIo *io,NativeAdrenoRing *ring,
@@ -43,6 +46,28 @@ IOReturn NativeAdrenoCpInit::run(const NativeAdrenoRingIo *io,NativeAdrenoRing *
     } else if(io->write32(io->cookie,CpSqeInstrBase,(uint32_t)config->sqe_iova) ||
         io->write32(io->cookie,CpSqeInstrBase+1,(uint32_t)(config->sqe_iova>>32)))
         return poison();
+    if(config->generation==NativeAdrenoA642L) {
+        if(io->write32(io->cookie,0x808,1)) {
+            return poison();
+        }
+        uint32_t words[12]={0};
+        if(AdrenoPM4Type7(CpMeInitOpcode,11,&words[0])!=AdrenoPM4Success) {
+            return poison();
+        }
+        words[1]=meInitMask(config->generation);
+        words[2]=3;
+        words[3]=0x20000000;
+        words[7]=2;
+        words[8]=uint32_t(config->pwrup_reglist_iova);
+        words[9]=uint32_t(config->pwrup_reglist_iova>>32);
+
+        const IOReturn status=ring->submit(words,12,fence);
+        if(status) {
+            return poison();
+        }
+        done_=true;
+        return kIOReturnSuccess;
+    }
     uint32_t words[CpInitWords]={0};
     if(AdrenoPM4Type7(CpThreadControlOpcode,1,&words[0])!=AdrenoPM4Success ||
         AdrenoPM4Type7(CpMeInitOpcode,7,&words[2])!=AdrenoPM4Success)return poison();

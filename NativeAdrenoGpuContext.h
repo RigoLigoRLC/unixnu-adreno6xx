@@ -38,6 +38,7 @@ public:
         const uint16_t sids[2],void (*progress)(uint32_t step),NativeAdrenoGmuContextReport *report);
     bool ready() const {return ready_;}
     const NativeAdrenoMemory &buffer(unsigned index) const {return buffers_[index];}
+    NativeAdrenoMemory &buffer(unsigned index) {return buffers_[index];}
     NativeAdrenoVm *vm() {return ready_?&vm_:nullptr;}
 };
 extern "C" IOReturn NativeAdrenoGpuContextBringup(volatile uint8_t *smmu,size_t bytes,unsigned bank,unsigned asid,

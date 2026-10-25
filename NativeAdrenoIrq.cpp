@@ -56,18 +56,27 @@ IOReturn NativeAdrenoIrq::poison()
 {
     poisoned_=true;return kIOReturnIOError;
 }
-uint32_t NativeAdrenoIrq::mask()
+uint32_t NativeAdrenoIrq::mask(NativeAdrenoGeneration generation)
 {
+    if(generation==NativeAdrenoA642L) {
+        return IrqBitAhb|IrqBitAtbAsync|IrqBitGpc|IrqBitCpSw|IrqBitCpHw|
+            IrqBitCpIb2|IrqBitCpIb1|IrqBitCpPm4|IrqBitCpFence|IrqBitAtbBus|
+            IrqBitHang|IrqBitUcheOob|IrqBitUcheTrap|IrqBitTsbWrite;
+    }
     return kEnable;
 }
-uint32_t NativeAdrenoIrq::cpErrorMask()
+uint32_t NativeAdrenoIrq::cpErrorMask(NativeAdrenoGeneration generation)
 {
+    if(generation==NativeAdrenoA642L) {
+        return 0xf7u;
+    }
     return kCpErrors;
 }
-IOReturn NativeAdrenoIrq::attach(const NativeAdrenoRingIo *io)
+IOReturn NativeAdrenoIrq::attach(const NativeAdrenoRingIo *io,NativeAdrenoGeneration generation)
 {
     if(attached_ || poisoned_)return kIOReturnBusy;
     if(!io || !io->read32 || !io->write32 || !io->barrier)return kIOReturnBadArgument;
+    generation_=generation;
     io_=*io;attached_=true;enabled_=0;
     return kIOReturnSuccess;
 }
@@ -81,9 +90,10 @@ IOReturn NativeAdrenoIrq::programMask(uint32_t *programmed)
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     if(programmed)*programmed=0;
     uint32_t readback=0;
-    if(io_.write32(io_.cookie,IrqRbbmMask,kEnable))return poison();
+    const uint32_t enable=mask(generation_);
+    if(io_.write32(io_.cookie,IrqRbbmMask,enable))return poison();
     if(io_.read32(io_.cookie,IrqRbbmMask,&readback))return poison();
-    if(readback!=kEnable)return poison();
+    if(readback!=enable)return poison();
     enabled_=readback;
     if(programmed)*programmed=readback;
     return kIOReturnSuccess;
@@ -108,12 +118,15 @@ IOReturn NativeAdrenoIrq::handle(NativeAdrenoIrqResult *result)
     if(status&(IrqBitTsbWrite|IrqBitFuse))flags|=NativeAdrenoIrqSecurity;
     if(status&IrqBitCpHw) {
         if(io_.read32(io_.cookie,IrqCpStatus,&cp_status))return poison();
-        if(cp_status&kCpErrors) {
+        if(cp_status&cpErrorMask(generation_)) {
             if(io_.read32(io_.cookie,IrqCpProtect,&protect))return poison();
             flags|=NativeAdrenoIrqCpError;
         }
     }
-    const uint32_t unknown=status&~kKnown;
+    const uint32_t known=generation_==NativeAdrenoA642L?
+        mask(generation_)|IrqBitIdle|IrqBitCpCcuDepth|IrqBitCpCcuColor|
+            IrqBitCpCcuResolve|IrqBitIsdbCpu|IrqBitIsdbDebug:kKnown;
+    const uint32_t unknown=status&~known;
     if(unknown)flags|=NativeAdrenoIrqUnknown;
     if(flags&(NativeAdrenoIrqHang|NativeAdrenoIrqCpError|NativeAdrenoIrqUche|
         NativeAdrenoIrqBusError|NativeAdrenoIrqSecurity|NativeAdrenoIrqUnknown))

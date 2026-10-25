@@ -4,8 +4,9 @@
 #include <IOKit/IOTypes.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "NativeAdrenoGeneration.h"
 
-/* A7XX command processor ring and timestamp fence, not a scheduler.
+/* NativeAdrenoRing owns a command processor ring and its timestamp fence.
  * Register indices are dword offsets; the platform adds the MMIO base and
  * multiplies by four. Caller must already own an exclusive, powered GPU with
  * SQE microcode loaded (CP_SQE_INSTR_BASE), global reset released and all
@@ -51,6 +52,7 @@ class NativeAdrenoRing final {
     uint64_t ring_iova_=0,fence_iova_=0;
     uint32_t next_=0,rptr_shadow_=0,seqno_=0,completed_=0,submissions_=0;
     bool attached_=false,poisoned_=false,reset_pending_=false;
+    NativeAdrenoGeneration generation_=NativeAdrenoA740;
     IOReturn poison();
     IOReturn readRptr(uint32_t *);
     IOReturn emitPrologue(uint32_t at,bool reset,uint32_t *end);
@@ -68,7 +70,8 @@ public:
      * All outputs are prevalidated before any register write. */
     IOReturn attach(const NativeAdrenoRingIo *,const NativeAdrenoRingCache *,
         void *ring,size_t ring_bytes,uint64_t ring_iova,
-        void *fence,size_t fence_bytes,uint64_t fence_iova);
+        void *fence,size_t fence_bytes,uint64_t fence_iova,
+        NativeAdrenoGeneration generation=NativeAdrenoA740);
     /* Programs nothing. Refuses while submissions are unobserved or poisoned,
      * because only the caller can establish real GPU quiescence and unmap. */
     IOReturn detach();
@@ -76,11 +79,11 @@ public:
      * it with one WPTR update. Returns a nonzero fence value on success. The
      * words are copied; the caller's buffer is never retained. */
     IOReturn submit(const uint32_t *words,size_t word_count,uint32_t *fence);
-    /* User command buffers: the A7XX BR/BV thread framing of a7xx_submit() around the words (CP init and the kernel's own
-     * bring-up packets keep the plain submit() above, as Linux sends them outside a7xx_submit()). */
+    /* A642L user buffers receive A6xx IB-list markers and CACHE_FLUSH_TS.
+     * A740 user buffers receive its BR/BV thread synchronization packets. */
     IOReturn submitFramed(const uint32_t *words,size_t word_count,uint32_t *fence);
-    /* The next framed submission starts with the A7XX context entry of a6xx_set_pagetable() (BR/BV counters, on-chip
-     * timestamps and resource table cleared between thread syncs); a new user client requests it, as Linux does per context. */
+    /* The next user submission waits for idle on A642L or clears the A740
+     * thread counters, timestamps and resource table between thread syncs. */
     void requestContextReset() {reset_pending_=true;}
     /* Polls the CP-written timestamp after invalidating the fence page. Never
      * writes registers and never advances the ring. Timeout is not poison. */
@@ -92,6 +95,8 @@ public:
     NativeAdrenoRingFence observeFence(uint32_t fence,const NativeAdrenoRingClock *,
         uint32_t timeout_us,uint32_t *observed);
     bool poisoned() const {return poisoned_;}
+    /* A fatal GPU fault prevents further WPTR updates and retains live DMA. */
+    void recordFault() {poisoned_=true;}
     uint32_t outstanding() const {return seqno_-completed_;}
     uint32_t lastSubmitted() const {return seqno_;}      /* the newest fence number handed out */
     uint32_t completedFence() const {return completed_;}

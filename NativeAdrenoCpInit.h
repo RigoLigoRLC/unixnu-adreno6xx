@@ -8,17 +8,15 @@ struct NativeAdrenoCpInitConfig {
     /* Nonzero when the caller already wrote CP_SQE_INSTR_BASE before CP_SQE_CNTL, as a6xx hw_init does: the base is
      * then read back and compared instead of rewritten after the SQE started. */
     uint32_t sqe_base_programmed;
+    NativeAdrenoGeneration generation=NativeAdrenoA740;
 };
-/* One-shot A7XX command-processor start sequence, not a GPU power or reset
- * driver. The caller must have completed GMU boot, powered GX/core clocks,
- * released the CP reset, loaded and hash-verified the SQE microcode into the
- * real IOVA given here, and hold exclusive MMIO. This programs
- * CP_SQE_INSTR_BASE, then submits the pinned a7xx_cp_init sequence directly
- * through the ring: CP_THREAD_CONTROL with concurrent binning disabled and
- * CP_ME_INIT with the Linux mask, hardware-context count, operation mode and
- * power-up register list. Completion is the ring timestamp fence, so a hung
- * CP is reported as a timeout instead of a fabricated success. A second call
- * cannot re-initialize the same object. */
+/* NativeAdrenoCpInit starts one command processor after GMU boot and GX power.
+ * The caller supplies SQE microcode already copied to its mapped GPU address
+ * and a register-list page retained for the entire boot. A642L uses the A660
+ * eleven-word CP_ME_INIT payload and starts SQE through CP_SQE_CNTL. A740
+ * sends CP_THREAD_CONTROL followed by its seven-word CP_ME_INIT payload.
+ * The ring appends a timestamp fence; the caller waits for that value before
+ * publishing clients. Each object accepts one initialization attempt. */
 class NativeAdrenoCpInit final {
     bool done_=false,poisoned_=false;
     IOReturn poison();
@@ -31,6 +29,6 @@ public:
         const NativeAdrenoCpInitConfig *,uint32_t *fence);
     bool completed() const {return done_;}
     bool poisoned() const {return poisoned_;}
-    static uint32_t meInitMask();
+    static uint32_t meInitMask(NativeAdrenoGeneration generation=NativeAdrenoA740);
 };
 #endif

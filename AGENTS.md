@@ -1,39 +1,27 @@
-# Agent instructions
+# Adreno6xx working instructions
 
-## Responsibility
-
-Maintain A740 kernel GPU driver.
-
-## Required reading
-
-1. Read this repository's README and [component documentation](https://unixnu.com/drivers/adreno740).
-2. Read the [component catalog](https://unixnu.com/reference/components) and selected SoC and OS profiles in UniXNU.
-3. Read the relevant implementation and its build entry point before editing.
-4. For ports, read the [porting overview](https://unixnu.com/porting/), [repository specification](https://unixnu.com/porting/device-repository), and [device-tree specification](https://unixnu.com/porting/device-tree).
-5. For kernel work, read XNU sources, the selected patch series, and [patch reference](https://unixnu.com/xnu/patch-reference).
-6. For image assembly, read [prelink](https://unixnu.com/concepts/prelink), [payload](https://unixnu.com/concepts/payload), and [UEFI firmware](https://unixnu.com/porting/uefi-firmware) pages on the UniXNU site.
-7. For migration, read the [migration guide](https://unixnu.com/porting/migration).
-
-## Component selection
-
-Search the catalog and existing implementations before adding a capability.
-Select dependencies by interface, hardware scope, OS ABI, and board inputs.
-Keep shared controller operations in their component or SoC repository.
-Keep device configuration in the device repository.
-
-Use `Adreno740` for the repository, catalog ID, checkout, and build references.
-Preserve source filenames, runtime classes, bundle names, exported symbols, and
-protocol identifiers recorded in the catalog.
-
-## Build and verification
-
-Run `build-arm-driver.py Adreno740` from the resolved build tree after kernel preparation.
-Read [building](https://unixnu.com/building) and [bring-up](https://unixnu.com/porting/bring-up).
-Run applicable existing checks and report the commands, results, source
-revisions, and required inputs. Report hardware observations separately from
-build results, with the device and OS profile.
-
-## Documentation
-
-Maintain this README and the relevant English and Chinese pages in UniXNU.
-Use concise language describing current interfaces and behavior.
+- This component implements Adreno 642L on SM7325 for SM-T733. Preserve the
+  real chip ID `0x06030500`, 512 KiB GMEM, 315 MHz first GPU request and A660
+  firmware family. Read README.md and the affected implementation before edits.
+- The component ID and resolved checkout are `Adreno6xx`. Preserve the
+  NativeAdreno runtime names and ABI v1 records in `NativeAdrenoABI.h`.
+- The device kit supplies physical resources and SMMU assignments through
+  `native_adreno_a6xx_resources`. The service owns mappings, DMA memory and
+  publication. Keep board addresses and private firmware paths in the device
+  repository; keep A6xx hardware procedures in this component.
+- Power and GMU receive bounded byte-offset MMIO and delay callbacks. Use the
+  live command database for ARC indexes and BCM data. Follow the SM7325 stock
+  GPUCC/GCC clock semantics, A6xx GX status bits 6/7, GMU fault bit 15 and RSCC
+  sequencer offset `0x180`. HFI startup requires actual matching replies.
+- The SM-T733 device build runs `scripts/build-adreno6xx.py --tree
+  RESOLVED_TREE` after kernel preparation. It produces
+  `build/adreno6xx/libAdreno6xx.a`; `bash scripts/build.sh TAG` in the device
+  repository runs the complete build. Keep dependent compilation and packaging
+  under the coordinating build owner.
+- Current delivery: build `49g` completed eight build stages and its 512 MiB FAT
+  write plus sync on 2026-10-25. Boot and GPU runtime results are pending.
+  Report hardware observations separately from build and deployment.
+- Preserve the upstream MIT license and the GPL-2.0-only SPDX/copyright notices
+  on adapted Qualcomm procedures and tables. COPYING contains GPL v2.
+- Do not hash files. Do not add tests or run extra verification unless the user
+  requests it. Complete an authorized deployment before deferred documentation.

@@ -16,7 +16,8 @@ static void readBack(const ArmSmmu4KIo *io,const ArmSmmu4KProgramResult *program
     io->read64(io->cookie,size_t(program->context_offset)+0x20,&r->ttbr0);
 }
 IOReturn NativeAdrenoGmuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,
-    unsigned slot,uint16_t sid,void (*progress)(uint32_t),NativeAdrenoGmuContextReport *report)
+    unsigned slot,uint16_t sid,void (*progress)(uint32_t),NativeAdrenoGmuContextReport *report,
+    uint16_t sidAlias)
 {
     if(!report)return kIOReturnBadArgument;
     *report={};
@@ -63,8 +64,8 @@ IOReturn NativeAdrenoGmuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
     }
     if(!status) {
         step(Attach);
-        const ArmSmmu4KStream route{slot,sid};
-        status=smmu_.attach(&route,1);
+        const ArmSmmu4KStream routes[2]={{slot,sid},{slot+1,sidAlias}};
+        status=smmu_.attach(routes,sidAlias?2:1);
         const ArmSmmu4KStreamResult *s=smmu_.streamResult();
         report->route_status=smmu_.attachStatus();
         report->route_phase=s->phase;report->route_writes=s->writes;report->routes_verified=s->streams_verified;

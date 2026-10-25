@@ -42,7 +42,8 @@ public:
     NativeAdrenoGmuContext &operator=(const NativeAdrenoGmuContext &)=delete;
     /* One attempt per object. progress (may be null) is called before each step. */
     IOReturn bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,unsigned slot,
-        uint16_t sid,void (*progress)(uint32_t step),NativeAdrenoGmuContextReport *report);
+        uint16_t sid,void (*progress)(uint32_t step),NativeAdrenoGmuContextReport *report,
+        uint16_t sidAlias=0);
     bool ready() const {return ready_;}
     NativeAdrenoGmuAllocator &allocator() {return gmu_;}
     NativeAdrenoVm &vm() {return vm_;}

@@ -30,13 +30,14 @@ class NativeAdrenoIrq final {
     NativeAdrenoRingIo io_{};
     uint32_t enabled_=0;
     bool attached_=false,poisoned_=false;
+    NativeAdrenoGeneration generation_=NativeAdrenoA740;
     IOReturn poison();
 public:
     NativeAdrenoIrq()=default;
     ~NativeAdrenoIrq()=default;
     NativeAdrenoIrq(const NativeAdrenoIrq &)=delete;
     NativeAdrenoIrq &operator=(const NativeAdrenoIrq &)=delete;
-    IOReturn attach(const NativeAdrenoRingIo *);
+    IOReturn attach(const NativeAdrenoRingIo *,NativeAdrenoGeneration generation=NativeAdrenoA740);
     IOReturn detach();
     /* The exact A7XX enable set: AHB, ATB async, GPC, CP_SW, CP_HW, PM4,
      * RB_DONE_TS, CACHE_FLUSH_TS, ATB bus, hang, UCHE OOB/trap, TSB, fuse. */
@@ -44,8 +45,8 @@ public:
     /* Reads, acknowledges, then decodes. Acknowledgement precedes decoding so
      * an error reported here cannot be hidden by a later clear failure. */
     IOReturn handle(NativeAdrenoIrqResult *);
-    static uint32_t mask();
-    static uint32_t cpErrorMask();
+    static uint32_t mask(NativeAdrenoGeneration generation=NativeAdrenoA740);
+    static uint32_t cpErrorMask(NativeAdrenoGeneration generation=NativeAdrenoA740);
     bool poisoned() const {return poisoned_;}
     uint32_t enabled() const {return enabled_;}
 };
