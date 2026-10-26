@@ -243,29 +243,50 @@ void saveBoProfile(BoProfileRecords &records,NativeAdrenoAbiBoProfile &record)
 
 void printBoProfile(const BoProfileRecords &records)
 {
-    IOLog("NativeAdrenoBO: source slot=%u generation=%llu device=%llu active=%u name=\"%.*s\"\n",
-        records.connection_slot,records.generation,records.device_id,unsigned(records.active),
-        int(sizeof(records.name)-1),records.name);
+    IOLog("NativeAdrenoBO: source name=\"%.*s\" s=%u g=%llu d=%llu active=%u\n",
+        int(sizeof(records.name)-1),records.name,records.connection_slot,records.generation,
+        records.device_id,unsigned(records.active));
     const NativeAdrenoAbiBoProfile &sample=records.counters;
     if(sample.sequence) {
         const NativeAdrenoAbiBoCacheCounters &counts=sample.data.counters;
-        IOLog("NativeAdrenoBO: counters slot=%u generation=%llu device=%llu sequence=%llu sampled_us=%llu requests=%llu requested_bytes=%llu eligible=%llu hits=%llu misses=%llu imports=%llu import_bytes=%llu\n",
-            records.connection_slot,records.generation,records.device_id,sample.sequence,sample.sampled_us,
-            counts.requests,counts.requested_bytes,counts.eligible,counts.hits,counts.misses,
-            counts.imports,counts.import_bytes);
-        IOLog("NativeAdrenoBO: reasons slot=%u generation=%llu device=%llu sequence=%llu sampled_us=%llu empty=%llu size=%llu alignment=%llu flags=%llu memory_property=%llu pending=%llu bypass_fixed=%llu bypass_flags=%llu bypass_oversize=%llu compatible_pending=%llu\n",
-            records.connection_slot,records.generation,records.device_id,sample.sequence,sample.sampled_us,
-            counts.miss_empty,counts.miss_size,counts.miss_alignment,counts.miss_flags,
-            counts.miss_memory_property,counts.miss_pending,counts.bypass_fixed,counts.bypass_flags,
-            counts.bypass_oversize,counts.compatible_pending_requests);
-        IOLog("NativeAdrenoBO: cache slot=%u generation=%llu device=%llu sequence=%llu sampled_us=%llu puts=%llu evict_objects=%llu evict_bytes=%llu evict_iova=%llu evict_allocation=%llu evict_close=%llu cached_objects=%llu cached_bytes=%llu peak_objects=%llu peak_bytes=%llu pending_objects=%llu pending_bytes=%llu\n",
-            records.connection_slot,records.generation,records.device_id,sample.sequence,sample.sampled_us,
-            counts.puts,counts.evict_objects,counts.evict_bytes,counts.evict_iova,counts.evict_allocation,
-            counts.evict_close,counts.cached_objects,counts.cached_bytes,counts.peak_objects,counts.peak_bytes,
-            counts.pending_objects,counts.pending_bytes);
-        IOLog("NativeAdrenoBO: retirement slot=%u generation=%llu device=%llu sequence=%llu sampled_us=%llu pressure_waits=%llu reaped=%llu slow_total=%llu slow_overwritten=%llu report_failures=%llu\n",
-            records.connection_slot,records.generation,records.device_id,sample.sequence,sample.sampled_us,
-            counts.pressure_waits,counts.reaped,counts.slow_total,counts.slow_overwritten,counts.report_failures);
+        IOLog("NativeAdrenoBO: counter_time s=%u g=%llu d=%llu q=%llu sampled_us=%llu\n",
+            records.connection_slot,records.generation,records.device_id,sample.sequence,sample.sampled_us);
+        IOLog("NativeAdrenoBO: counter_counts s=%u g=%llu d=%llu q=%llu requests=%llu eligible=%llu hits=%llu\n",
+            records.connection_slot,records.generation,records.device_id,sample.sequence,
+            counts.requests,counts.eligible,counts.hits);
+        IOLog("NativeAdrenoBO: counter_imports s=%u g=%llu d=%llu q=%llu misses=%llu imports=%llu\n",
+            records.connection_slot,records.generation,records.device_id,sample.sequence,
+            counts.misses,counts.imports);
+        IOLog("NativeAdrenoBO: counter_bytes s=%u g=%llu d=%llu q=%llu requested_bytes=%llu import_bytes=%llu\n",
+            records.connection_slot,records.generation,records.device_id,sample.sequence,
+            counts.requested_bytes,counts.import_bytes);
+        IOLog("NativeAdrenoBO: miss_shape s=%u g=%llu d=%llu q=%llu empty=%llu size=%llu alignment=%llu\n",
+            records.connection_slot,records.generation,records.device_id,sample.sequence,
+            counts.miss_empty,counts.miss_size,counts.miss_alignment);
+        IOLog("NativeAdrenoBO: miss_attributes s=%u g=%llu d=%llu q=%llu flags=%llu memory_property=%llu pending=%llu\n",
+            records.connection_slot,records.generation,records.device_id,sample.sequence,
+            counts.miss_flags,counts.miss_memory_property,counts.miss_pending);
+        IOLog("NativeAdrenoBO: bypass s=%u g=%llu d=%llu q=%llu fixed=%llu flags=%llu oversize=%llu\n",
+            records.connection_slot,records.generation,records.device_id,sample.sequence,
+            counts.bypass_fixed,counts.bypass_flags,counts.bypass_oversize);
+        IOLog("NativeAdrenoBO: cache_evict s=%u g=%llu d=%llu q=%llu puts=%llu evict_objects=%llu evict_bytes=%llu\n",
+            records.connection_slot,records.generation,records.device_id,sample.sequence,
+            counts.puts,counts.evict_objects,counts.evict_bytes);
+        IOLog("NativeAdrenoBO: cache_evict_reason s=%u g=%llu d=%llu q=%llu iova=%llu allocation=%llu close=%llu\n",
+            records.connection_slot,records.generation,records.device_id,sample.sequence,
+            counts.evict_iova,counts.evict_allocation,counts.evict_close);
+        IOLog("NativeAdrenoBO: cache_objects s=%u g=%llu d=%llu q=%llu cached=%llu peak=%llu pending=%llu\n",
+            records.connection_slot,records.generation,records.device_id,sample.sequence,
+            counts.cached_objects,counts.peak_objects,counts.pending_objects);
+        IOLog("NativeAdrenoBO: cache_bytes s=%u g=%llu d=%llu q=%llu cached=%llu peak=%llu pending=%llu\n",
+            records.connection_slot,records.generation,records.device_id,sample.sequence,
+            counts.cached_bytes,counts.peak_bytes,counts.pending_bytes);
+        IOLog("NativeAdrenoBO: retirement s=%u g=%llu d=%llu q=%llu compatible_pending=%llu pressure_waits=%llu reaped=%llu\n",
+            records.connection_slot,records.generation,records.device_id,sample.sequence,
+            counts.compatible_pending_requests,counts.pressure_waits,counts.reaped);
+        IOLog("NativeAdrenoBO: reporting s=%u g=%llu d=%llu q=%llu slow_total=%llu slow_overwritten=%llu report_failures=%llu\n",
+            records.connection_slot,records.generation,records.device_id,sample.sequence,
+            counts.slow_total,counts.slow_overwritten,counts.report_failures);
     }
     for(unsigned kind=NativeAdrenoBoProfileSize;kind<=NativeAdrenoBoProfileUsage;++kind) {
         const unsigned count=kind==NativeAdrenoBoProfileSize?NativeAdrenoBoProfileSizeCount:NativeAdrenoBoProfileUsageCount;
@@ -277,11 +298,19 @@ void printBoProfile(const BoProfileRecords &records)
                 !bin.compatible_pending_requests)) {
                 continue;
             }
-            IOLog("NativeAdrenoBO: bin slot=%u generation=%llu device=%llu sequence=%llu sampled_us=%llu kind=%s index=%u upper_bytes=%llu requests=%llu requested_bytes=%llu eligible=%llu hits=%llu misses=%llu compatible_pending=%llu name=\"%.*s\"\n",
-                records.connection_slot,records.generation,records.device_id,entry.sequence,entry.sampled_us,
-                kind==NativeAdrenoBoProfileSize?"size":"usage",index,bin.upper_bytes,bin.requests,
-                bin.requested_bytes,bin.eligible,bin.hits,bin.misses,bin.compatible_pending_requests,
-                int(sizeof(bin.name)-1),bin.name);
+            const char *kindName=kind==NativeAdrenoBoProfileSize?"size":"usage";
+            IOLog("NativeAdrenoBO: bin_name name=\"%.*s\" s=%u g=%llu d=%llu q=%llu kind=%s index=%u sampled_us=%llu\n",
+                int(sizeof(bin.name)-1),bin.name,records.connection_slot,records.generation,
+                records.device_id,entry.sequence,kindName,index,entry.sampled_us);
+            IOLog("NativeAdrenoBO: bin_counts s=%u g=%llu d=%llu q=%llu kind=%s index=%u requests=%llu eligible=%llu hits=%llu\n",
+                records.connection_slot,records.generation,records.device_id,entry.sequence,kindName,index,
+                bin.requests,bin.eligible,bin.hits);
+            IOLog("NativeAdrenoBO: bin_misses s=%u g=%llu d=%llu q=%llu kind=%s index=%u misses=%llu compatible_pending=%llu\n",
+                records.connection_slot,records.generation,records.device_id,entry.sequence,kindName,index,
+                bin.misses,bin.compatible_pending_requests);
+            IOLog("NativeAdrenoBO: bin_bytes s=%u g=%llu d=%llu q=%llu kind=%s index=%u upper_bytes=%llu requested_bytes=%llu\n",
+                records.connection_slot,records.generation,records.device_id,entry.sequence,kindName,index,
+                bin.upper_bytes,bin.requested_bytes);
         }
     }
     for(unsigned index=0;index<NativeAdrenoBoProfileSlowCount;++index) {
@@ -290,47 +319,71 @@ void printBoProfile(const BoProfileRecords &records)
             continue;
         }
         const NativeAdrenoAbiBoSlowEvent &event=entry.data.slow;
-        IOLog("NativeAdrenoBO: slow slot=%u generation=%llu device=%llu sequence=%llu sampled_us=%llu index=%u operation=%u elapsed_us=%llu bytes=%llu alignment=%llu handle=%llu iova=%llx reason=%u alloc_flags=%x memory_property=%x connection_fence=%u status=%08x cached_objects=%u cached_bytes=%llu pending_objects=%u pending_bytes=%llu name=\"%.*s\"\n",
-            records.connection_slot,records.generation,records.device_id,entry.sequence,entry.sampled_us,index,
-            event.operation,event.elapsed_us,event.bytes,event.alignment,event.handle,event.iova,
-            event.cache_reason,event.alloc_flags,event.memory_property,event.connection_fence,event.status,
-            event.cached_objects,event.cached_bytes,event.pending_objects,event.pending_bytes,
-            int(sizeof(event.name)-1),event.name);
+        IOLog("NativeAdrenoBO: slow_name name=\"%.*s\" s=%u g=%llu d=%llu q=%llu index=%u operation=%u\n",
+            int(sizeof(event.name)-1),event.name,records.connection_slot,records.generation,
+            records.device_id,entry.sequence,index,event.operation);
+        IOLog("NativeAdrenoBO: slow s=%u g=%llu d=%llu q=%llu sampled_us=%llu elapsed_us=%llu bytes=%llu\n",
+            records.connection_slot,records.generation,records.device_id,entry.sequence,
+            entry.sampled_us,event.elapsed_us,event.bytes);
+        IOLog("NativeAdrenoBO: slow_object s=%u g=%llu d=%llu q=%llu alignment=%llu handle=%llu iova=%llx\n",
+            records.connection_slot,records.generation,records.device_id,entry.sequence,
+            event.alignment,event.handle,event.iova);
+        IOLog("NativeAdrenoBO: slow_flags s=%u g=%llu d=%llu q=%llu reason=%u alloc_flags=%x memory_property=%x status=%08x\n",
+            records.connection_slot,records.generation,records.device_id,entry.sequence,
+            event.cache_reason,event.alloc_flags,event.memory_property,event.status);
+        IOLog("NativeAdrenoBO: slow_queue s=%u g=%llu d=%llu q=%llu connection_fence=%u cached_objects=%u pending_objects=%u\n",
+            records.connection_slot,records.generation,records.device_id,entry.sequence,
+            event.connection_fence,event.cached_objects,event.pending_objects);
+        IOLog("NativeAdrenoBO: slow_bytes s=%u g=%llu d=%llu q=%llu cached_bytes=%llu pending_bytes=%llu\n",
+            records.connection_slot,records.generation,records.device_id,entry.sequence,
+            event.cached_bytes,event.pending_bytes);
     }
 }
 
 void printKernelBoProfile(uint64_t sequence,uint64_t sampled_us)
 {
     const NativeAdrenoMemoryDiagnostics &records=kernelBoProfileSnapshot;
-    IOLog("NativeAdrenoBO: kernel sequence=%llu sampled_us=%llu insert_attempts=%llu insertions=%llu cached_objects=%llu cached_bytes=%llu peak_objects=%llu peak_bytes=%llu slow_total=%llu slow_count=%u\n",
-        sequence,sampled_us,records.insert_attempts,records.insertions,records.cached_objects,
-        records.cached_bytes,records.peak_objects,records.peak_bytes,records.slow_total,records.slow_count);
+    IOLog("NativeAdrenoBO: kernel sequence=%llu sampled_us=%llu insert_attempts=%llu insertions=%llu\n",
+        sequence,sampled_us,records.insert_attempts,records.insertions);
+    IOLog("NativeAdrenoBO: kernel_objects sequence=%llu cached_objects=%llu peak_objects=%llu\n",
+        sequence,records.cached_objects,records.peak_objects);
+    IOLog("NativeAdrenoBO: kernel_bytes sequence=%llu cached_bytes=%llu peak_bytes=%llu\n",
+        sequence,records.cached_bytes,records.peak_bytes);
+    IOLog("NativeAdrenoBO: kernel_events sequence=%llu slow_total=%llu slow_count=%u\n",
+        sequence,records.slow_total,records.slow_count);
     for(unsigned index=0;index<NativeAdrenoMemorySizeBucketCount;++index) {
         const NativeAdrenoMemoryBucketStats &bin=records.buckets[index];
         if(!bin.requests && !bin.lookups && !bin.bypassed) {
             continue;
         }
-        IOLog("NativeAdrenoBO: kernel_bin sequence=%llu sampled_us=%llu index=%u upper_bytes=%llu requests=%llu requested_bytes=%llu lookups=%llu hits=%llu misses=%llu bypassed=%llu miss_empty=%llu miss_size=%llu miss_attributes=%llu miss_quarantined=%llu\n",
-            sequence,sampled_us,index,bin.upper_bound_bytes,bin.requests,bin.bytes,bin.lookups,
-            bin.hits,bin.misses,bin.bypassed,bin.miss_reason[0],bin.miss_reason[1],
-            bin.miss_reason[2],bin.miss_reason[3]);
+        IOLog("NativeAdrenoBO: kernel_bin_bytes sequence=%llu index=%u upper_bytes=%llu requested_bytes=%llu\n",
+            sequence,index,bin.upper_bound_bytes,bin.bytes);
+        IOLog("NativeAdrenoBO: kernel_bin_counts sequence=%llu index=%u requests=%llu lookups=%llu hits=%llu\n",
+            sequence,index,bin.requests,bin.lookups,bin.hits);
+        IOLog("NativeAdrenoBO: kernel_bin_misses sequence=%llu index=%u misses=%llu bypassed=%llu\n",
+            sequence,index,bin.misses,bin.bypassed);
+        IOLog("NativeAdrenoBO: kernel_bin_shape sequence=%llu index=%u miss_empty=%llu miss_size=%llu\n",
+            sequence,index,bin.miss_reason[0],bin.miss_reason[1]);
+        IOLog("NativeAdrenoBO: kernel_bin_attributes sequence=%llu index=%u miss_attributes=%llu miss_quarantined=%llu\n",
+            sequence,index,bin.miss_reason[2],bin.miss_reason[3]);
     }
     static const char *rejectNames[]={"not_owned","not_prepared","not_wc","quarantined",
         "no_spans","zero_size","oversized","no_evictable_entry","no_slot","imported",
         "pooled","memory_pressure","busy"};
     for(unsigned index=0;index<NativeAdrenoBackingRejectReasonCount;++index) {
         if(records.insert_reject[index]) {
-            IOLog("NativeAdrenoBO: kernel_reject sequence=%llu sampled_us=%llu reason=%s count=%llu\n",
-                sequence,sampled_us,rejectNames[index],records.insert_reject[index]);
+            IOLog("NativeAdrenoBO: kernel_reject sequence=%llu reason=%s count=%llu\n",
+                sequence,rejectNames[index],records.insert_reject[index]);
         }
     }
     static const char *evictionNames[]={"object_limit","byte_limit","client_close",
         "memory_pressure","allocation_retry"};
     for(unsigned index=0;index<NativeAdrenoBackingEvictReasonCount;++index) {
         if(records.eviction_attempts[index] || records.evictions[index] || records.eviction_failures[index]) {
-            IOLog("NativeAdrenoBO: kernel_eviction sequence=%llu sampled_us=%llu reason=%s attempts=%llu failures=%llu objects=%llu bytes=%llu\n",
-                sequence,sampled_us,evictionNames[index],records.eviction_attempts[index],
-                records.eviction_failures[index],records.evictions[index],records.evicted_bytes[index]);
+            IOLog("NativeAdrenoBO: kernel_evict_counts sequence=%llu reason=%s attempts=%llu failures=%llu\n",
+                sequence,evictionNames[index],records.eviction_attempts[index],records.eviction_failures[index]);
+            IOLog("NativeAdrenoBO: kernel_evict_size sequence=%llu reason=%s objects=%llu bytes=%llu\n",
+                sequence,evictionNames[index],records.evictions[index],records.evicted_bytes[index]);
         }
     }
     static const char *operationNames[]={"allocation","owned_descriptor_release",
@@ -345,11 +398,14 @@ void printKernelBoProfile(uint64_t sequence,uint64_t sampled_us)
         char process[sizeof(event.process)];
         memcpy(process,event.process,sizeof(process));
         sanitizeProfileName(process,sizeof(process));
-        IOLog("NativeAdrenoBO: kernel_slow sequence=%llu sampled_us=%llu operation=%s source=%s cache=%s elapsed_us=%llu bytes=%llu spans=%llu output_bits=%u flags=%x cached_objects=%u cached_bytes=%llu available_pages=%llu process=\"%.*s\"\n",
-            event.sequence,event.sampled_us,operation<4?operationNames[operation]:"unknown",
-            source<4?sourceNames[source]:"unknown",cache<3?cacheNames[cache]:"unknown",
-            event.elapsed_us,event.bytes,event.spans,event.output_bits,event.flags,event.cached_objects,
-            event.cached_bytes,event.available_pages,int(sizeof(process)-1),process);
+        IOLog("NativeAdrenoBO: kernel_slow process=\"%.*s\" sequence=%llu sampled_us=%llu operation=%s source=%s cache=%s\n",
+            int(sizeof(process)-1),process,event.sequence,event.sampled_us,
+            operation<4?operationNames[operation]:"unknown",source<4?sourceNames[source]:"unknown",
+            cache<3?cacheNames[cache]:"unknown");
+        IOLog("NativeAdrenoBO: kernel_slow_object sequence=%llu elapsed_us=%llu bytes=%llu spans=%llu output_bits=%u flags=%x\n",
+            event.sequence,event.elapsed_us,event.bytes,event.spans,event.output_bits,event.flags);
+        IOLog("NativeAdrenoBO: kernel_slow_cache sequence=%llu cached_objects=%u cached_bytes=%llu available_pages=%llu\n",
+            event.sequence,event.cached_objects,event.cached_bytes,event.available_pages);
     }
 }
 
