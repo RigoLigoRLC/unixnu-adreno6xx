@@ -4,6 +4,8 @@
 #include "NativeAdrenoRing.h"
 #include "NativeAdrenoVm.h"
 
+enum : size_t {NativeAdrenoSubmitMaxBuffers=128};
+
 struct NativeAdrenoSubmitBuffer {
     uint64_t handle;
     uint64_t iova;
@@ -33,7 +35,7 @@ class NativeAdrenoSubmit final {
     struct Job {
         uint32_t fence=0;
         size_t count=0;
-        uint64_t handles[16]{};
+        uint64_t handles[NativeAdrenoSubmitMaxBuffers]{};
         uint32_t queue=0;
         bool active=false;
     } jobs_[8];
@@ -41,10 +43,14 @@ class NativeAdrenoSubmit final {
     NativeAdrenoRing *ring_=nullptr;
     NativeAdrenoSubmitStats stats_{};
     bool attached_=false,poisoned_=false;
-    uint32_t audit_tick_=0;   /* submissions since attach; every eighth one audits its IB lines */
+    uint32_t audit_tick_=0;
+    uint32_t coherence_tick_=0;
+    // The caller holds the GPU lock while these submission arrays are used.
+    uint64_t scratch_handles_[NativeAdrenoSubmitMaxBuffers]{};
+    uint32_t scratch_words_[NativeAdrenoSubmitMaxBuffers*4]{};
     Job *find(uint32_t fence);
     Job *free();
-    IOReturn release(Job &);
+    IOReturn release(Job &, bool acquire_imported = true);
     IOReturn poison();
 public:
     NativeAdrenoSubmit()=default;
@@ -64,8 +70,8 @@ public:
      * leaves other queues' jobs alone. Each client of the shared ring owns one such range. */
     bool rangeOutstanding(uint32_t first,uint32_t count) const;
     IOReturn waitRange(uint32_t first,uint32_t count,const NativeAdrenoRingClock *,uint32_t timeout_us);
-    /* Retires (without waiting) every job whose fence the CP has already passed, so completed work never pins buffers or
-     * job slots just because nobody called wait(). */
+    /* Completed jobs are collected without waiting. One imported-memory acquisition covers the whole completed batch before
+     * its references and job slots are retired. The caller serializes submissions, VM changes and retirement. */
     IOReturn retireCompleted();
     /* Waits for every outstanding job in submission order and retires its references. */
     IOReturn waitAll(const NativeAdrenoRingClock *,uint32_t timeout_us);

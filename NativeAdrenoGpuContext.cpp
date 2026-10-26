@@ -11,12 +11,35 @@ static const size_t kBytes[GpuBufferCount]={GpuSqeBytes,GpuRingBytes,GpuPageByte
 IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,const unsigned slots[2],
     const uint16_t sids[2],void (*progress)(uint32_t),NativeAdrenoGmuContextReport *report)
 {
+    return initialize(io,bank,asid,slots,sids,progress,report,nullptr);
+}
+
+IOReturn NativeAdrenoGpuContext::bringUpShared(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,
+    const unsigned slots[2],const uint16_t sids[2],NativeAdrenoGpuContext *source,
+    NativeAdrenoGmuContextReport *report)
+{
+    if(!source || source==this || !source->ready()) {
+        return kIOReturnBadArgument;
+    }
+    return initialize(io,bank,asid,slots,sids,nullptr,report,source);
+}
+
+IOReturn NativeAdrenoGpuContext::initialize(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,
+    const unsigned slots[2],const uint16_t sids[2],void (*progress)(uint32_t),
+    NativeAdrenoGmuContextReport *report,NativeAdrenoGpuContext *shared)
+{
     if(!report)return kIOReturnBadArgument;
     *report={};
     if(used_)return kIOReturnBusy;
     if(!io || !slots || !sids || bank>63 || !asid || asid>0xffff || slots[0]>127 || slots[1]>127 ||
         slots[0]==slots[1])return kIOReturnBadArgument;
     used_=true;
+    shared_=shared;
+    report->bank=bank;
+    report->asid=asid;
+    report->stream_count=2;
+    report->streams[0]={slots[0],sids[0]};
+    report->streams[1]={slots[1],sids[1]};
     IOReturn status=kIOReturnSuccess;
     auto step=[&](Step s) {report->step=s;if(progress)progress(s);};
     step(Allocate);
@@ -30,7 +53,7 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
     }
     /* The BO pool is taken first, while the VM still has long contiguous runs (the board sets the size from sheng-gpu-pool; 0 = scattered BOs only).
      * A pool that cannot be had at one size is tried at the next smaller; none is not an error. */
-    if(!status && native_adreno_pool_mib) {
+    if(!status && !shared_ && native_adreno_pool_mib) {
         for(uint32_t mib=native_adreno_pool_mib;mib>=16;mib>>=1) {
             const IOReturn pooled=NativeAdrenoMemory::reservePool(report->output_bits,(size_t)mib<<20);
             native_adreno_pool_stats[0]=pooled==kIOReturnSuccess?mib:0;native_adreno_pool_status=(uint32_t)pooled;
@@ -39,14 +62,36 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
         /* Not fatal: without it each pooled BO changes its pages' attribute itself, as a scattered one does. */
         if(native_adreno_wc_enabled && NativeAdrenoMemory::poolBytes())native_adreno_pool_wc=(uint32_t)NativeAdrenoMemory::writeCombinePool()|1u<<31;
     }
-    if(!status)status=tables_.allocate(TablePages*0x1000,report->output_bits,true,TablePages*0x1000);
-    for(unsigned i=0;!status && i<GpuBufferCount;++i)
+    if(!status) {
+        report->allocation_bytes=TablePages*0x1000;
+        status=tables_.allocate(TablePages*0x1000,report->output_bits,true,TablePages*0x1000);
+        report->allocation_status=status;
+    }
+    for(unsigned i=0;!status && !shared_ && i<GpuBufferCount;++i) {
+        report->allocation_index=i+1;
+        report->allocation_bytes=kBytes[i];
+        IOLog("NativeAdrenoGpuMemory: allocate index=%u iova=%llx bytes=%lx\n",i,kIovas[i],kBytes[i]);
         status=buffers_[i].allocate(kBytes[i],report->output_bits,true,kBytes[i]);
+        if(!status) {
+            IOLog("NativeAdrenoGpuMemory: CPU cache conversion begin index=%u\n",i);
+            status=buffers_[i].makeWriteCombined();
+            IOLog("NativeAdrenoGpuMemory: CPU cache conversion end index=%u status=%08x\n",i,status);
+        }
+        report->allocation_status=status;
+    }
     if(!status) {
         step(Prepare);
         status=smmu_.prepare(&tables_,0,0,GpuApertureBytes,NativeAdrenoSmmuContext::MaxLeaves,
             bank,asid,1000,report->output_bits);
         if(!status)smmu_.setAliasScratch(alias_scratch_,sizeof alias_scratch_/sizeof *alias_scratch_);
+    }
+    if(!status) {
+        step(Ownership);
+        report->ownership_status=ArmSmmu4KCheckFaultedStreams(io,report->streams,
+            report->stream_count,bank,smmu_.configuration()->stream_shareability,&report->ownership);
+        if(report->ownership_status!=ArmSmmu4KSuccess) {
+            status=kIOReturnIOError;
+        }
     }
     if(!status) {
         step(Program);
@@ -68,15 +113,26 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
     if(!status) {
         step(VmAttach);
         NativeAdrenoVmRegion lower={&tables_,smmu_.arenaHandle(),smmu_.stateHandle()};
-        /* 65536 spans: 256 MiB of BOs even when every page is its own span. The Metal runtime pools its memory in 64 MiB blocks,
-         * which XNU rarely finds physically contiguous; one scattered block is 16384 spans (int-070 ran out at 16384). */
+        /* The initial span array grows with live mappings up to the aperture's
+         * actual leaf budget, including scattered allocations and imports. */
         status=vm_.attach(io,smmu_.configHandle(),smmu_.streamsHandle(),&lower,nullptr,131072,262144);
     }
     if(!status) {
         step(Map);
-        /* adreno_fw_create_bo maps the SQE MSM_BO_GPU_READONLY without NOEXEC; every other kernel BO read/write. */
-        for(unsigned i=0;!status && i<GpuBufferCount;++i)
-            status=vm_.map(&buffers_[i],0,kIovas[i],i?3u:5u,0,2,&handles_[i]);
+        const unsigned permissions[GpuBufferCount]={
+            ArmSmmu4KRead|ArmSmmu4KExecute,
+            ArmSmmu4KRead|ArmSmmu4KPrivileged,
+            ArmSmmu4KRead|ArmSmmu4KWrite|ArmSmmu4KPrivileged,
+            ArmSmmu4KRead|ArmSmmu4KWrite|ArmSmmu4KPrivileged,
+            ArmSmmu4KRead|ArmSmmu4KWrite
+        };
+
+        /* APRIV permits the CP to access its ring, memptrs and power-up list.
+         * Indirect user commands retain access only to the scratch buffer. */
+        for(unsigned i=0;!status && i<GpuBufferCount;++i) {
+            status=vm_.map(&buffer(i),0,kIovas[i],permissions[i],0,2,&handles_[i]);
+        }
+
         report->spans=uint32_t(vm_.spanCount());
     }
     if(!status) {
@@ -84,6 +140,7 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
         ready_=true;
     }
     report->status=status;
+    NativeAdrenoCaptureSmmuReport(io,&smmu_,report);
     return status;
 }
 static NativeAdrenoGpuContext *board_gpu_context;

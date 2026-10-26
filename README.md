@@ -5,11 +5,60 @@ This driver contains the SM7325 backend for the Samsung Galaxy Tab S7 FE Wi-Fi
 GMEM, and starts with a 315 MHz GPU request. The firmware inputs are
 `a660_gmu.bin`, `a660_sqe.fw`, and the A660 ZAP metadata and shader segments.
 
-The driver retains NativeAdreno ABI v1 in [NativeAdrenoABI.h](NativeAdrenoABI.h).
+The driver advertises NativeAdreno ABI v2 in [NativeAdrenoABI.h](NativeAdrenoABI.h),
+with up to 128 IBs in a 3104-byte submit record. The kernel also accepts the
+416-byte version 1 record containing up to 16 IBs. Userspace queries the version
+before choosing its record size; the mailbox transport uses the smaller record.
 The existing BO allocation/import, SMMU mappings, queues, submission, fences and
 IOKit transport connect to the A6xx power, GMU, CP and interrupt implementations.
 The startup sequence requires actual firmware replies and a GPU memory write
 before publishing the GPU service.
+
+## Submission and mapping costs
+
+BO handles use indices into 16384-entry client and shared VM tables. The sorted
+IOVA range array uses binary searches for overlap and unmap locations. Dynamic
+span capacity remains bounded by the configured page-table arenas. A fresh
+driver allocation can use ArmSmmu4K's exclusive map transaction only while it
+has no device references and has never exposed a client CPU mapping token.
+Imports and exposed allocations retain physical alias checks.
+
+ArmSmmu4K validates the changed descriptors during updates and completes unmap
+TLB invalidation before returning. Submit publishes BO contents without an
+additional full TLB flush. CPU cache maintenance for imports, write-combined
+page attribute reassertion, and the shared submission lock remain in place.
+
+These adaptations follow upstream Adreno740
+[handle indices](https://github.com/UniXNU/Adreno740/commit/25abaa4b15e5da2b9966152899cf99389c63008d),
+[VM changes](https://github.com/UniXNU/Adreno740/commit/1c4065cfb1f3e05e4bff30fbfabc6c291f472c28),
+[128 IB records](https://github.com/UniXNU/Adreno740/commit/c232716ce093df4b73c9fca0e608d6fd430f5390),
+and the synchronized
+[ArmSmmu4K](https://github.com/UniXNU/ArmSmmu4K/commit/3ba92451bd44bb742d11758fbfcd3a446ecad685).
+
+## Submission profiling
+
+`native-adreno-profile=1` enables CPU duration accumulation on each successful
+submission. `native-adreno-profile-every=16` is the default hardware sampling
+interval; `1` samples every submission. Selected submissions emit begin/end
+hardware counter snapshots, each containing one WFI and 107 command words.
+The other submissions retain CPU timings without those GPU commands. Snapshot
+buffers use whole-page publication and acquisition around their 512-byte slots.
+
+`gpu-profile` prints eight cumulative aggregate lines with one shared `snapshot`
+number. CPU totals cover validation including prior-job retirement, page-attribute
+reassertion and optional IB audit, BO publication, and ring reserve/emission/WPTR
+publication. They start after the global GPU lock and user-client dispatch have
+been entered. Global lock waiting, BO allocation/import/map calls, and time after
+submission completion are outside these CPU totals. GPU elapsed and queue delay
+describe the selected submissions; their WFI operations still drain the pipeline.
+
+The summary reports `sample_every`, `sampled`, `valid`, invalid sample counts,
+valid counter and nonzero counter masks. Counter totals are accompanied by
+per-counter valid sample counts. All-zero deltas leave `populated_mask=0`.
+The 512-entry detail ring overwrites its oldest records independently of the
+cumulative aggregates; `lost` counts only those overwritten detail records.
+`native-adreno-profile-detail=1` additionally prints at most 32 detail records
+per request. Runtime captures determine whether hardware counters are populated.
 
 ## Board interface
 
@@ -38,12 +87,25 @@ this component and the required ArmSmmu4K/AdrenoPM4 sources into
 archive into the kernel. The recipe defers the IOKit class constructors until
 the runtime publication setup.
 
-On 2026-10-25, `49h` booted to the desktop and USB captured the GPU worker.
-Startup stopped while validating command-db BCM auxiliary data, before GMU
-startup. The ACV fixed vote now accepts zero unit/width fields, following the
-stock A660 encoding. Build `49i` completed all eight stages and its 512 MiB FAT
-was written and synced; its GPU results remain pending. CP and Vulkan execution
-have not yet been recorded on this device.
+On 2026-10-25, build `50c` completed the build, its 512 MiB FAT write and sync,
+and hardware startup. Kernel scratch/fence and all four userspace CP_MEM_WRITE
+readbacks passed with zero faults. Turnip completed Vulkan offscreen fill of
+1024 words, compute of 1024 words, and triangle rendering of 512 pixels with
+zero unexpected pixels. It reported stage=0, VkResult=0, compute_stage=0 and
+render_stage=0, then exited with status 0. DeviceInfo reports flags=1, UBWC=3,
+swizzle=6 and macrotile=0. System Metal composition and DPU scanout remain
+pending. The workspace [GPU implementation](../../../../notes/GPU_IMPLEMENTATION.md)
+records the current result and raw log
+`logs/t733-usb-live/t733-20261025T081340.968881Z.raw`.
+
+LPAC has its own context, ASID and SID1/0x401 routes. Its page tables map the
+main GPU's existing startup memory objects at the same IOVAs. The provider
+handles faults for all three contexts and checks every startup page through
+both GPU and both LPAC SIDs before starting SQE. The ZAP reservation uses a
+write-combined CPU mapping; loading copies the ELF segment's file bytes and
+zeros only the remaining memory bytes. The earlier LPAC and ZAP investigation
+is recorded in the workspace's
+[first-fetch audit](../../../../notes/GPU_FIRST_FETCH_AUDIT_2026-10-25.md).
 
 ## Licenses and sources
 

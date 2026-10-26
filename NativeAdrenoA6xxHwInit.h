@@ -9,6 +9,8 @@
 class NativeAdrenoA6xxHwInit final {
 public:
     static IOReturn program(const NativeAdrenoRingIo *,uint32_t highestBankBit);
+    static IOReturn programClockGating(const NativeAdrenoRingIo *);
+    static IOReturn finish(const NativeAdrenoRingIo *);
     static IOReturn stop(const NativeAdrenoRingIo *,uint32_t pollLimit);
 };
 

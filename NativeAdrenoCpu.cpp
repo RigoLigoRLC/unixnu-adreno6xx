@@ -1,10 +1,12 @@
 /* SPDX-License-Identifier: MIT */
 #include "NativeAdrenoMemory.h"
+#include <IOKit/IOLib.h>
 #include <kern/cpu_data.h>
 #include <vm/vm_map.h>
 #include <mach/vm_param.h>
 #include <kern/clock.h>
 #include <vm/memory_types.h>
+#include <pexpert/pexpert.h>
 extern "C" vm_offset_t phystokv(uint64_t pa);
 extern "C" uint64_t gPhysBase,gPhysSize;   /* the physical range phystokv covers (the kernel's own DRAM); anything else panics in phystokv */
 extern "C" void pmap_set_cache_attributes(ppnum_t pn,unsigned int cacheattr);
@@ -14,6 +16,20 @@ extern "C" unsigned int pmap_cache_attributes(ppnum_t pn);
 extern "C" {volatile uint64_t native_adreno_cache_stats[5];}
 /* Time spent checking and re-asserting write-combined page attributes (NativeAdrenoReassertWriteCombined), for the board page. */
 extern "C" {volatile uint64_t native_adreno_reassert_ticks;}
+bool NativeAdrenoCacheTraceEnabled()
+{
+    static unsigned int state=0;
+    unsigned int current=__atomic_load_n(&state,__ATOMIC_RELAXED);
+    if(!current) {
+        int enabled=0;
+        PE_parse_boot_argn("native-adreno-cache-trace",&enabled,sizeof(enabled));
+        current=enabled?2:1;
+        __atomic_store_n(&state,current,__ATOMIC_RELAXED);
+    }
+
+    return current==2;
+}
+
 static void noteMaintenance(uint64_t began,size_t bytes)
 {
     const uint64_t ticks=mach_absolute_time()-began;
@@ -74,29 +90,88 @@ IOReturn NativeAdrenoMaintainPhysicalPages(uint64_t physical,size_t bytes,Native
 {
     if(!physical || !bytes || ((physical|bytes)&4095) || physical>UINT64_MAX-bytes || op>NativeAdrenoInvalidate || op<NativeAdrenoClean)
         return kIOReturnBadArgument;
+    const NativeAdrenoPhysicalSpan span={0,physical,bytes};
+    return NativeAdrenoMaintainPhysicalSpans(&span,1,0,bytes,op);
+}
+
+IOReturn NativeAdrenoMaintainPhysicalSpans(const NativeAdrenoPhysicalSpan *spans,size_t count,size_t offset,size_t bytes,
+    NativeAdrenoCacheOperation op)
+{
+    if(!spans || !count || !bytes || ((offset|bytes)&4095) || offset>SIZE_MAX-bytes ||
+        op>NativeAdrenoInvalidate || op<NativeAdrenoClean) {
+        return kIOReturnBadArgument;
+    }
+
     const uint64_t began=mach_absolute_time();
-    /* One barrier pair per run of up to 64 pages instead of per page (an imported 3048x2032 surface is 5952 pages): preemption stays off
-     * for a bounded run, and the closing DSB on the issuing core completes every operation of that run. */
-    for(size_t offset=0;offset<bytes;) {
-        disable_preemption();
-        uint64_t ctr;__asm__ volatile("mrs %0, ctr_el0":"=r"(ctr));
-        const size_t line=(size_t)4<<((ctr>>16)&15);
-        if(line>4096) {enable_preemption();return kIOReturnUnsupported;}
-        __asm__ volatile("dsb sy":::"memory");
-        for(unsigned run=0;run<64 && offset<bytes;++run,offset+=4096) {
+    const size_t limit=offset+bytes;
+    size_t covered=offset;
+    for(size_t i=0;i<count && covered<limit;++i) {
+        const NativeAdrenoPhysicalSpan &span=spans[i];
+        if(!span.physical || !span.bytes || ((span.offset|span.physical|span.bytes)&4095) ||
+            span.offset>UINT64_MAX-span.bytes || span.physical>UINT64_MAX-span.bytes) {
+            return kIOReturnBadArgument;
+        }
+        if(span.offset+span.bytes<=covered) {
+            continue;
+        }
+        if(span.offset>covered) {
+            return kIOReturnBadArgument;
+        }
+        covered=span.offset+span.bytes<limit?span.offset+span.bytes:limit;
+    }
+    if(covered!=limit) {
+        return kIOReturnBadArgument;
+    }
+
+    /* A batch spans up to 64 physical pages even when each page has its own span. Its closing DSB completes all operations
+     * on the issuing core before preemption is enabled, and the next batch reads that core's cache-line size again. */
+    unsigned run=0;
+    size_t line=0;
+    for(size_t i=0;i<count;++i) {
+        const NativeAdrenoPhysicalSpan &span=spans[i];
+        if(span.offset>=limit) {
+            break;
+        }
+        const size_t begin=offset>span.offset?offset:span.offset;
+        const size_t end=limit<span.offset+span.bytes?limit:span.offset+span.bytes;
+        if(begin>=end) {
+            continue;
+        }
+        for(uint64_t page=span.physical+(begin-span.offset),endPhysical=page+(end-begin);page<endPhysical;page+=4096) {
+            if(!run) {
+                disable_preemption();
+                uint64_t ctr;__asm__ volatile("mrs %0, ctr_el0":"=r"(ctr));
+                line=(size_t)4<<((ctr>>16)&15);
+                if(line>4096) {
+                    enable_preemption();
+                    return kIOReturnUnsupported;
+                }
+                __asm__ volatile("dsb sy":::"memory");
+            }
             /* A page outside the kernel's DRAM is device memory (the firmware framebuffer the display hand-off imports): the CPU maps it
              * uncached (kIOMapInhibitCache), no cache line of it exists to maintain, and phystokv would panic on it (int-080: illegal PA
              * 0xb8000000). */
-            const uint64_t page=physical+offset;
-            if(page<gPhysBase || page-gPhysBase>=gPhysSize)continue;
-            const vm_offset_t alias=phystokv(page);
-            if(!alias) {__asm__ volatile("dsb sy":::"memory");enable_preemption();return kIOReturnUnsupported;}
-            for(uintptr_t address=alias,end=alias+4096;address<end;address+=line) {
-                if(op==NativeAdrenoClean)__asm__ volatile("dc cvac, %0"::"r"(address):"memory");
-                else if(op==NativeAdrenoCleanInvalidate)__asm__ volatile("dc civac, %0"::"r"(address):"memory");
-                else __asm__ volatile("dc ivac, %0"::"r"(address):"memory");
+            if(page>=gPhysBase && page-gPhysBase<gPhysSize) {
+                const vm_offset_t alias=phystokv(page);
+                if(!alias) {
+                    __asm__ volatile("dsb sy":::"memory");
+                    enable_preemption();
+                    return kIOReturnUnsupported;
+                }
+                for(uintptr_t address=alias,endAddress=alias+4096;address<endAddress;address+=line) {
+                    if(op==NativeAdrenoClean)__asm__ volatile("dc cvac, %0"::"r"(address):"memory");
+                    else if(op==NativeAdrenoCleanInvalidate)__asm__ volatile("dc civac, %0"::"r"(address):"memory");
+                    else __asm__ volatile("dc ivac, %0"::"r"(address):"memory");
+                }
+            }
+            if(++run==64) {
+                __asm__ volatile("dsb sy":::"memory");
+                enable_preemption();
+                run=0;
             }
         }
+    }
+    if(run) {
         __asm__ volatile("dsb sy":::"memory");
         enable_preemption();
     }
@@ -112,6 +187,7 @@ IOReturn NativeAdrenoMaintainPhysicalPages(uint64_t physical,size_t bytes,Native
 IOReturn NativeAdrenoSetPagesCacheMode(const NativeAdrenoPhysicalSpan *spans,size_t count,bool write_combined)
 {
     if(!spans || !count)return kIOReturnBadArgument;
+    const bool trace=NativeAdrenoCacheTraceEnabled();
     uint64_t pages=0;
     for(size_t i=0;i<count;++i) {
         const NativeAdrenoPhysicalSpan &span=spans[i];
@@ -119,9 +195,23 @@ IOReturn NativeAdrenoSetPagesCacheMode(const NativeAdrenoPhysicalSpan *spans,siz
             span.physical<gPhysBase || span.physical+span.bytes-gPhysBase>gPhysSize)return kIOReturnBadArgument;
         pages+=span.bytes/4096;
     }
-    for(size_t i=0;i<count;++i)
-        for(uint64_t offset=0;offset<spans[i].bytes;offset+=4096)
+    for(size_t i=0;i<count;++i) {
+        if(trace) {
+            IOLog("NativeAdrenoCpu: pmap span=%lx physical=%llx bytes=%llx mode=%u\n",
+                i,spans[i].physical,spans[i].bytes,write_combined);
+        }
+        for(uint64_t offset=0;offset<spans[i].bytes;offset+=4096) {
+            const bool marker=trace && !(offset&0x3ffff);
+            if(marker) {
+                IOLog("NativeAdrenoCpu: pmap_set_cache_attributes begin physical=%llx offset=%llx\n",
+                    spans[i].physical+offset,offset);
+            }
             pmap_set_cache_attributes((ppnum_t)((spans[i].physical+offset)>>12),write_combined?VM_WIMG_WCOMB:VM_WIMG_USE_DEFAULT);
+            if(marker) {
+                IOLog("NativeAdrenoCpu: pmap_set_cache_attributes returned physical=%llx\n",spans[i].physical+offset);
+            }
+        }
+    }
     if(write_combined)__atomic_fetch_add(&native_adreno_cache_stats[4],pages,__ATOMIC_RELAXED);
     else __atomic_fetch_sub(&native_adreno_cache_stats[4],pages,__ATOMIC_RELAXED);
     return kIOReturnSuccess;

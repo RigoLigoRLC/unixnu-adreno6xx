@@ -12,11 +12,16 @@ struct NativeAdrenoCpuState {
     uint64_t kernel_page_bytes,kernel_map_page_bytes;
 };
 IOReturn NativeAdrenoQueryCpu4K(NativeAdrenoCpuState *);
+/* The native-adreno-cache-trace boot argument enables per-BO and per-span cache logs. */
+bool NativeAdrenoCacheTraceEnabled();
 enum NativeAdrenoCacheOperation {NativeAdrenoClean,NativeAdrenoCleanInvalidate,NativeAdrenoInvalidate};
 IOReturn NativeAdrenoMaintainOwnedPages(void *,size_t,NativeAdrenoCacheOperation);
 /* The same over whole physical pages of DRAM, through the kernel's physical aperture: data cache lines are physically tagged, so this
  * reaches lines another task's mapping left (an imported IOSurface). Apple's sys_dcache_flush is only a DSB, so user space cannot. */
 IOReturn NativeAdrenoMaintainPhysicalPages(uint64_t physical,size_t bytes,NativeAdrenoCacheOperation);
+/* The requested page-aligned interval is maintained across its ordered physical spans, with at most 64 pages per preemption hold. */
+IOReturn NativeAdrenoMaintainPhysicalSpans(const NativeAdrenoPhysicalSpan *,size_t count,size_t offset,size_t bytes,
+    NativeAdrenoCacheOperation);
 /* Every CPU mapping of the spans' pages becomes write-combined (true) or takes the default cacheable attribute again (false). */
 IOReturn NativeAdrenoSetPagesCacheMode(const NativeAdrenoPhysicalSpan *,size_t count,bool write_combined);
 /* int-100 found a write-combined BO's page back at the default (cacheable) attribute with dirty IB lines: XNU's view machinery sets a page's
@@ -40,6 +45,7 @@ class NativeAdrenoMemory final {
     size_t bytes_=0,span_count_=0,span_capacity_=0;
     uint32_t device_references_=0;
     bool prepared_=false,quarantined_=false,write_combined_=false,pooled_=false;
+    bool client_mapping_exposed_=false;
     size_t pool_offset_=0;
     IOReturn maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation);
 public:
@@ -71,6 +77,16 @@ public:
      * publishForDevice/acquireDeviceWrites have nothing to do for this object. Spans and PA bounds are checked as for allocate. */
     IOReturn importTask(void *task,uint64_t address,size_t bytes,unsigned output_bits,size_t byte_budget);
     bool imported() const {return imported_!=nullptr;}
+    /* A CPU mapping token allows a client to import the same physical pages
+     * through another BO. This fact stays set until backing memory is released. */
+    void exposeClientMapping()
+    {
+        client_mapping_exposed_=true;
+    }
+    bool clientMappingExposed() const
+    {
+        return client_mapping_exposed_;
+    }
     /* An import of memory the owner maps read-only (the kernel could pin it for reading only): the GPU may read it, never write it. */
     bool readOnly() const {return read_only_;}
     /* After allocate(), before any device or client mapping: cleans and invalidates the pages and makes every CPU mapping of them

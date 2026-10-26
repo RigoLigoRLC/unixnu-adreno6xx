@@ -230,9 +230,22 @@ IOReturn NativeAdrenoMemory::makeWriteCombined()
     if(!(descriptor_ || pooled_) || imported_ || !prepared_ || quarantined_ || device_references_ || write_combined_ || !mapping_ || !span_count_)
         return kIOReturnNotReady;
     if(pooled_ && pool.write_combined) {write_combined_=true;return kIOReturnSuccess;}
+    const bool trace=NativeAdrenoCacheTraceEnabled();
+    if(trace) {
+        IOLog("NativeAdrenoMemory: clean/invalidate begin cpu=%p bytes=%lx spans=%lx\n",mapping_,bytes_,span_count_);
+    }
     IOReturn status=NativeAdrenoMaintainOwnedPages(mapping_,bytes_,NativeAdrenoCleanInvalidate);
+    if(trace || status) {
+        IOLog("NativeAdrenoMemory: clean/invalidate end status=%08x\n",status);
+    }
     if(status)return status;
+    if(trace) {
+        IOLog("NativeAdrenoMemory: pmap cache attributes begin physical=%llx bytes=%lx\n",spans_[0].physical,bytes_);
+    }
     status=NativeAdrenoSetPagesCacheMode(spans_,span_count_,true);
+    if(trace || status) {
+        IOLog("NativeAdrenoMemory: pmap cache attributes end status=%08x\n",status);
+    }
     if(status)return status;
     write_combined_=true;return kIOReturnSuccess;
 }
@@ -268,6 +281,7 @@ IOReturn NativeAdrenoMemory::release()
         native_adreno_trace_stage=34;
     }
     if(pooled_) {poolGive(pool_offset_,bytes_);pooled_=false;prepared_=false;pool_offset_=0;}
+    client_mapping_exposed_=false;
     if(spans_)IODeleteData(spans_,NativeAdrenoPhysicalSpan,span_capacity_);
     mapping_=nullptr;spans_=nullptr;bytes_=span_count_=span_capacity_=0;read_only_=false;
     return kIOReturnSuccess;
@@ -289,8 +303,14 @@ IOReturn NativeAdrenoMemory::publishForDevice(size_t offset,size_t bytes,bool wr
     if(!backed() || !prepared_ || quarantined_)return kIOReturnNotReady;
     if(!bytes || ((offset|bytes)&4095) || offset>bytes_ || bytes>bytes_-offset)return kIOReturnBadArgument;
     if(imported_)return maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);
-    if(write_combined_)   /* no CPU mapping should cache these pages; if one does, reach its lines through the physical pages */
-        return include_write_combined?maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean):kIOReturnSuccess;
+    if(write_combined_) {
+        if(include_write_combined) {
+            return maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);
+        }
+
+        __asm__ volatile("dsb st" ::: "memory");
+        return kIOReturnSuccess;
+    }
     return NativeAdrenoMaintainOwnedPages(static_cast<unsigned char *>(mapping_)+offset,bytes,
         writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);
 }
@@ -300,20 +320,15 @@ IOReturn NativeAdrenoMemory::acquireDeviceWrites(size_t offset,size_t bytes)
     if(!bytes || ((offset|bytes)&4095) || offset>bytes_ || bytes>bytes_-offset)return kIOReturnBadArgument;
     /* Imported pages may hold the owner's unrelated dirty lines next to the GPU's writes: clean as well as invalidate. */
     if(imported_)return maintainImported(offset,bytes,NativeAdrenoCleanInvalidate);
-    if(write_combined_)return kIOReturnSuccess;
+    if(write_combined_) {
+        __asm__ volatile("dsb ld" ::: "memory");
+        return kIOReturnSuccess;
+    }
     return NativeAdrenoMaintainOwnedPages(static_cast<unsigned char *>(mapping_)+offset,bytes,NativeAdrenoInvalidate);
 }
 /* Imported pages have no kernel mapping here (and write-combined ones only a non-cacheable one); maintain each span's part of
  * [offset, offset+bytes) by physical address. */
 IOReturn NativeAdrenoMemory::maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation op)
 {
-    for(size_t i=0;i<span_count_;++i) {
-        const NativeAdrenoPhysicalSpan &span=spans_[i];
-        const size_t begin=offset>span.offset?offset:span.offset;
-        const size_t end=offset+bytes<span.offset+span.bytes?offset+bytes:span.offset+span.bytes;
-        if(begin>=end)continue;
-        const IOReturn status=NativeAdrenoMaintainPhysicalPages(span.physical+(begin-span.offset),end-begin,op);
-        if(status)return status;
-    }
-    return kIOReturnSuccess;
+    return NativeAdrenoMaintainPhysicalSpans(spans_,span_count_,offset,bytes,op);
 }

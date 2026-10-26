@@ -118,9 +118,9 @@ IOReturn NativeAdrenoIrq::handle(NativeAdrenoIrqResult *result)
     if(status&(IrqBitTsbWrite|IrqBitFuse))flags|=NativeAdrenoIrqSecurity;
     if(status&IrqBitCpHw) {
         if(io_.read32(io_.cookie,IrqCpStatus,&cp_status))return poison();
+        flags|=NativeAdrenoIrqCpError;
         if(cp_status&cpErrorMask(generation_)) {
             if(io_.read32(io_.cookie,IrqCpProtect,&protect))return poison();
-            flags|=NativeAdrenoIrqCpError;
         }
     }
     const uint32_t known=generation_==NativeAdrenoA642L?

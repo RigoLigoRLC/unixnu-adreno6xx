@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "NativeAdrenoGeneration.h"
+#include "NativeAdrenoSubmissionProfile.h"
 
 /* NativeAdrenoRing owns a command processor ring and its timestamp fence.
  * Register indices are dword offsets; the platform adds the MMIO base and
@@ -24,6 +25,10 @@ struct NativeAdrenoRingIo {
     int (*write32)(void *,uint32_t reg,uint32_t value);
     int (*read32)(void *,uint32_t reg,uint32_t *value);
     int (*barrier)(void *);
+    /* The A642L platform retries a dropped WPTR write through the GMU fence. */
+    int (*writeWptr)(void *,uint32_t value);
+    /* The GMU AO status uses bit 23 for GPU busy excluding AHB accesses. */
+    int (*readGpuBusy)(void *,uint32_t *status);
 };
 struct NativeAdrenoRingCache {
     void *cookie;
@@ -47,18 +52,25 @@ enum NativeAdrenoRingFence {
 class NativeAdrenoRing final {
     NativeAdrenoRingIo io_{};
     NativeAdrenoRingCache cache_{};
+    NativeAdrenoSubmissionProfile profile_;
     volatile uint32_t *ring_=nullptr,*fence_=nullptr;
     size_t ring_bytes_=0,fence_bytes_=0;
     uint64_t ring_iova_=0,fence_iova_=0;
     uint32_t next_=0,rptr_shadow_=0,seqno_=0,completed_=0,submissions_=0;
     bool attached_=false,poisoned_=false,reset_pending_=false;
+    bool bootstrap_pending_=false;
     NativeAdrenoGeneration generation_=NativeAdrenoA740;
     IOReturn poison();
     IOReturn readRptr(uint32_t *);
+    IOReturn reserveA6xx(uint32_t words,uint32_t *at);
+    IOReturn commit(uint32_t end,uint32_t serial,bool profiled=false);
+    void logBootstrap(uint32_t target,uint32_t rptr,uint32_t busy,const char *result);
     IOReturn emitPrologue(uint32_t at,bool reset,uint32_t *end);
     IOReturn emitFence(uint32_t at,uint32_t seqno,uint32_t *end);
     IOReturn emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *end);
-    IOReturn submitWords(const uint32_t *words,size_t word_count,uint32_t *fence,bool framed);
+    IOReturn emitProfile(uint32_t at,uint32_t fence,bool end,uint32_t *next);
+    IOReturn submitWords(const uint32_t *words,size_t word_count,uint32_t *fence,bool framed,
+        const NativeAdrenoProfileCpuTiming *timing=nullptr);
 public:
     NativeAdrenoRing()=default;
     ~NativeAdrenoRing()=default;
@@ -79,9 +91,27 @@ public:
      * it with one WPTR update. Returns a nonzero fence value on success. The
      * words are copied; the caller's buffer is never retained. */
     IOReturn submit(const uint32_t *words,size_t word_count,uint32_t *fence);
+    /* A642L bootstrap commands run before timestamp memory is usable. The
+     * returned WPTR is completed only by waitBootstrap's hardware-idle check. */
+    IOReturn submitBootstrap(const uint32_t *words,size_t word_count,uint32_t *wptr);
+    NativeAdrenoRingFence waitBootstrap(uint32_t wptr,const NativeAdrenoRingClock *,
+        uint32_t timeout_us,uint32_t *observed);
     /* A642L user buffers receive A6xx IB-list markers and CACHE_FLUSH_TS.
      * A740 user buffers receive its BR/BV thread synchronization packets. */
-    IOReturn submitFramed(const uint32_t *words,size_t word_count,uint32_t *fence);
+    IOReturn submitFramed(const uint32_t *words,size_t word_count,uint32_t *fence,
+        const NativeAdrenoProfileCpuTiming *timing=nullptr);
+    /* Optional A642L sampling is configured after attach, before SQE starts.
+     * Completed slots are consumed by Submit under the same submission lock. */
+    IOReturn enableProfiling(NativeAdrenoVm *);
+    bool profilingEnabled() const { return profile_.enabled(); }
+    void setProfileCpuTiming(uint32_t fence,const NativeAdrenoProfileCpuTiming &timing)
+    {
+        profile_.setCpuTiming(fence,timing);
+    }
+    void collectProfile(uint32_t fence)
+    {
+        profile_.collect(fence);
+    }
     /* The next user submission waits for idle on A642L or clears the A740
      * thread counters, timestamps and resource table between thread syncs. */
     void requestContextReset() {reset_pending_=true;}
@@ -97,7 +127,7 @@ public:
     bool poisoned() const {return poisoned_;}
     /* A fatal GPU fault prevents further WPTR updates and retains live DMA. */
     void recordFault() {poisoned_=true;}
-    uint32_t outstanding() const {return seqno_-completed_;}
+    uint32_t outstanding() const {return seqno_-completed_+(bootstrap_pending_?1:0);}
     uint32_t lastSubmitted() const {return seqno_;}      /* the newest fence number handed out */
     uint32_t completedFence() const {return completed_;}
     uint32_t submissions() const {return submissions_;}

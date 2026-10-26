@@ -7,7 +7,7 @@
  * and IB_SIZE in dwords (bits 0..19), exactly as the pinned adreno_pm4.xml
  * domain states and Linux msm_gem_submit.c converts the userspace byte size. */
 enum : uint32_t {SubmitIndirectBuffer=0x3f,SubmitIbWords=3,SubmitMaxJobs=8,
-    SubmitMaxBuffers=16,SubmitMaxIbBytes=0xfffffu*4u,
+    SubmitMaxBuffers=uint32_t(NativeAdrenoSubmitMaxBuffers),SubmitMaxIbBytes=0xfffffu*4u,
     SubmitAuditBytes=256u*1024u};   /* IB bytes the write-combine audit compares per submission */
 extern "C" {volatile uint32_t native_adreno_coherence[8];}
 /* The submission (1-based count) at which the write-combine audit found a dirty IB line or failed; 0 = never. */
@@ -42,15 +42,16 @@ IOReturn NativeAdrenoSubmit::attach(NativeAdrenoVm *vm,NativeAdrenoRing *ring)
     vm_=vm;ring_=ring;attached_=true;stats_={};
     return kIOReturnSuccess;
 }
-IOReturn NativeAdrenoSubmit::release(Job &job)
+IOReturn NativeAdrenoSubmit::release(Job &job, bool acquire_imported)
 {
+    ring_->collectProfile(job.fence);
     IOReturn status=kIOReturnSuccess;
     for(size_t i=0;i<job.count;++i) {
         IOReturn retired=vm_->retireJobAfterCompletion(job.handles[i]);
         if(retired)status=retired;else ++stats_.references_retired;
     }
     if(status)return poison();
-    if(vm_->acquireImported())return poison();
+    if(acquire_imported && vm_->acquireImported())return poison();
     job={};return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoSubmit::detach()
@@ -78,9 +79,18 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
     if(!fence)return kIOReturnBadArgument;*fence=0;
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     if(!buffers || !count || count>SubmitMaxBuffers)return kIOReturnBadArgument;
+    const bool profiling=ring_->profilingEnabled();
+    NativeAdrenoProfileCpuTiming timing{};
+    if(profiling) {
+        timing.submitUs=NativeAdrenoProfileNowUs();
+        timing.queue=queue;
+        timing.ibs=uint32_t(count);
+    }
     /* Every buffer is validated against the live VM before any reference. */
-    uint64_t handles[SubmitMaxBuffers];size_t handle_count=0;
-    uint32_t words[SubmitMaxBuffers*(1+SubmitIbWords)];size_t word_count=0;
+    uint64_t *handles=scratch_handles_;
+    uint32_t *words=scratch_words_;
+    size_t handle_count=0;
+    size_t word_count=0;
     for(size_t i=0;i<count;++i) {
         const NativeAdrenoSubmitBuffer &buffer=buffers[i];
         if(!buffer.handle || !buffer.bytes || (buffer.bytes&3) || buffer.bytes>SubmitMaxIbBytes)
@@ -113,12 +123,17 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
         }
         ++stats_.references_held;
     }
+    if(profiling) {
+        timing.validationUs=NativeAdrenoProfileNowUs()-timing.submitUs;
+        timing.depth=uint32_t(outstanding()+1);
+    }
     uint32_t value=0;
     /* int-070: the first IB word as the kernel's cacheable alias and DRAM see it before any maintenance, then DRAM after the CPU
      * caches over every mapped BO are cleaned and invalidated. The board shows the last submission's record on a stall. */
     uint32_t cached=~0u,before=~0u,ignored=0,after=~0u;
     /* Write-combined stores this CPU made before the call (the client's command words) complete before anything below. */
     __asm__ volatile("dsb sy":::"memory");
+    const uint64_t cacheStarted=profiling?NativeAdrenoProfileNowUs():0;
     /* int-098/099: with write-combined user BOs and no maintenance the CP stopped at the end of the first IB, as in int-065..069 when an
      * IB sat in a CPU cache. While write-combined BOs are trusted, every line of this submission's IBs is compared as a CPU cache and
      * DRAM hold it (bounded). A dirty line means a client view still caches its BOs: maintain every BO from now on, this submission
@@ -130,10 +145,9 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
         IOReturn audited=vm_->reassertWriteCombined(&reset);
         native_adreno_wc_audit[5]=native_adreno_wc_audit[5]+reset;
         uint32_t lines=0,dirty=0,stale=0;size_t budget=SubmitAuditBytes;
-        /* The re-assertion above is the correction and runs every time; the audit only detects, and found no dirty line in int-141's
-         * 133798, so after the first 16 submissions it compares every eighth one's IBs (it cost about 2 ms each). */
+        // Page attributes are reasserted every time; the optional physical comparison samples initial submissions.
         ++audit_tick_;
-        const bool audit_now=audit_tick_<=16 || (audit_tick_&7)==1;
+        const bool audit_now=audit_tick_<=16;
         if(!audit_now)budget=0;
         for(size_t i=0;i<count && budget && !audited;++i) {   /* a failed re-assertion skips the audit and ends the trust */
             const size_t bytes=buffers[i].bytes<budget?(size_t)buffers[i].bytes:budget;
@@ -151,9 +165,23 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
             native_adreno_wc_distrusted=native_adreno_coherence[0]+1;
         }
     }
-    (void)vm_->sampleWord(buffers[0].iova,&cached,&before);
+    if(profiling) {
+        timing.cacheUs=NativeAdrenoProfileNowUs()-cacheStarted;
+    }
+    const bool sample=!(coherence_tick_++&63);
+    if(sample) {
+        (void)vm_->sampleWord(buffers[0].iova,&cached,&before);
+    }
+    const uint64_t publishStarted=profiling?NativeAdrenoProfileNowUs():0;
     IOReturn status=vm_->publishMapped();
-    if(!status) {
+    if(profiling) {
+        timing.publishUs=NativeAdrenoProfileNowUs()-publishStarted;
+        if(status) {
+            IOLog("NativeAdrenoProfile: kind=error stage=publish-mapped fence=%u status=%08x\n",
+                ring_->lastSubmitted()+1,status);
+        }
+    }
+    if(!status && sample) {
         (void)vm_->sampleWord(buffers[0].iova,&ignored,&after);
         native_adreno_coherence[0]=native_adreno_coherence[0]+1;
         native_adreno_coherence[1]=cached;native_adreno_coherence[2]=before;native_adreno_coherence[3]=after;
@@ -163,8 +191,8 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
             }
             native_adreno_coherence[4]=native_adreno_coherence[4]+1;
         }
-        status=vm_->invalidateTlb();
     }
+    // Mapping publishes previously invalid leaves, and unmap completes its TLB synchronization before reuse.
     if(status) {
         for(size_t i=0;i<handle_count;++i) {vm_->retireJobAfterCompletion(handles[i]);++stats_.references_retired;}
         return status;
@@ -177,7 +205,16 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
         for(unsigned i=0;i<28;++i)native_adreno_ib_log[slot][4+i]=head[i];
         native_adreno_ib_log_count=native_adreno_ib_log_count+1;
     }
-    status=ring_->submitFramed(words,word_count,&value);
+    const uint64_t ringStarted=profiling?NativeAdrenoProfileNowUs():0;
+    status=ring_->submitFramed(words,word_count,&value,profiling?&timing:nullptr);
+    if(profiling) {
+        const uint64_t finished=NativeAdrenoProfileNowUs();
+        timing.ringUs=finished-ringStarted;
+        timing.cpuUs=finished-timing.submitUs;
+        if(!status) {
+            ring_->setProfileCpuTiming(value,timing);
+        }
+    }
     if(status) {
         /* A poisoned ring may already have consumed the WPTR write, so the
          * referenced buffers cannot be retired here. */
@@ -266,15 +303,43 @@ IOReturn NativeAdrenoSubmit::waitRange(uint32_t first,uint32_t count,const Nativ
 }
 IOReturn NativeAdrenoSubmit::retireCompleted()
 {
-    if(!attached_ || poisoned_)return kIOReturnNotReady;
-    for(auto &job:jobs_) {
-        if(!job.active)continue;
-        const NativeAdrenoRingFence state=ring_->observeFence(job.fence,nullptr,0,nullptr);
-        if(state==NativeAdrenoRingFencePoisoned)return poison();
-        if(state!=NativeAdrenoRingFenceComplete)continue;
-        const IOReturn status=release(job);
-        if(status)return status;
+    if (!attached_ || poisoned_) {
+        return kIOReturnNotReady;
+    }
+
+    Job *completed[SubmitMaxJobs];
+    size_t count = 0;
+    for (auto &job : jobs_) {
+        if (!job.active) {
+            continue;
+        }
+
+        const NativeAdrenoRingFence state = ring_->observeFence(job.fence, nullptr, 0, nullptr);
+        if (state == NativeAdrenoRingFencePoisoned) {
+            return poison();
+        }
+        if (state != NativeAdrenoRingFenceComplete) {
+            continue;
+        }
+
+        completed[count++] = &job;
+    }
+    if (!count) {
+        return kIOReturnSuccess;
+    }
+
+    if (vm_->acquireImported()) {
+        return poison();
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        const IOReturn status = release(*completed[i], false);
+        if (status) {
+            return status;
+        }
+
         ++stats_.completed;
     }
+
     return kIOReturnSuccess;
 }

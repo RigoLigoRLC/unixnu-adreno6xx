@@ -45,10 +45,17 @@ struct NativeAdrenoA6xxReport {
     uint32_t hfiMessage;
     uint32_t hfiError;
     uint32_t acknowledged;
+    uint32_t hfiQueue;
+    uint32_t hfiHeader;
+    char hfiErrorText[65];
+    uint32_t gmuInitResult;
+    uint32_t gmuInterrupts;
+    uint32_t gmuAoInterrupts;
+    uint32_t gmuFenceStatus;
 };
 
 /* NativeAdrenoA6xxTables contains the A660 HFI wire payloads. GPU entry zero
- * requests the off level; entry one requests 315 MHz at LOW_SVS. GMU entry one
+ * requests off; entry one requests 315 MHz. GMU entry one
  * requests 200 MHz at MIN_SVS. Power builds the ARC indexes and BCM commands
  * from the running SM7325 command database before changing a power register. */
 struct NativeAdrenoA6xxTables {
@@ -57,6 +64,7 @@ struct NativeAdrenoA6xxTables {
     uint32_t cxAddress;
     uint32_t mxAddress;
     uint32_t gfxAddress;
+    uint32_t xoAddress;
     uint32_t cxIndex;
     uint32_t mxIndex;
     uint32_t gfxIndex;
@@ -65,10 +73,13 @@ struct NativeAdrenoA6xxTables {
 /* NativeAdrenoA6xxPower owns the host votes that keep the GMU and SMMU alive.
  * enableCx reads command-db, disables ACD through AOP QMP, raises the parent
  * rails through an unused APPS DRV2 active TCS, and enables the Yupik clocks
- * and CX domain. The GMU subsequently controls the 315 MHz GPU clock through
- * HFI. enableGx performs the host GX regulator handoff and waits for live power
- * status. stop requires the caller to have stopped GPU and GMU DMA first. */
+ * and CX domain. The GMU subsequently controls the GPU clock and bandwidth through
+ * HFI. enableGx observes the GX power, GMU fence and GX clock state after the
+ * GMU wake request. stop requires the caller to have stopped GPU and GMU DMA
+ * first; host votes and mappings remain owned throughout this one-shot run. */
 class NativeAdrenoA6xxPower final {
+    enum BranchRule : unsigned { BranchHalt, BranchDelay, BranchSkip, BranchVoted };
+
     NativeAdrenoA6xxIo io_{};
     NativeAdrenoA6xxTables tables_{};
     NativeAdrenoA6xxReport report_{};
@@ -82,7 +93,7 @@ class NativeAdrenoA6xxPower final {
     IOReturn buildTables();
     IOReturn disableAcd();
     IOReturn voteRails();
-    IOReturn branch(uint32_t, uint32_t, uint32_t, unsigned);
+    IOReturn branch(uint32_t, uint32_t, uint32_t, BranchRule, uint32_t = 0);
     IOReturn setSource(uint32_t, uint32_t);
 
 public:

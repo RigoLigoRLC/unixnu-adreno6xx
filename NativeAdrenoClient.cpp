@@ -11,9 +11,9 @@ IOReturn NativeAdrenoClient::open(const NativeAdrenoTransport *transport)
     const IOReturn status=transport_.call(transport_.cookie,NativeAdrenoMethodQuery,
         nullptr,0,&reply,sizeof(reply));
     if(status) {transport_={};return status;}
-    if(reply.abi_version!=NativeAdrenoAbiVersion || reply.input_bits<32 ||
+    if((reply.abi_version!=NativeAdrenoAbiVersion && reply.abi_version!=NativeAdrenoAbiLegacyVersion) || reply.input_bits<32 ||
         reply.input_bits>48 || reply.output_bits<32 || reply.output_bits>48 ||
-        !reply.max_bo_bytes || (reply.flags&~uint32_t(NativeAdrenoParamsHostImport))) {transport_={};return kIOReturnUnsupported;}
+        !reply.max_bo_bytes || (reply.flags&~uint32_t(NativeAdrenoParamsHostImport|NativeAdrenoParamsSleepingWait))) {transport_={};return kIOReturnUnsupported;}
     params_=reply;open_=true;
     return kIOReturnSuccess;
 }
@@ -70,7 +70,9 @@ IOReturn NativeAdrenoClient::submit(const NativeAdrenoAbiSubmitBuffer *buffers,s
 {
     if(!fence)return kIOReturnBadArgument;*fence=0;
     if(!open_)return kIOReturnNotReady;
-    if(!buffers || !count || count>NativeAdrenoAbiMaxBuffers)return kIOReturnBadArgument;
+    const bool legacy=params_.abi_version==NativeAdrenoAbiLegacyVersion;
+    const size_t limit=legacy?NativeAdrenoAbiLegacyMaxBuffers:NativeAdrenoAbiMaxBuffers;
+    if(!buffers || !count || count>limit)return kIOReturnBadArgument;
     NativeAdrenoAbiSubmit request{};
     request.buffer_count=(uint32_t)count;
     request.queue=queue;
@@ -79,7 +81,7 @@ IOReturn NativeAdrenoClient::submit(const NativeAdrenoAbiSubmitBuffer *buffers,s
     for(size_t i=0;i<count;++i)request.buffers[i]=buffers[i];
     NativeAdrenoAbiSubmitReply reply{};
     const IOReturn status=transport_.call(transport_.cookie,NativeAdrenoMethodSubmit,
-        &request,sizeof(request),&reply,sizeof(reply));
+        &request,legacy?sizeof(NativeAdrenoAbiSubmitV1):sizeof(request),&reply,sizeof(reply));
     if(!status)*fence=reply.fence;
     return status;
 }

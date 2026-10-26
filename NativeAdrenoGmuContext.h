@@ -26,7 +26,27 @@ struct NativeAdrenoGmuContextReport {
      * 1 CBA2R, 2 TCR, 3 TCR2, 4 MAIR0, 5 MAIR1, 6 TTBR0, 7 TTBR1, 8 SCTLR (SCTLR is 0 before enable). */
     ArmSmmu4KContextImage image;
     uint32_t mismatch;
+    uint32_t id0,scr0,global_fault;
+    uint32_t bank,asid,stream_count;
+    ArmSmmu4KStream streams[2];
+    ArmSmmu4KStreamResult ownership;
+    uint32_t ownership_status;
+    ArmSmmu4KProgramResult program;
+    ArmSmmu4KStreamResult routes;
+    ArmSmmu4KContextImage expected;
+    uint32_t expected_valid;
+    uint32_t actlr,actlr_expected,actlr_status;
+    uint32_t context_read_valid,context_fault;
+    uint64_t observed_context_offset;
+    uint32_t stream_smr[2],stream_s2cr[2];
+    uint32_t allocation_index,allocation_status;
+    uint64_t allocation_bytes;
 };
+
+void NativeAdrenoCaptureSmmuReport(const ArmSmmu4KIo *,NativeAdrenoSmmuContext *,
+    NativeAdrenoGmuContextReport *);
+void NativeAdrenoLogSmmuReport(const char *role,const NativeAdrenoGmuContextReport *);
+void NativeAdrenoSnapshotSmmu(const ArmSmmu4KIo *,const char *phase);
 class NativeAdrenoGmuContext final {
     NativeAdrenoGmuAllocator gmu_;
     NativeAdrenoSmmuContext smmu_;
@@ -34,7 +54,7 @@ class NativeAdrenoGmuContext final {
     bool ready_=false,used_=false;
 public:
     /* Allocate also reads ID2 first and refuses an output size the kit cannot encode. */
-    enum Step : uint32_t {Allocate=1,Prepare,Program,Attach,VmAttach,Map,Ready};
+    enum Step : uint32_t {Allocate=1,Prepare,Program,Attach,VmAttach,Map,Ready,Ownership};
     /* Lower region: 1 L1 + 2 L2 + 1024 L3 pages for 2 GiB with a 32-bit input. */
     enum : size_t {TablePages=1027};
     NativeAdrenoGmuContext()=default;
@@ -43,7 +63,7 @@ public:
     /* One attempt per object. progress (may be null) is called before each step. */
     IOReturn bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,unsigned slot,
         uint16_t sid,void (*progress)(uint32_t step),NativeAdrenoGmuContextReport *report,
-        uint16_t sidAlias=0);
+        uint16_t sidAlias=0,unsigned aliasSlot=UINT32_MAX);
     bool ready() const {return ready_;}
     NativeAdrenoGmuAllocator &allocator() {return gmu_;}
     NativeAdrenoVm &vm() {return vm_;}

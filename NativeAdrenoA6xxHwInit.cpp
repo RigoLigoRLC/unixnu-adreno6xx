@@ -7,29 +7,28 @@
 
 namespace {
 /* Register indices are dwords from SM7325 a6xx_reg.h. */
+const uint32_t kTrustedMemoryRegisters[]={
+    0xf803,0xf800,0xf801,0xf802
+};
 const uint32_t kAddressModes[]={
     0x842,0xc01,0x8601,0x8e05,0x9e01,0xbe05,0xa601,0x9601,
     0xe00,0xae01,0xb601,0xf810
 };
 const uint32_t kInitial[][2]={
-    {0x3c45,0},{0x16,0},
     {0x3c03,0x00071620},{0x3c04,0x00071620},
     {0x3c05,0x00071620},{0x3c06,0x00071620},{0x11,3},
     {0x50b,0xffffffff},
     {0xe05,0xffffffc0},{0xe06,0x0001ffff},
     {0xe09,0xfffff000},{0xe0a,0x0001ffff},
     {0xe07,0xfffff000},{0xe08,0x0001ffff},
-    {0xe0b,0x01000000},{0xe0c,0},
-    {0xe0d,0x0107ffff},{0xe0e,0},
     {0xe18,0x804},{0xe17,4},
-    {0x8c2,0x02000140},{0x8c1,0x8040362c},{0x8c3,128},
+    {0x8c2,0x02000140},{0x8c1,0x8040362c},{0x8c3,128},{0xb34,0x20},
     {0x9e00,0x00200200},{0x98d,1},{0x500,1},
     {0x1f,0x4003ffff},{0xe19,1},
     {0xb608,0},{0xb609,0x3fe05ff4},{0xb60a,0x3fa0ebee},
     {0xb60b,0x3f5193ed},{0xb60c,0x3f0243f0},
     {0x841,1},{0x11,0},{0xe3c,0x66906},
-    {0x844,0x6e},{0x84f,0xb},
-    {0xf803,0},{0xf800,0},{0xf801,0},{0xf802,0}
+    {0x844,0x6e}
 };
 const uint32_t kHwcg[][2]={
     {0xb0,0x02222222},{0xb4,0x02222220},{0xb8,0x80},{0xbc,0xf3cf},
@@ -75,17 +74,52 @@ IOReturn NativeAdrenoA6xxHwInit::program(const NativeAdrenoRingIo *io,uint32_t h
         highestBankBit<13 || highestBankBit>16) {
         return kIOReturnBadArgument;
     }
+
+    uint32_t trustedBefore[4]={0};
+    uint32_t trustedAfter[4]={0};
+    for(unsigned index=0;index<4;++index) {
+        if(io->read32(io->cookie,kTrustedMemoryRegisters[index],&trustedBefore[index])) {
+            return kIOReturnIOError;
+        }
+    }
+    IOLog("NativeAdrenoHwInit: inherited TSB control=%08x base=%08x:%08x size=%08x\n",
+        trustedBefore[0],trustedBefore[2],trustedBefore[1],trustedBefore[3]);
+
+    /* This driver allocates ordinary GPU memory. The DRM A6xx setup clears
+     * TSB control and the trusted range before enabling SQE in this mode. */
+    for(uint32_t reg:kTrustedMemoryRegisters) {
+        if(io->write32(io->cookie,reg,0)) {
+            return kIOReturnIOError;
+        }
+    }
+    if(io->barrier(io->cookie)) {
+        return kIOReturnIOError;
+    }
+    for(unsigned index=0;index<4;++index) {
+        if(io->read32(io->cookie,kTrustedMemoryRegisters[index],&trustedAfter[index])) {
+            return kIOReturnIOError;
+        }
+    }
+    IOLog("NativeAdrenoHwInit: configured TSB control=%08x base=%08x:%08x size=%08x\n",
+        trustedAfter[0],trustedAfter[2],trustedAfter[1],trustedAfter[3]);
+    if(trustedAfter[0] || trustedAfter[1] || trustedAfter[2] || trustedAfter[3]) {
+        return kIOReturnIOError;
+    }
+
+    IOLog("NativeAdrenoHwInit: address modes begin\n");
     for(uint32_t reg:kAddressModes) {
         if(io->write32(io->cookie,reg,1)) {
             return kIOReturnIOError;
         }
     }
+    IOLog("NativeAdrenoHwInit: core register table begin\n");
     for(const auto &entry:kInitial) {
         if(io->write32(io->cookie,entry[0],entry[1])) {
             return kIOReturnIOError;
         }
     }
 
+    IOLog("NativeAdrenoHwInit: UBWC mode registers begin\n");
     const uint32_t hbb=(highestBankBit-13)&3;
     const uint32_t modes[][2]={
         {0x8e08,0x10|(hbb<<1)},{0xb604,hbb<<1},
@@ -96,12 +130,29 @@ IOReturn NativeAdrenoA6xxHwInit::program(const NativeAdrenoRingIo *io,uint32_t h
             return kIOReturnIOError;
         }
     }
+    IOLog("NativeAdrenoHwInit: CP protected register ranges begin\n");
+    if(io->write32(io->cookie,0x84f,0xb)) {
+        return kIOReturnIOError;
+    }
     for(const auto &entry:kProtected) {
         const uint32_t encoded=entry[1]|((entry[2]-entry[1])<<18)|(entry[3]<<31);
         if(io->write32(io->cookie,0x850+entry[0],encoded)) {
             return kIOReturnIOError;
         }
     }
+    IOLog("NativeAdrenoHwInit: core register setup completed\n");
+    if(io->barrier(io->cookie)) {
+        return kIOReturnIOError;
+    }
+    return kIOReturnSuccess;
+}
+
+IOReturn NativeAdrenoA6xxHwInit::programClockGating(const NativeAdrenoRingIo *io)
+{
+    if(!io || !io->write32 || !io->barrier) {
+        return kIOReturnBadArgument;
+    }
+    IOLog("NativeAdrenoHwInit: RBBM hardware clock table begin\n");
     for(const auto &entry:kHwcg) {
         if(io->write32(io->cookie,entry[0],entry[1])) {
             return kIOReturnIOError;
@@ -110,6 +161,21 @@ IOReturn NativeAdrenoA6xxHwInit::program(const NativeAdrenoRingIo *io,uint32_t h
     if(io->barrier(io->cookie)) {
         return kIOReturnIOError;
     }
+    IOLog("NativeAdrenoHwInit: RBBM hardware clock table completed\n");
+    return kIOReturnSuccess;
+}
+
+IOReturn NativeAdrenoA6xxHwInit::finish(const NativeAdrenoRingIo *io)
+{
+    if(!io || !io->write32 || !io->barrier) {
+        return kIOReturnBadArgument;
+    }
+    IOLog("NativeAdrenoHwInit: GBIF halt release begin\n");
+    if(io->write32(io->cookie,0x3c45,0) ||
+        io->write32(io->cookie,0x16,0) || io->barrier(io->cookie)) {
+        return kIOReturnIOError;
+    }
+    IOLog("NativeAdrenoHwInit: GBIF halt release completed\n");
     return kIOReturnSuccess;
 }
 

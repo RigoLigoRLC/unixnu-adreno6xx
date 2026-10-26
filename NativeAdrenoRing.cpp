@@ -15,6 +15,7 @@ enum : uint32_t {
     RingRptrAddress = 0x0804, /* 64-bit CP_RB_RPTR_ADDR */
     RingRptr = 0x0806,
     RingWptr = 0x0807,
+    RingNop = 0x10,
     RingScratch = 0x0885,     /* CP_SCRATCH(2) for A6XX..A7XX */
     RingFenceOpcode = 0x46,   /* CP_EVENT_WRITE7 on A7XX */
     RingFenceEvent = 0x31,    /* CACHE_CLEAN */
@@ -64,6 +65,13 @@ static uint32_t ilog2(size_t value)
 {
     uint32_t result=0;while(value>1) {value>>=1;++result;}return result;
 }
+static void logProfileFailure(bool profiled,uint32_t fence,const char *stage,uint32_t status)
+{
+    if(profiled) {
+        IOLog("NativeAdrenoProfile: kind=error stage=%s fence=%u status=%08x\n",
+            stage,fence,status);
+    }
+}
 /* The last submissions as the CP will read them: [slot] fence, start index, end index, word count, then up to 112 ring words from the start. The board log
  * prints them, so a fence the GPU never wrote can be compared with the packets that should have written it. */
 extern "C" {volatile uint32_t native_adreno_ring_log[4][4+112];volatile uint32_t native_adreno_ring_log_count;}
@@ -77,6 +85,90 @@ IOReturn NativeAdrenoRing::readRptr(uint32_t *value)
     if(io_.read32(io_.cookie,RingRptr,&rptr))return poison();
     if(rptr>=ring_bytes_/4)return poison(); /* unusable read pointer */
     *value=rptr;rptr_shadow_=rptr;return kIOReturnSuccess;
+}
+
+IOReturn NativeAdrenoRing::reserveA6xx(uint32_t words,uint32_t *at)
+{
+    const uint32_t size=uint32_t(ring_bytes_/4);
+    if(!words || words>size-3 || !at) {
+        return kIOReturnBadArgument;
+    }
+    uint32_t rptr=0;
+    IOReturn status=readRptr(&rptr);
+    if(status) {
+        return status;
+    }
+    if(next_>=rptr) {
+        if(words<=size-2-next_) {
+            *at=next_;
+            return kIOReturnSuccess;
+        }
+        if(words>=rptr) {
+            return kIOReturnNoResources;
+        }
+        const uint32_t remaining=size-next_;
+        uint32_t header=0;
+        if(remaining<2 || AdrenoPM4Type7(RingNop,remaining-1,&header)!=AdrenoPM4Success) {
+            return poison();
+        }
+        ring_[next_]=header;
+        for(uint32_t i=next_+1;i<size;++i) {
+            ring_[i]=0;
+        }
+        *at=0;
+        return kIOReturnSuccess;
+    }
+    if(words>=rptr-next_) {
+        return kIOReturnNoResources;
+    }
+    *at=next_;
+    return kIOReturnSuccess;
+}
+
+IOReturn NativeAdrenoRing::commit(uint32_t end,uint32_t serial,bool profiled)
+{
+    const uint32_t mask=uint32_t(ring_bytes_/4-1);
+    const uint32_t slot=native_adreno_ring_log_count&3;
+    const uint32_t total=(end-next_)&mask;
+    volatile uint32_t *record=native_adreno_ring_log[slot];
+    record[0]=serial;
+    record[1]=next_;
+    record[2]=end;
+    record[3]=total;
+    for(uint32_t i=0;i<112;++i) {
+        record[4+i]=i<total?ring_[(next_+i)&mask]:0;
+    }
+    native_adreno_ring_log_count=native_adreno_ring_log_count+1;
+    const int published=cache_.publish(cache_.cookie,ring_,ring_bytes_);
+    if(published) {
+        logProfileFailure(profiled,serial,"ring-publish",published);
+        return poison();
+    }
+    const int barrier=io_.barrier(io_.cookie);
+    if(barrier) {
+        logProfileFailure(profiled,serial,"ring-barrier",barrier);
+        return poison();
+    }
+    profile_.markEnqueued(serial,&io_);
+    if(generation_==NativeAdrenoA642L) {
+        if(!io_.writeWptr) {
+            logProfileFailure(profiled,serial,"missing-wptr-callback",kIOReturnNotReady);
+            return poison();
+        }
+        const int written=io_.writeWptr(io_.cookie,end);
+        if(written) {
+            logProfileFailure(profiled,serial,"write-wptr",written);
+            return poison();
+        }
+    } else {
+        const int written=io_.write32(io_.cookie,RingWptr,end);
+        if(written) {
+            logProfileFailure(profiled,serial,"write-wptr",written);
+            return poison();
+        }
+    }
+    next_=end;
+    return kIOReturnSuccess;
 }
 /* Packs one TYPE7 packet into words; returns the next free index or 0 when the header cannot be built. */
 static size_t packet(uint32_t *words,size_t at,uint32_t opcode,const uint32_t *payload,uint32_t count)
@@ -156,12 +248,16 @@ IOReturn NativeAdrenoRing::emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *
 {
     if(generation_==NativeAdrenoA642L) {
         const uint32_t mask=uint32_t(ring_bytes_/4-1);
-        uint32_t words[2]={0};
+        uint32_t words[6]={0};
         const uint32_t finish=0xe;
-        packet(words,0,RingSetMarker,&finish,1);
-        ring_[at&mask]=words[0];
-        ring_[(at+1)&mask]=words[1];
-        IOReturn status=emitFence((at+2)&mask,seqno,end);
+        const uint32_t depth=RingCcuInvalidateDepth,color=RingCcuInvalidateColor;
+        size_t count=packet(words,0,RingSetMarker,&finish,1);
+        count=packet(words,count,RingFenceOpcode,&depth,1);
+        count=packet(words,count,RingFenceOpcode,&color,1);
+        for(size_t i=0;i<count;++i) {
+            ring_[(at+i)&mask]=words[i];
+        }
+        IOReturn status=emitFence((at+uint32_t(count))&mask,seqno,end);
         if(status) {
             return status;
         }
@@ -206,28 +302,53 @@ IOReturn NativeAdrenoRing::attach(const NativeAdrenoRingIo *io,const NativeAdren
         !cache->publish || !cache->acquire || !ring || !fence ||
         ring_bytes<8192 || ring_bytes>(1u<<20) || (ring_bytes&(ring_bytes-1)) ||
         ((ring_iova|ring_bytes)&(ring_bytes-1)) || (ring_iova&4095) ||
-        fence_bytes<64 || (fence_iova&7) || fence_bytes>=(1u<<24))return kIOReturnBadArgument;
+        fence_bytes<64 || (fence_iova&7) || fence_bytes>=(1u<<24) ||
+        (generation==NativeAdrenoA642L && !io->writeWptr))return kIOReturnBadArgument;
     /* No register may be touched before every argument is acceptable. */
     generation_=generation;
     io_=*io;cache_=*cache;ring_=static_cast<volatile uint32_t *>(ring);
     ring_bytes_=ring_bytes;ring_iova_=ring_iova;
     fence_=static_cast<volatile uint32_t *>(fence);fence_bytes_=fence_bytes;fence_iova_=fence_iova;
     for(size_t i=0;i<fence_bytes_/4;++i)fence_[i]=0;
+    if(generation_==NativeAdrenoA642L) {
+        for(size_t i=0;i<ring_bytes_/4;++i) {
+            ring_[i]=0xaaaaaaaa;
+        }
+    }
     const uint32_t control=(uint32_t)(ilog2(ring_bytes/8)&0x3f)|(ilog2(RingBlockBytes/8)<<8);
     const uint32_t base_lo=(uint32_t)ring_iova_,base_hi=(uint32_t)(ring_iova_>>32);
     const uint32_t rptr_lo=(uint32_t)fence_iova_,rptr_hi=(uint32_t)(fence_iova_>>32);
-    const uint32_t writes[]={RingBase,base_lo,RingBase+1,base_hi,RingControl,control,
-        RingRptrAddress,rptr_lo,RingRptrAddress+1,rptr_hi,RingWptr,0,RingScratch,0};
-    for(size_t i=0;i<sizeof(writes)/sizeof(writes[0]);i+=2)
-        if(io_.write32(io_.cookie,writes[i],writes[i+1]))return poison();
-    uint32_t rptr=0;IOReturn status=readRptr(&rptr);
-    if(status)return status;
-    next_=rptr;seqno_=0;completed_=0;submissions_=0;
+    if(generation_==NativeAdrenoA642L) {
+        const uint32_t writes[]={RingRptrAddress,rptr_lo,RingRptrAddress+1,rptr_hi,
+            RingControl,control,RingBase,base_lo,RingBase+1,base_hi};
+        for(size_t i=0;i<sizeof(writes)/sizeof(writes[0]);i+=2) {
+            if(io_.write32(io_.cookie,writes[i],writes[i+1])) {
+                return poison();
+            }
+        }
+        next_=0;
+        rptr_shadow_=0;
+    } else {
+        const uint32_t writes[]={RingBase,base_lo,RingBase+1,base_hi,RingControl,control,
+            RingRptrAddress,rptr_lo,RingRptrAddress+1,rptr_hi,RingWptr,0,RingScratch,0};
+        for(size_t i=0;i<sizeof(writes)/sizeof(writes[0]);i+=2) {
+            if(io_.write32(io_.cookie,writes[i],writes[i+1])) {
+                return poison();
+            }
+        }
+        uint32_t rptr=0;
+        const IOReturn status=readRptr(&rptr);
+        if(status) {
+            return status;
+        }
+        next_=rptr;
+    }
+    seqno_=0;completed_=0;submissions_=0;bootstrap_pending_=false;
     attached_=true;return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoRing::detach()
 {
-    if(poisoned_)return kIOReturnBusy;
+    if(poisoned_ || profile_.enabled())return kIOReturnBusy;
     if(!attached_)return kIOReturnNotReady;
     if(outstanding())return kIOReturnBusy;
     attached_=false;ring_=nullptr;fence_=nullptr;ring_bytes_=fence_bytes_=0;
@@ -238,49 +359,231 @@ IOReturn NativeAdrenoRing::submit(const uint32_t *words,size_t word_count,uint32
 {
     return submitWords(words,word_count,fence,false);
 }
-IOReturn NativeAdrenoRing::submitFramed(const uint32_t *words,size_t word_count,uint32_t *fence)
+
+IOReturn NativeAdrenoRing::submitBootstrap(const uint32_t *words,size_t word_count,uint32_t *wptr)
 {
-    return submitWords(words,word_count,fence,true);
+    if(!wptr) {
+        return kIOReturnBadArgument;
+    }
+    *wptr=0;
+    if(!attached_ || poisoned_ || bootstrap_pending_ || seqno_ ||
+        generation_!=NativeAdrenoA642L) {
+        return kIOReturnNotReady;
+    }
+    if(!words || !word_count || word_count>ring_bytes_/4-3) {
+        return kIOReturnBadArgument;
+    }
+    uint32_t at=0;
+    IOReturn status=reserveA6xx(uint32_t(word_count),&at);
+    if(status) {
+        return status;
+    }
+    for(size_t i=0;i<word_count;++i) {
+        ring_[at+i]=words[i];
+    }
+    const uint32_t end=at+uint32_t(word_count);
+    status=commit(end,0);
+    if(status) {
+        return status;
+    }
+    bootstrap_pending_=true;
+    *wptr=end;
+    IOLog("NativeAdrenoRing: bootstrap publication completed wptr=%u\n",end);
+    return kIOReturnSuccess;
 }
-IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,uint32_t *fence,bool framed)
+
+void NativeAdrenoRing::logBootstrap(uint32_t target,uint32_t rptr,uint32_t busy,const char *result)
+{
+    const uint32_t regs[]={RingWptr,0x210,0x213,0x201,0x821,0x823,0x824,
+        0xb81,0xb82,0xb83};
+    uint32_t values[10]={0};
+    uint32_t failed=0;
+    for(size_t i=0;i<sizeof(regs)/sizeof(regs[0]);++i) {
+        if(io_.read32(io_.cookie,regs[i],&values[i])) {
+            failed|=1u<<i;
+        }
+    }
+    IOLog("NativeAdrenoRing: bootstrap %s target=%u rptr=%u wptr=%u busy=%08x rbbm=%08x/%08x int=%08x\n",
+        result,target,rptr,values[0],busy,values[1],values[2],values[3]);
+    IOLog("NativeAdrenoRing: bootstrap fault=%08x cp=%08x protect=%08x failed_reads=%x\n",
+        values[4],values[5],values[6],failed);
+    IOLog("NativeAdrenoRing: bootstrap LPAC control=%08x instruction-base=%08x:%08x\n",
+        values[7],values[9],values[8]);
+}
+
+NativeAdrenoRingFence NativeAdrenoRing::waitBootstrap(uint32_t wptr,
+    const NativeAdrenoRingClock *clock,uint32_t timeout_us,uint32_t *observed)
+{
+    if(observed) {
+        *observed=0;
+    }
+    if(!attached_ || poisoned_) {
+        return NativeAdrenoRingFencePoisoned;
+    }
+    if(generation_!=NativeAdrenoA642L || !bootstrap_pending_ || wptr!=next_ ||
+        !clock || !clock->now_us || !timeout_us) {
+        return NativeAdrenoRingFenceArgument;
+    }
+    const uint32_t fatalInterrupts=(1u<<1)|(1u<<6)|(1u<<7)|(1u<<9)|
+        (1u<<22)|(1u<<23)|(1u<<24)|(1u<<25)|(1u<<28);
+    const uint64_t start=clock->now_us(clock->cookie);
+    uint32_t rptr=0,busy=0;
+    for(;;) {
+        uint32_t interrupts=0,cp=0;
+        if(readRptr(&rptr) || io_.read32(io_.cookie,0x201,&interrupts) ||
+            io_.read32(io_.cookie,0x823,&cp)) {
+            logBootstrap(wptr,rptr,busy,"read failed");
+            poison();
+            return NativeAdrenoRingFencePoisoned;
+        }
+        if(observed) {
+            *observed=rptr;
+        }
+        bool idle=false;
+        if(io_.readGpuBusy) {
+            if(io_.readGpuBusy(io_.cookie,&busy)) {
+                logBootstrap(wptr,rptr,busy,"GMU read failed");
+                poison();
+                return NativeAdrenoRingFencePoisoned;
+            }
+            idle=(busy&(1u<<23))==0;
+        } else {
+            if(io_.read32(io_.cookie,0x210,&busy)) {
+                logBootstrap(wptr,rptr,busy,"RBBM read failed");
+                poison();
+                return NativeAdrenoRingFencePoisoned;
+            }
+            idle=(busy&0xfffffffeu)==0;
+        }
+        if((interrupts&fatalInterrupts) || (cp&0xf7u)) {
+            logBootstrap(wptr,rptr,busy,"hardware fault");
+            poison();
+            return NativeAdrenoRingFencePoisoned;
+        }
+        if(rptr==wptr && idle) {
+            bootstrap_pending_=false;
+            logBootstrap(wptr,rptr,busy,"idle");
+            return NativeAdrenoRingFenceComplete;
+        }
+        if(clock->now_us(clock->cookie)-start>=timeout_us) {
+            logBootstrap(wptr,rptr,busy,"timeout");
+            return NativeAdrenoRingFenceTimeout;
+        }
+        if(clock->idle && clock->idle(clock->cookie)) {
+            logBootstrap(wptr,rptr,busy,"wait interrupted");
+            return NativeAdrenoRingFenceTimeout;
+        }
+    }
+}
+
+IOReturn NativeAdrenoRing::enableProfiling(NativeAdrenoVm *vm)
+{
+    if(!attached_ || poisoned_ || seqno_ || bootstrap_pending_ ||
+        generation_!=NativeAdrenoA642L) {
+        return kIOReturnNotReady;
+    }
+    return profile_.attach(vm,&io_);
+}
+
+IOReturn NativeAdrenoRing::emitProfile(uint32_t at,uint32_t fence,bool end,uint32_t *next)
+{
+    uint32_t words[NativeAdrenoProfileSnapshotWords]{};
+    const IOReturn status=profile_.emit(fence,end,words,NativeAdrenoProfileSnapshotWords);
+    if(status) {
+        logProfileFailure(true,fence,end?"end-snapshot":"begin-snapshot",status);
+        return poison();
+    }
+    const uint32_t mask=uint32_t(ring_bytes_/4-1);
+    for(unsigned index=0;index<NativeAdrenoProfileSnapshotWords;++index) {
+        ring_[(at+index)&mask]=words[index];
+    }
+    *next=(at+NativeAdrenoProfileSnapshotWords)&mask;
+    return kIOReturnSuccess;
+}
+
+IOReturn NativeAdrenoRing::submitFramed(const uint32_t *words,size_t word_count,uint32_t *fence,
+    const NativeAdrenoProfileCpuTiming *timing)
+{
+    return submitWords(words,word_count,fence,true,timing);
+}
+
+IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,uint32_t *fence,bool framed,
+    const NativeAdrenoProfileCpuTiming *timing)
 {
     if(!fence)return kIOReturnBadArgument;*fence=0;
-    if(!attached_ || poisoned_)return kIOReturnNotReady;
+    if(!attached_ || poisoned_ || bootstrap_pending_)return kIOReturnNotReady;
     if(!words || !word_count || word_count>SIZE_MAX/sizeof(uint32_t))return kIOReturnBadArgument;
     const uint32_t size_words=(uint32_t)(ring_bytes_/4),mask=size_words-1;
     const bool reset=framed && reset_pending_;
-    const uint32_t extra=generation_==NativeAdrenoA642L?
-        (framed?4+(reset?1:0)+RingFenceWords+4:RingFenceWords):
+    const bool tracked=framed && profile_.enabled();
+    const bool profiled=tracked && profile_.samples();
+    const uint32_t framing=generation_==NativeAdrenoA642L?
+        (framed?4+(reset?1:0)+RingFenceWords+8:RingFenceWords):
         (framed?RingPrologueWords+(reset?RingResetWords:0)+RingFramedFenceWords:RingFenceWords);
+    const uint32_t extra=framing+(profiled?2*NativeAdrenoProfileSnapshotWords:0);
     if(word_count>size_words-extra-8)return kIOReturnNoResources;
-    uint32_t rptr=0;IOReturn status=readRptr(&rptr);
-    if(status)return status;
-    const uint32_t used=(next_-rptr)&mask;
-    if(word_count+extra+8>size_words-used)return kIOReturnNoResources;
     uint32_t at=next_;
+    IOReturn status=kIOReturnSuccess;
+    if(generation_==NativeAdrenoA642L) {
+        status=reserveA6xx(uint32_t(word_count)+extra,&at);
+        if(status) {
+            logProfileFailure(profiled,seqno_+1,"ring-reserve",status);
+            return status;
+        }
+    } else {
+        uint32_t rptr=0;
+        status=readRptr(&rptr);
+        if(status) {
+            return status;
+        }
+        const uint32_t used=(next_-rptr)&mask;
+        if(word_count+extra+8>size_words-used) {
+            return kIOReturnNoResources;
+        }
+    }
+    if(tracked) {
+        const NativeAdrenoProfileCpuTiming empty{};
+        status=profile_.prepare(seqno_+1,timing?*timing:empty,profiled);
+        if(status) {
+            logProfileFailure(profiled,seqno_+1,"prepare",status);
+            return status;
+        }
+    }
     if(framed) {
         status=emitPrologue(at,reset,&at);
-        if(status)return status;
+        if(status) {
+            profile_.cancel(seqno_+1);
+            logProfileFailure(profiled,seqno_+1,"prologue",status);
+            return status;
+        }
+    }
+    if(profiled) {
+        status=emitProfile(at,seqno_+1,false,&at);
+        if(status) {
+            profile_.cancel(seqno_+1);
+            return status;
+        }
     }
     for(size_t i=0;i<word_count;++i)ring_[(at+i)&mask]=words[i];
     at=(at+(uint32_t)word_count)&mask;
+    if(profiled) {
+        status=emitProfile(at,seqno_+1,true,&at);
+        if(status) {
+            profile_.cancel(seqno_+1);
+            return status;
+        }
+    }
     uint32_t end=0;
     status=framed?emitFramedFence(at,seqno_+1,&end):emitFence(at,seqno_+1,&end);
-    if(status)return status;
-    /* Whole-ring publication is deliberate: a submission may wrap, and one
-     * clean of the owned pool is cheaper than a split range proof. */
-    {
-        const uint32_t slot=native_adreno_ring_log_count&3;
-        const uint32_t total=(end-next_)&mask;
-        volatile uint32_t *record=native_adreno_ring_log[slot];
-        record[0]=seqno_+1;record[1]=next_;record[2]=end;record[3]=total;
-        for(uint32_t i=0;i<112;++i)record[4+i]=i<total?ring_[(next_+i)&mask]:0;
-        native_adreno_ring_log_count=native_adreno_ring_log_count+1;
+    if(status) {
+        profile_.cancel(seqno_+1);
+        logProfileFailure(profiled,seqno_+1,"fence-packet",status);
+        return status;
     }
-    if(cache_.publish(cache_.cookie,ring_,ring_bytes_))return poison();
-    if(io_.barrier(io_.cookie))return poison();
-    if(io_.write32(io_.cookie,RingWptr,end))return poison();
-    next_=end;*fence=++seqno_;++submissions_;
+    if(commit(end,seqno_+1,profiled)) {
+        return poison();
+    }
+    *fence=++seqno_;++submissions_;
     if(reset)reset_pending_=false;
     return kIOReturnSuccess;
 }

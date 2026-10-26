@@ -175,10 +175,11 @@ IOReturn NativeAdrenoA6xxPower::poll(uint32_t domain, uint32_t offset,
 
 IOReturn NativeAdrenoA6xxPower::buildTables()
 {
+    constexpr unsigned ResourceCount = 8;
     static const char *const names[] = {
-        "gfx.lvl", "mx.lvl", "cx.lvl", "SH0", "MC0", "ACV", "CN0"
+        "gfx.lvl", "mx.lvl", "cx.lvl", "SH0", "MC0", "ACV", "CN0", "xo.lvl"
     };
-    Resource resources[7]{};
+    Resource resources[ResourceCount]{};
     uint32_t headers[8][2]{};
     uint32_t version = 0;
     uint32_t magic = 0;
@@ -200,7 +201,7 @@ IOReturn NativeAdrenoA6xxPower::buildTables()
                 headers[index][0] & 0xffff, 144 + (headers[index][0] >> 16),
                 144 + (headers[index][1] & 0xffff), headers[index][1] >> 16);
         }
-        for (unsigned index = 0; index < 7; ++index) {
+        for (unsigned index = 0; index < ResourceCount; ++index) {
             const Resource &entry = resources[index];
             IOLog("NativeAdrenoA6xx: command-db resource[%u]=%s found=%u record=%x address=%x auxiliary=%x bytes=%u first=%08x,%08x\n",
                 index, names[index], (seen >> index) & 1, entry.recordOffset,
@@ -213,14 +214,14 @@ IOReturn NativeAdrenoA6xxPower::buildTables()
 
     IOReturn result = read(NativeAdrenoA6xxCommandDb, 0, &version);
     if (result) {
-        return reject("version-read", result, 7, 0, 0, 0);
+        return reject("version-read", result, ResourceCount, 0, 0, 0);
     }
     result = read(NativeAdrenoA6xxCommandDb, 4, &magic);
     if (result) {
-        return reject("magic-read", result, 7, 4, 0, 0x0c0330db);
+        return reject("magic-read", result, ResourceCount, 4, 0, 0x0c0330db);
     }
     if (magic != 0x0c0330db) {
-        return reject("magic", kIOReturnBadMedia, 7, 4, magic, 0x0c0330db);
+        return reject("magic", kIOReturnBadMedia, ResourceCount, 4, magic, 0x0c0330db);
     }
 
     for (unsigned slave = 0; slave < 8; ++slave) {
@@ -229,7 +230,7 @@ IOReturn NativeAdrenoA6xxPower::buildTables()
         for (unsigned word = 0; word < 2; ++word) {
             result = read(NativeAdrenoA6xxCommandDb, 8 + 16 * slave + 4 * word, &header[word]);
             if (result) {
-                return reject("slave-header-read", result, 7,
+                return reject("slave-header-read", result, ResourceCount,
                     8 + 16 * slave + 4 * word, 0, 0);
             }
         }
@@ -241,7 +242,7 @@ IOReturn NativeAdrenoA6xxPower::buildTables()
         const uint32_t auxiliary = 144 + (header[1] & 0xffff);
         const uint32_t count = header[1] >> 16;
         if (count > 4096 || records > 0x20000 || count * 24 > 0x20000 - records) {
-            return reject("slave-record-extent", kIOReturnBadMedia, 7,
+            return reject("slave-record-extent", kIOReturnBadMedia, ResourceCount,
                 8 + 16 * slave + 4, header[1], 0x20000);
         }
 
@@ -250,12 +251,12 @@ IOReturn NativeAdrenoA6xxPower::buildTables()
             for (unsigned word = 0; word < 6; ++word) {
                 result = read(NativeAdrenoA6xxCommandDb, records + index * 24 + word * 4, &record[word]);
                 if (result) {
-                    return reject("resource-record-read", result, 7,
+                    return reject("resource-record-read", result, ResourceCount,
                         records + index * 24 + word * 4, 0, 0);
                 }
             }
 
-            for (unsigned name = 0; name < 7; ++name) {
+            for (unsigned name = 0; name < ResourceCount; ++name) {
                 if (!resourceName(record[0], record[1], names[name])) {
                     continue;
                 }
@@ -276,10 +277,10 @@ IOReturn NativeAdrenoA6xxPower::buildTables()
                     return reject("resource-address", kIOReturnBadMedia,
                         name, recordOffset + 16, record[4], 4);
                 }
-                if (((record[4] >> 16) & 7) != slaveId ||
-                    slaveId != (name < 3 ? 3u : 5u)) {
+                const uint32_t expectedSlave = name < 3 || name == 7 ? 3u : 5u;
+                if (((record[4] >> 16) & 7) != slaveId || slaveId != expectedSlave) {
                     return reject("resource-slave", kIOReturnBadMedia,
-                        name, recordOffset + 16, record[4], (name < 3 ? 3u : 5u) << 16);
+                        name, recordOffset + 16, record[4], expectedSlave << 16);
                 }
                 if (length > sizeof(resources[name].auxiliary) ||
                     offset > 0x20000 || length > 0x20000 - offset) {
@@ -300,8 +301,8 @@ IOReturn NativeAdrenoA6xxPower::buildTables()
             }
         }
     }
-    if (seen != 0x7f) {
-        return reject("required-resources", kIOReturnNotFound, 7, 0, seen, 0x7f);
+    if (seen != 0xff) {
+        return reject("required-resources", kIOReturnNotFound, ResourceCount, 0, seen, 0xff);
     }
 
     uint32_t gpuVote;
@@ -338,6 +339,7 @@ IOReturn NativeAdrenoA6xxPower::buildTables()
     tables_.cxAddress = resources[2].address;
     tables_.mxAddress = resources[1].address;
     tables_.gfxAddress = resources[0].address;
+    tables_.xoAddress = resources[7].address;
     tables_.cxIndex = gmuVote & 0xff;
     tables_.gfxIndex = gpuVote & 0xff;
     tables_.mxIndex = (gpuVote >> 8) & 0xff;
@@ -502,12 +504,13 @@ IOReturn NativeAdrenoA6xxPower::disableAcd()
 
 IOReturn NativeAdrenoA6xxPower::voteRails()
 {
+    constexpr unsigned CommandCount = 8;
     uint32_t configuration;
     IOReturn result = read(NativeAdrenoA6xxRpmh, 0x0c, &configuration);
     if (result) {
         return result;
     }
-    if (((configuration >> 12) & 0x3f) < 2 || (configuration >> 27) < 7) {
+    if (((configuration >> 12) & 0x3f) < 2 || (configuration >> 27) < CommandCount) {
         report_.status = kIOReturnUnsupported;
         return report_.status;
     }
@@ -530,10 +533,21 @@ IOReturn NativeAdrenoA6xxPower::voteRails()
 
     const uint32_t base = 0xd00 + tcs * 672;
     const uint32_t addresses[] = {tables_.mxAddress, tables_.cxAddress, tables_.gfxAddress,
-        tables_.bandwidth[5], tables_.bandwidth[23], tables_.bandwidth[24], tables_.bandwidth[25]};
+        tables_.bandwidth[5], tables_.bandwidth[23], tables_.bandwidth[24],
+        tables_.bandwidth[25], tables_.xoAddress};
     const uint32_t values[] = {tables_.mxIndex, tables_.cxIndex, tables_.gfxIndex,
-        tables_.bandwidth[17], tables_.bandwidth[55], tables_.bandwidth[56], tables_.bandwidth[57]};
-    const uint32_t controlValues[] = {0, Bit(16)};
+        tables_.bandwidth[17], tables_.bandwidth[55], tables_.bandwidth[56],
+        tables_.bandwidth[57], 3};
+
+    uint32_t control;
+    result = read(NativeAdrenoA6xxRpmh, base + 0x14, &control);
+    if (result) {
+        return result;
+    }
+    // The RSC requires trigger removal to finish before AMC mode is cleared.
+    const uint32_t controlValues[] = {
+        control & ~Bit(24), control & ~(Bit(24) | Bit(16)), Bit(16)
+    };
     for (uint32_t value : controlValues) {
         result = write(NativeAdrenoA6xxRpmh, base + 0x14, value);
         if (result) {
@@ -549,7 +563,9 @@ IOReturn NativeAdrenoA6xxPower::voteRails()
     if (result) {
         return result;
     }
-    for (unsigned command = 0; command < 7; ++command) {
+    for (unsigned command = 0; command < CommandCount; ++command) {
+        IOLog("NativeAdrenoA6xx: parent vote tcs=%u command=%u address=%08x value=%08x\n",
+            tcs, command, addresses[command], values[command]);
         result = write(NativeAdrenoA6xxRpmh, base + 0x30 + command * 20, 0x10108);
         if (result) {
             return result;
@@ -563,11 +579,12 @@ IOReturn NativeAdrenoA6xxPower::voteRails()
             return result;
         }
     }
-    result = write(NativeAdrenoA6xxRpmh, base + 0x10, 0x7f);
+    const uint32_t commandMask = (1u << CommandCount) - 1;
+    result = write(NativeAdrenoA6xxRpmh, base + 0x10, commandMask);
     if (result) {
         return result;
     }
-    result = write(NativeAdrenoA6xxRpmh, base + 0x1c, 0x7f);
+    result = write(NativeAdrenoA6xxRpmh, base + 0x1c, commandMask);
     if (result) {
         return result;
     }
@@ -579,7 +596,7 @@ IOReturn NativeAdrenoA6xxPower::voteRails()
     if (result) {
         return result;
     }
-    for (unsigned command = 0; command < 7; ++command) {
+    for (unsigned command = 0; command < CommandCount; ++command) {
         result = poll(NativeAdrenoA6xxRpmh, base + 0x3c + command * 20,
             Bit(8) | Bit(16), Bit(8) | Bit(16), 1000);
         if (result) {
@@ -595,7 +612,7 @@ IOReturn NativeAdrenoA6xxPower::voteRails()
 }
 
 IOReturn NativeAdrenoA6xxPower::branch(uint32_t domain, uint32_t offset,
-    uint32_t enable, unsigned rule)
+    uint32_t enable, BranchRule rule, uint32_t hwcgMask)
 {
     uint32_t value;
     IOReturn result = update(domain, offset, 0, enable);
@@ -606,11 +623,11 @@ IOReturn NativeAdrenoA6xxPower::branch(uint32_t domain, uint32_t offset,
     if (result) {
         return result;
     }
-    if (rule == 1) {
+    if (rule == BranchDelay) {
         io_.delayUs(io_.cookie, 10);
         return kIOReturnSuccess;
     }
-    if (rule == 2 || rule == 3 || (value & Bit(1))) {
+    if (rule == BranchSkip || (hwcgMask && (value & hwcgMask))) {
         return kIOReturnSuccess;
     }
 
@@ -663,11 +680,11 @@ IOReturn NativeAdrenoA6xxPower::enableCx(const NativeAdrenoA6xxIo &io)
     if (result) {
         return result;
     }
-    result = branch(NativeAdrenoA6xxGcc, 0x52000, Bit(15) | Bit(16), 1);
+    result = branch(NativeAdrenoA6xxGcc, 0x52000, Bit(15) | Bit(16), BranchDelay);
     if (result) {
         return result;
     }
-    result = branch(NativeAdrenoA6xxGcc, 0x71004, 1, 1);
+    result = branch(NativeAdrenoA6xxGcc, 0x71004, 1, BranchDelay);
     if (result) {
         return result;
     }
@@ -695,25 +712,30 @@ IOReturn NativeAdrenoA6xxPower::enableCx(const NativeAdrenoA6xxIo &io)
     }
 
     report_.phase = GpuCcClocks;
-    struct Clock { uint32_t domain; uint32_t offset; unsigned rule; };
+    struct Clock {
+        uint32_t domain;
+        uint32_t offset;
+        BranchRule rule;
+        uint32_t hwcgMask;
+    };
     const Clock clocks[] = {
-        {NativeAdrenoA6xxGpuCc, 0x1170, 1},
-        {NativeAdrenoA6xxGpuCc, 0x1004, 0},
-        {NativeAdrenoA6xxGpuCc, 0x109c, 0},
-        {NativeAdrenoA6xxGpuCc, 0x1178, 0},
-        {NativeAdrenoA6xxGpuCc, 0x1204, 0},
-        {NativeAdrenoA6xxGpuCc, 0x1078, 1},
-        {NativeAdrenoA6xxGpuCc, 0x107c, 0},
-        {NativeAdrenoA6xxGpuCc, 0x1098, 0},
-        {NativeAdrenoA6xxGpuCc, 0x108c, 0},
-        {NativeAdrenoA6xxGpuCc, 0x1090, 0},
-        {NativeAdrenoA6xxGpuCc, 0x5000, 2},
-        {NativeAdrenoA6xxGcc, 0x71154, 3},
-        {NativeAdrenoA6xxGcc, 0x7100c, 0},
-        {NativeAdrenoA6xxGcc, 0x71018, 0}
+        {NativeAdrenoA6xxGpuCc, 0x1170, BranchDelay, 0},
+        {NativeAdrenoA6xxGpuCc, 0x1004, BranchVoted, 0},
+        {NativeAdrenoA6xxGpuCc, 0x109c, BranchHalt, 0},
+        {NativeAdrenoA6xxGpuCc, 0x1178, BranchHalt, 0},
+        {NativeAdrenoA6xxGpuCc, 0x1204, BranchHalt, 0},
+        {NativeAdrenoA6xxGpuCc, 0x1078, BranchDelay, 0},
+        {NativeAdrenoA6xxGpuCc, 0x107c, BranchVoted, 0},
+        {NativeAdrenoA6xxGpuCc, 0x1098, BranchHalt, 0},
+        {NativeAdrenoA6xxGpuCc, 0x108c, BranchVoted, 0},
+        {NativeAdrenoA6xxGpuCc, 0x1090, BranchVoted, 0},
+        {NativeAdrenoA6xxGpuCc, 0x5000, BranchVoted, 0},
+        {NativeAdrenoA6xxGcc, 0x71154, BranchSkip, Bit(1)},
+        {NativeAdrenoA6xxGcc, 0x7100c, BranchVoted, Bit(1)},
+        {NativeAdrenoA6xxGcc, 0x71018, BranchHalt, 0}
     };
     for (const Clock &clock : clocks) {
-        result = branch(clock.domain, clock.offset, 1, clock.rule);
+        result = branch(clock.domain, clock.offset, 1, clock.rule, clock.hwcgMask);
         if (result) {
             return result;
         }
@@ -731,43 +753,28 @@ IOReturn NativeAdrenoA6xxPower::enableGx()
         return kIOReturnNotReady;
     }
     report_.phase = GxDomain;
-    uint32_t value;
-    IOReturn result = read(NativeAdrenoA6xxGpuCc, 0x100c, &value);
+    IOReturn result = poll(NativeAdrenoA6xxGpuCc, 0x100c, Bit(31), Bit(31), 5000);
     if (result) {
         return result;
     }
-    if (!(value & Bit(31))) {
-        result = update(NativeAdrenoA6xxGpuCc, 0x1008, 0, 1);
-        if (result) {
-            return result;
-        }
-        io_.delayUs(io_.cookie, 100);
-        result = update(NativeAdrenoA6xxGpuCc, 0x1008, 1, 0);
-        if (result) {
-            return result;
-        }
-        result = update(NativeAdrenoA6xxGpuCc, 0x158c, 0, Bit(4));
-        if (result) {
-            return result;
-        }
-        io_.delayUs(io_.cookie, 1);
-        result = update(NativeAdrenoA6xxGpuCc, 0x158c, Bit(4) | Bit(0), 0);
-        if (result) {
-            return result;
-        }
-    }
-    result = update(NativeAdrenoA6xxGpuCc, 0x100c, 7, Bit(11));
+    const uint32_t gxDomain = report_.value;
+    result = poll(NativeAdrenoA6xxGmuRegisters, 0x1f8d0 * 4 - 0x6a000, 0xc0, 0, 5000);
     if (result) {
         return result;
     }
-    result = poll(NativeAdrenoA6xxGpuCc, 0x100c, Bit(31), Bit(31), 5000);
+    const uint32_t gxStatus = report_.value;
+    result = poll(NativeAdrenoA6xxGmuRegisters, 0x23b10 * 4 - 0x6a000, 0xffffffff, 0, 5000);
     if (result) {
         return result;
     }
-    result = branch(NativeAdrenoA6xxGpuCc, 0x1064, 1, 0);
+    const uint32_t fence = report_.value;
+    uint32_t gxClock;
+    result = read(NativeAdrenoA6xxGpuCc, 0x1064, &gxClock);
     if (result) {
         return result;
     }
+    IOLog("NativeAdrenoA6xx: GMU owns GX domain=%08x status=%08x fence=%08x clock=%08x\n",
+        gxDomain, gxStatus, fence, gxClock);
 
     gxReady_ = true;
     report_.phase = GxReady;
@@ -785,7 +792,8 @@ IOReturn NativeAdrenoA6xxPower::stop(bool dmaStopped)
     }
 
     // Host votes and SMMU clocks remain asserted while the service owns memory.
-    report_.phase = Stopped;
-    report_.status = kIOReturnSuccess;
+    if (!report_.status) {
+        report_.phase = Stopped;
+    }
     return kIOReturnSuccess;
 }

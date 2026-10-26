@@ -15,8 +15,9 @@ struct NativeAdrenoCpInitConfig {
  * and a register-list page retained for the entire boot. A642L uses the A660
  * eleven-word CP_ME_INIT payload and starts SQE through CP_SQE_CNTL. A740
  * sends CP_THREAD_CONTROL followed by its seven-word CP_ME_INIT payload.
- * The ring appends a timestamp fence; the caller waits for that value before
- * publishing clients. Each object accepts one initialization attempt. */
+ * A642L bootstrap waits for hardware idle before the caller authenticates ZAP
+ * and exits secure mode. A740 initialization appends a timestamp fence.
+ * Each object accepts one initialization attempt. */
 class NativeAdrenoCpInit final {
     bool done_=false,poisoned_=false;
     IOReturn poison();
@@ -27,6 +28,8 @@ public:
     NativeAdrenoCpInit &operator=(const NativeAdrenoCpInit &)=delete;
     IOReturn run(const NativeAdrenoRingIo *,NativeAdrenoRing *,
         const NativeAdrenoCpInitConfig *,uint32_t *fence);
+    IOReturn runBootstrap(const NativeAdrenoRingIo *,NativeAdrenoRing *,
+        const NativeAdrenoCpInitConfig *,uint32_t *wptr);
     bool completed() const {return done_;}
     bool poisoned() const {return poisoned_;}
     static uint32_t meInitMask(NativeAdrenoGeneration generation=NativeAdrenoA740);
