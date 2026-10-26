@@ -126,7 +126,7 @@ struct NativeAdrenoBackingStorage {
     size_t bytes=0,span_count=0,span_capacity=0;
     unsigned output_bits=0;
     bool contiguous=false,prepared=false,quarantined=false,write_combined=false;
-    bool descriptor_write_combined=false;
+    bool descriptor_write_combined=false;   /* The persistent memory entry was created with WC. */
     NativeAdrenoMemorySource diagnostic_source=NativeAdrenoMemorySource::Unknown;
     NativeAdrenoMemoryCacheResult diagnostic_cache_result=NativeAdrenoMemoryCacheResult::NotRequested;
 };
@@ -140,7 +140,7 @@ class NativeAdrenoMemory final {
     NativeAdrenoBackingStorage storage_;
     IOMemoryDescriptor *imported_=nullptr;
     bool read_only_=false;
-    bool controlled_cpu_views_=true;
+    bool controlled_cpu_views_=true;   /* A legacy physical view requires submit-time page repair. */
     uint32_t device_references_=0;
     bool pooled_=false;
     size_t pool_offset_=0;
@@ -179,9 +179,9 @@ public:
     /* The whole pool write-combined once, for good: a pooled BO then takes no page-attribute change on allocation or release.
      * Board only, after reservePool, when user BOs are write-combined. */
     static IOReturn writeCombinePool();
-    /* Pins bytes at address in task (a user task's own pages) instead of allocating; prepare() wires them until release().
-     * There is no kernel mapping: the owner keeps its CPU mapping and does its own cache maintenance around GPU use, so
-     * publishForDevice/acquireDeviceWrites have nothing to do for this object. Spans and PA bounds are checked as for allocate. */
+    /* importTask pins the task's pages and retains their existing CPU cache mode.
+     * publishForDevice and acquireDeviceWrites maintain their physical ranges
+     * around GPU use. Spans and PA bounds are checked as for allocate. */
     IOReturn importTask(void *task,uint64_t address,size_t bytes,unsigned output_bits,size_t byte_budget);
     bool imported() const {return imported_!=nullptr;}
     /* An import of memory the owner maps read-only (the kernel could pin it for reading only): the GPU may read it, never write it. */

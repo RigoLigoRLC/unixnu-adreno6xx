@@ -40,7 +40,7 @@ struct NativeAdrenoAbiParams {
     uint32_t abi_version;
     uint32_t input_bits;          /* GPU VA bits below 2^input_bits */
     uint32_t output_bits;         /* physical address bits */
-    uint32_t flags;               /* NativeAdrenoParamsHostImport or zero */
+    uint32_t flags;               /* NativeAdrenoParams capability bits */
     uint64_t max_bo_bytes;
 };
 enum {
