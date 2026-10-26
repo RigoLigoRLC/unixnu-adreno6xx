@@ -12,6 +12,7 @@ extern "C" {volatile uint32_t native_adreno_trace_stage;}
 extern "C" {
 extern uint64_t (*native_adreno_vm_now_us)(void);
 extern unsigned int memorystatus_available_pages;
+extern volatile uint64_t native_adreno_cache_stats[5];
 void proc_selfname(char *,int);
 volatile uint64_t native_adreno_memory_stage_stats[10][4];
 /* hits, misses, insertions, evictions, rejected insertions, cached objects,
@@ -506,6 +507,7 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
         return kIOReturnNoResources;
     }
     const NativeAdrenoMemorySource source=pooled?NativeAdrenoMemorySource::UserOwned:NativeAdrenoMemorySource::KernelOwned;
+    controlled_cpu_views_=true;
     storage_.diagnostic_source=source;
     storage_.diagnostic_cache_result=NativeAdrenoMemoryCacheResult::NotRequested;
     storage_.output_bits=bits;
@@ -588,6 +590,9 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
     }
 
     IOOptionBits options=static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone);
+    if(reuse_write_combined) {
+        options|=kIOMapWriteCombineCache;
+    }
     if(contiguous) {
         options|=kIOMemoryPhysicallyContiguous;
     }
@@ -604,6 +609,7 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
     if(!storage_.descriptor) {
         return kIOReturnNoMemory;
     }
+    storage_.descriptor_write_combined=reuse_write_combined;
     {
         MemoryStageTime elapsed(MemoryPrepare,bytes);
         status=storage_.descriptor->prepare();
@@ -651,6 +657,10 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
                 storage_.spans[storage_.span_count++]={offset,physical,4096};
             }
         }
+    }
+    storage_.write_combined=storage_.descriptor_write_combined;
+    if(storage_.write_combined) {
+        __atomic_fetch_add(&native_adreno_cache_stats[4],bytes/4096,__ATOMIC_RELAXED);
     }
     {
         MemoryStageTime elapsed(MemoryZero,bytes);

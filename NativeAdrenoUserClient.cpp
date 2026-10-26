@@ -66,6 +66,7 @@ void NativeAdrenoUserClient::returnEntry(Entry &entry)
     entry.metadata_bytes=0;
     entry.token=0;
     entry.mapping_leases=0;
+    entry.controlled_mapping_leases=0;
 
     entry.next_free=free_head_;
     free_head_=static_cast<uint32_t>(&entry-entries_);
@@ -169,6 +170,7 @@ IOReturn NativeAdrenoUserClient::releaseAll(const NativeAdrenoRingClock *clock,u
         Entry &entry=entries_[index];
         if(!entry.used)continue;
         entry.mapping_leases=0;
+        entry.controlled_mapping_leases=0;
         NativeAdrenoAbiBoFree request{entry.handle};
         status=freeBo(&request);
         if(status)return status;
@@ -200,7 +202,8 @@ IOReturn NativeAdrenoUserClient::query(NativeAdrenoAbiParams *params)
     if(!open_)return kIOReturnNotReady;
     params->abi_version=NativeAdrenoAbiVersion;
     params->input_bits=input_bits_;params->output_bits=output_bits_;
-    params->flags=NativeAdrenoParamsHostImport|NativeAdrenoParamsBoProfile;
+    params->flags=NativeAdrenoParamsHostImport|NativeAdrenoParamsBoProfile|
+        NativeAdrenoParamsCpuMapV2|NativeAdrenoParamsBoProfileBudget;
     params->max_bo_bytes=UINT64_C(1)<<NativeAdrenoAbiMaxBoBytesShift;
     return kIOReturnSuccess;
 }
@@ -353,7 +356,10 @@ IOReturn NativeAdrenoUserClient::freeBo(const NativeAdrenoAbiBoFree *request)
     Entry *entry=find(request->handle);
     if(!entry)return kIOReturnBadArgument;
     if(entry->unreleasable) {noteFreeRefused(entry->imported,entry->handle,kIOReturnBusy);return kIOReturnBusy;}
-    if(entry->mapping_leases) {noteFreeRefused(entry->imported,entry->handle,kIOReturnBusy);return kIOReturnBusy;}
+    if(entry->mapping_leases || entry->controlled_mapping_leases) {
+        noteFreeRefused(entry->imported,entry->handle,kIOReturnBusy);
+        return kIOReturnBusy;
+    }
     native_adreno_trace_stage=2;
     if(entry->mapped_state) {
         /* Completed jobs must not pin the buffer: retire what the CP has passed before the unmap decides. */
@@ -637,7 +643,7 @@ IOReturn NativeAdrenoUserClient::dispatch(uint32_t method,const void *input,
     return status;
 }
 IOReturn NativeAdrenoUserClient::cpuMap(const NativeAdrenoAbiBoCpuMap *request,
-    NativeAdrenoAbiBoCpuMapReply *reply)
+    NativeAdrenoAbiBoCpuMapReply *reply,bool controlled)
 {
     if(!request || !reply)return kIOReturnBadArgument;*reply={};
     if(!open_)return kIOReturnNotReady;
@@ -645,12 +651,15 @@ IOReturn NativeAdrenoUserClient::cpuMap(const NativeAdrenoAbiBoCpuMap *request,
     if(!entry || entry->unreleasable)return kIOReturnBadArgument;
     /* An imported BO is the caller's own memory, already mapped where it came from. */
     if(entry->memory.imported())return kIOReturnUnsupported;
-    if(entry->mapping_leases==UINT32_MAX)return kIOReturnNoResources;
-    ++entry->mapping_leases;
+    if(controlled && !entry->memory.descriptorWriteCombined())return kIOReturnUnsupported;
+    uint32_t &leases=controlled?entry->controlled_mapping_leases:entry->mapping_leases;
+    if(leases==UINT32_MAX)return kIOReturnNoResources;
+    if(!controlled)entry->memory.allowLegacyCpuView();
+    ++leases;
     reply->token=entry->token;reply->bytes=entry->memory.bytes();
     return kIOReturnSuccess;
 }
-IOReturn NativeAdrenoUserClient::cpuUnmap(const NativeAdrenoAbiBoCpuUnmap *request)
+IOReturn NativeAdrenoUserClient::cpuUnmap(const NativeAdrenoAbiBoCpuUnmap *request,bool controlled)
 {
     if(!request)return kIOReturnBadArgument;
     if(!open_)return kIOReturnNotReady;
@@ -658,8 +667,9 @@ IOReturn NativeAdrenoUserClient::cpuUnmap(const NativeAdrenoAbiBoCpuUnmap *reque
     Entry *entry=find(request->handle);
     if(!entry || entry->unreleasable || !entry->token)return kIOReturnBadArgument;
     if(request->token!=entry->token)return kIOReturnBadArgument;
-    if(!entry->mapping_leases)return kIOReturnBusy;
-    --entry->mapping_leases;
+    uint32_t &leases=controlled?entry->controlled_mapping_leases:entry->mapping_leases;
+    if(!leases)return kIOReturnBusy;
+    --leases;
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoUserClient::createQueue(NativeAdrenoAbiQueueReply *reply)

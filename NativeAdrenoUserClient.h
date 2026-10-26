@@ -32,6 +32,7 @@ class NativeAdrenoUserClient final {
         uint32_t metadata_bytes=0;
         uint32_t token=0;
         uint32_t mapping_leases=0;
+        uint32_t controlled_mapping_leases=0;
         char metadata[NativeAdrenoAbiMetadataBytes]{};
     };
     /* open() allocates the entries and links them in ascending slot order. */
@@ -101,8 +102,8 @@ public:
     IOReturn freeBo(const NativeAdrenoAbiBoFree *);
     IOReturn submit(const NativeAdrenoAbiSubmit *,NativeAdrenoAbiSubmitReply *,
         const NativeAdrenoRingClock *);
-    IOReturn cpuMap(const NativeAdrenoAbiBoCpuMap *,NativeAdrenoAbiBoCpuMapReply *);
-    IOReturn cpuUnmap(const NativeAdrenoAbiBoCpuUnmap *);
+    IOReturn cpuMap(const NativeAdrenoAbiBoCpuMap *,NativeAdrenoAbiBoCpuMapReply *,bool controlled=false);
+    IOReturn cpuUnmap(const NativeAdrenoAbiBoCpuUnmap *,bool controlled=false);
     IOReturn createQueue(NativeAdrenoAbiQueueReply *);
     IOReturn closeQueue(const NativeAdrenoAbiQueue *);
     IOReturn setMetadata(const NativeAdrenoAbiMetadata *);

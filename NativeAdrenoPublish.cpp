@@ -6,7 +6,8 @@
  * one GPU address space (the render server the large one), and closing a connection waits for its own jobs only, then unmaps and
  * frees everything it created. Not yet done: per-process GPU page tables (the windows are enforced by the driver, not by the SMMU)
  * and a reset path. This is not the Metal or Turnip ABI; it carries NativeAdrenoABI.h unchanged.
- * BO CPU mappings use physical-range descriptors; Turnip requests write-combined CPU mappings for the BO pages.
+ * Controlled BO CPU mappings share the allocation's persistent WC descriptor.
+ * Legacy CPU tokens retain their physical-range views and cache-attribute repair.
  * AGXDeviceUserClient serves the Metal plugin's connections. The accelerator's
  * NativeSandboxGrantProcess property supplies the process authorization used by
  * the kernel's IOServiceOpen path; the client class name alone is insufficient. */
@@ -164,6 +165,7 @@ struct BoProfileRecords {
     bool active=false;
     char name[20]{};
     NativeAdrenoAbiBoProfile counters{};
+    NativeAdrenoAbiBoProfile budget{};
     NativeAdrenoAbiBoProfile sizes[NativeAdrenoBoProfileSizeCount]{};
     NativeAdrenoAbiBoProfile usages[NativeAdrenoBoProfileUsageCount]{};
     NativeAdrenoAbiBoProfile slow[NativeAdrenoBoProfileSlowCount]{};
@@ -200,6 +202,7 @@ bool validBoProfile(const NativeAdrenoAbiBoProfile &record)
     }
     switch(record.kind) {
         case NativeAdrenoBoProfileCounters:
+        case NativeAdrenoBoProfileBudget:
             return record.index==0;
         case NativeAdrenoBoProfileSize:
             return record.index<NativeAdrenoBoProfileSizeCount;
@@ -222,6 +225,9 @@ void saveBoProfile(BoProfileRecords &records,NativeAdrenoAbiBoProfile &record)
     switch(record.kind) {
         case NativeAdrenoBoProfileCounters:
             destination=&records.counters;
+            break;
+        case NativeAdrenoBoProfileBudget:
+            destination=&records.budget;
             break;
         case NativeAdrenoBoProfileSize:
             destination=&records.sizes[record.index];
@@ -287,6 +293,21 @@ void printBoProfile(const BoProfileRecords &records)
         IOLog("NativeAdrenoBO: reporting s=%u g=%llu d=%llu q=%llu slow_total=%llu slow_overwritten=%llu report_failures=%llu\n",
             records.connection_slot,records.generation,records.device_id,sample.sequence,
             counts.slow_total,counts.slow_overwritten,counts.report_failures);
+    }
+    const NativeAdrenoAbiBoProfile &budgetRecord=records.budget;
+    if(budgetRecord.sequence) {
+        const NativeAdrenoAbiBoCacheBudget &budget=budgetRecord.data.budget;
+        IOLog("NativeAdrenoBO: budget_time s=%u g=%llu d=%llu q=%llu sampled_us=%llu\n",
+            records.connection_slot,records.generation,records.device_id,budgetRecord.sequence,budgetRecord.sampled_us);
+        IOLog("NativeAdrenoBO: budget_nodes s=%u g=%llu d=%llu q=%llu objects=%llu limit=%llu metadata_bytes=%llu\n",
+            records.connection_slot,records.generation,records.device_id,budgetRecord.sequence,
+            budget.node_objects,budget.node_limit,budget.metadata_bytes);
+        IOLog("NativeAdrenoBO: budget_bytes s=%u g=%llu d=%llu q=%llu cache=%llu reclaim=%llu\n",
+            records.connection_slot,records.generation,records.device_id,budgetRecord.sequence,
+            budget.cache_budget_bytes,budget.reclaim_bytes);
+        IOLog("NativeAdrenoBO: budget_reclaim s=%u g=%llu d=%llu q=%llu high_bytes=%llu low_bytes=%llu\n",
+            records.connection_slot,records.generation,records.device_id,budgetRecord.sequence,
+            budget.reclaim_high_bytes,budget.reclaim_low_bytes);
     }
     for(unsigned kind=NativeAdrenoBoProfileSize;kind<=NativeAdrenoBoProfileUsage;++kind) {
         const unsigned count=kind==NativeAdrenoBoProfileSize?NativeAdrenoBoProfileSizeCount:NativeAdrenoBoProfileUsageCount;
@@ -473,7 +494,19 @@ class AGXDeviceUserClient : public IOUserClient {
      * pmap_assert_free. A cache of 64 held until the render server's hundreds of mapped BOs (int-087). */
     enum {MaxViews=NativeAdrenoClientMaxObjects};
     View *views_=nullptr;   /* on the heap: 1024 entries would make the client object too big for the kernel allocator's fixed-size classes */
+    /* CpuMapping retains one completed map and the BO lease that prevents its
+     * allocation from being released while the user address remains mapped. */
+    struct CpuMapping {
+        uint64_t handle=0,map_id=0;
+        uint32_t token=0;
+        IOMemoryMap *map=nullptr;
+    };
+    CpuMapping *cpuMappings_=nullptr;
+    uint64_t nextCpuMapId_=0;
     IOReturn dropViews(uint32_t token);
+    IOReturn mapCpu(const NativeAdrenoAbiBoCpuMapV2 &,NativeAdrenoAbiBoCpuMapV2Reply &);
+    IOReturn unmapCpu(const NativeAdrenoAbiBoCpuUnmapV2 &);
+    IOReturn dropCpuMappings();
     static IOReturn action(OSObject *target,void *reference,IOExternalMethodArguments *arguments);
     IOReturn run(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size);
 public:
@@ -710,6 +743,161 @@ IOReturn AGXDeviceUserClient::dropViews(uint32_t token)
         view->release();
     }
 }
+IOReturn AGXDeviceUserClient::mapCpu(const NativeAdrenoAbiBoCpuMapV2 &request,
+    NativeAdrenoAbiBoCpuMapV2Reply &reply)
+{
+    if(request.version!=NativeAdrenoCpuMapVersion || request.flags || (request.address&4095)) {
+        return kIOReturnBadArgument;
+    }
+
+    IOLockLock(g.lock);
+    if(!live_ || closing_ || viewTeardownStatus_ || g.failed || kernel_) {
+        IOLockUnlock(g.lock);
+        return kIOReturnNotReady;
+    }
+    if(nextCpuMapId_==UINT64_MAX) {
+        IOLockUnlock(g.lock);
+        return kIOReturnNoResources;
+    }
+    if(!cpuMappings_) {
+        cpuMappings_=IONewZero(CpuMapping,MaxViews);
+    }
+    if(!cpuMappings_) {
+        IOLockUnlock(g.lock);
+        return kIOReturnNoMemory;
+    }
+    CpuMapping *destination=nullptr;
+    for(size_t index=0;index<MaxViews;++index) {
+        if(!cpuMappings_[index].map_id) {
+            destination=&cpuMappings_[index];
+            break;
+        }
+    }
+    if(!destination) {
+        IOLockUnlock(g.lock);
+        return kIOReturnNoResources;
+    }
+
+    NativeAdrenoAbiBoCpuMap leaseRequest{request.handle};
+    NativeAdrenoAbiBoCpuMapReply lease{};
+    IOReturn status=core_->cpuMap(&leaseRequest,&lease,true);
+    if(status) {
+        IOLockUnlock(g.lock);
+        return status;
+    }
+    NativeAdrenoMemory *backing=core_->memoryOf(request.handle);
+    IOMemoryDescriptor *descriptor=backing?backing->descriptor():nullptr;
+    IOMemoryMap *map=nullptr;
+    if(descriptor && request.address<=UINT64_MAX-lease.bytes) {
+        /* Default cache flags preserve the WC mode stored in the memory entry.
+         * A unique map gives each returned ID an independent unmap lifetime. */
+        const IOOptionBits options=kIOMapUnique|(request.address?0:kIOMapAnywhere);
+        map=descriptor->createMappingInTask(current_task(),request.address,options,0,lease.bytes);
+    }
+    if(map && map->getAddress() && map->getLength()==lease.bytes &&
+        (!request.address || map->getAddress()==request.address)) {
+        destination->handle=request.handle;
+        destination->map_id=++nextCpuMapId_;
+        destination->token=lease.token;
+        destination->map=map;
+        reply={destination->map_id,map->getAddress(),map->getLength()};
+        IOLockUnlock(g.lock);
+        return kIOReturnSuccess;
+    }
+
+    if(map) {
+        status=map->unmap();
+        if(status) {
+            destination->handle=request.handle;
+            destination->map_id=++nextCpuMapId_;
+            destination->token=lease.token;
+            destination->map=map;
+            viewTeardownStatus_=status;
+            backing->quarantine();
+            IOLockUnlock(g.lock);
+            return status;
+        }
+        map->release();
+    }
+    NativeAdrenoAbiBoCpuUnmap undo{request.handle,lease.token,0};
+    status=core_->cpuUnmap(&undo,true);
+    if(status) {
+        viewTeardownStatus_=status;
+        if(backing) {
+            backing->quarantine();
+        }
+    }
+    IOLockUnlock(g.lock);
+    return status?status:kIOReturnNoMemory;
+}
+
+IOReturn AGXDeviceUserClient::unmapCpu(const NativeAdrenoAbiBoCpuUnmapV2 &request)
+{
+    if(!request.handle || !request.map_id) {
+        return kIOReturnBadArgument;
+    }
+
+    IOLockLock(g.lock);
+    if(!live_ || viewTeardownStatus_) {
+        const IOReturn status=viewTeardownStatus_?viewTeardownStatus_:kIOReturnNotReady;
+        IOLockUnlock(g.lock);
+        return status;
+    }
+    CpuMapping *mapping=nullptr;
+    for(size_t index=0;cpuMappings_ && index<MaxViews;++index) {
+        if(cpuMappings_[index].map_id==request.map_id && cpuMappings_[index].handle==request.handle) {
+            mapping=&cpuMappings_[index];
+            break;
+        }
+    }
+    if(!mapping) {
+        IOLockUnlock(g.lock);
+        return kIOReturnBadArgument;
+    }
+
+    IOReturn status=mapping->map->unmap();
+    if(!status) {
+        NativeAdrenoAbiBoCpuUnmap lease{mapping->handle,mapping->token,0};
+        status=core_->cpuUnmap(&lease,true);
+    }
+    if(status) {
+        viewTeardownStatus_=status;
+        if(NativeAdrenoMemory *backing=core_->memoryOf(mapping->handle)) {
+            backing->quarantine();
+        }
+        IOLockUnlock(g.lock);
+        return status;
+    }
+    IOMemoryMap *map=mapping->map;
+    *mapping={};
+    IOLockUnlock(g.lock);
+    map->release();
+    return kIOReturnSuccess;
+}
+
+IOReturn AGXDeviceUserClient::dropCpuMappings()
+{
+    for(;;) {
+        NativeAdrenoAbiBoCpuUnmapV2 request{};
+        IOLockLock(g.lock);
+        const IOReturn previous=viewTeardownStatus_;
+        for(size_t index=0;!previous && cpuMappings_ && index<MaxViews;++index) {
+            if(cpuMappings_[index].map_id) {
+                request={cpuMappings_[index].handle,cpuMappings_[index].map_id};
+                break;
+            }
+        }
+        IOLockUnlock(g.lock);
+        if(previous || !request.map_id) {
+            return previous;
+        }
+        const IOReturn status=unmapCpu(request);
+        if(status) {
+            return status;
+        }
+    }
+}
+
 IOReturn AGXDeviceUserClient::clientClose()
 {
     IOLockLock(g.lock);
@@ -725,7 +913,10 @@ IOReturn AGXDeviceUserClient::clientClose()
     if(gMailboxOwner==this) {mailbox=gMailboxOwner;gMailboxOwner=nullptr;}
     IOLockUnlock(g.lock);
 
-    IOReturn status=dropViews(0);
+    IOReturn status=dropCpuMappings();
+    if(!status) {
+        status=dropViews(0);
+    }
     IOLockLock(g.lock);
     if(!status && live_) {
         const uint64_t peak=core_->windowPeak();
@@ -748,7 +939,14 @@ IOReturn AGXDeviceUserClient::clientClose()
 }
 void AGXDeviceUserClient::free()
 {
-    const IOReturn status=dropViews(0);
+    IOReturn status=dropCpuMappings();
+    if(!status) {
+        status=dropViews(0);
+    }
+    if(!status && cpuMappings_) {
+        IODelete(cpuMappings_,CpuMapping,MaxViews);
+        cpuMappings_=nullptr;
+    }
     if(!status && views_) {IODelete(views_,View,MaxViews);views_=nullptr;}
     /* Still live only when a teardown failed: its objects stay referenced by the VM and the ring, so the core is kept, not freed. */
     if(core_ && !live_) {delete core_;core_=nullptr;}
@@ -903,6 +1101,28 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
 }
 IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size)
 {
+    if(method==NativeAdrenoMethodBoCpuMapV2) {
+        if(!input || input_size!=sizeof(NativeAdrenoAbiBoCpuMapV2) ||
+            !output || output_size!=sizeof(NativeAdrenoAbiBoCpuMapV2Reply)) {
+            return kIOReturnBadArgument;
+        }
+        NativeAdrenoAbiBoCpuMapV2 request{};
+        NativeAdrenoAbiBoCpuMapV2Reply reply{};
+        memcpy(&request,input,sizeof(request));
+        const IOReturn status=mapCpu(request,reply);
+        if(!status) {
+            memcpy(output,&reply,sizeof(reply));
+        }
+        return status;
+    }
+    if(method==NativeAdrenoMethodBoCpuUnmapV2) {
+        if(!input || input_size!=sizeof(NativeAdrenoAbiBoCpuUnmapV2) || output_size) {
+            return kIOReturnBadArgument;
+        }
+        NativeAdrenoAbiBoCpuUnmapV2 request{};
+        memcpy(&request,input,sizeof(request));
+        return unmapCpu(request);
+    }
     if(method==NativeAdrenoMethodReportBoProfile) {
         if(!input || input_size!=sizeof(NativeAdrenoAbiBoProfile) || output_size) {
             return kIOReturnBadArgument;
@@ -1045,7 +1265,9 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
         {&action,0,sizeof(NativeAdrenoAbiBoCpuUnmap),0,0},
         {&action,0,0,0,sizeof(NativeAdrenoAbiDeviceInfo)},
         {&action,0,sizeof(NativeAdrenoAbiBoImport),0,sizeof(NativeAdrenoAbiBoAllocReply)},
-        {&action,0,sizeof(NativeAdrenoAbiBoProfile),0,0}};
+        {&action,0,sizeof(NativeAdrenoAbiBoProfile),0,0},
+        {&action,0,sizeof(NativeAdrenoAbiBoCpuMapV2),0,sizeof(NativeAdrenoAbiBoCpuMapV2Reply)},
+        {&action,0,sizeof(NativeAdrenoAbiBoCpuUnmapV2),0,0}};
     native_adreno_metal_diag.ext_entries=native_adreno_metal_diag.ext_entries+1;
     if(selector<256)native_adreno_metal_diag.sel_bits[selector>>5]|=1u<<(selector&31);
     /* Tunnel. The sandbox resolves a filter policy for this class at open time and then admits only the selectors its profile lists,

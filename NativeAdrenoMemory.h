@@ -126,6 +126,7 @@ struct NativeAdrenoBackingStorage {
     size_t bytes=0,span_count=0,span_capacity=0;
     unsigned output_bits=0;
     bool contiguous=false,prepared=false,quarantined=false,write_combined=false;
+    bool descriptor_write_combined=false;
     NativeAdrenoMemorySource diagnostic_source=NativeAdrenoMemorySource::Unknown;
     NativeAdrenoMemoryCacheResult diagnostic_cache_result=NativeAdrenoMemoryCacheResult::NotRequested;
 };
@@ -139,6 +140,7 @@ class NativeAdrenoMemory final {
     NativeAdrenoBackingStorage storage_;
     IOMemoryDescriptor *imported_=nullptr;
     bool read_only_=false;
+    bool controlled_cpu_views_=true;
     uint32_t device_references_=0;
     bool pooled_=false;
     size_t pool_offset_=0;
@@ -188,12 +190,15 @@ public:
      * write-combined. Cached storage already has this attribute. */
     IOReturn makeWriteCombined();
     bool writeCombined() const {return storage_.write_combined;}
-    /* CPU view creation and teardown can change scattered pages' attributes.
-     * This call restores WC on those pages before the device uses them. The
-     * reserved contiguous pool keeps its fixed WC attribute. */
+    bool descriptorWriteCombined() const {return storage_.descriptor_write_combined;}
+    void allowLegacyCpuView() {controlled_cpu_views_=false;}
+    /* Legacy physical views can change scattered pages' attributes. Controlled
+     * views share the allocation's persistent WC memory entry, so their map and
+     * unmap operations preserve the cache mode without walking physical pages. */
     IOReturn reassertWriteCombined(uint32_t *reset) const
     {
-        return storage_.write_combined && storage_.span_count && !pooled_?
+        return storage_.write_combined && storage_.span_count && !pooled_ &&
+            (!storage_.descriptor_write_combined || !controlled_cpu_views_)?
             NativeAdrenoReassertWriteCombined(storage_.spans,storage_.span_count,reset):kIOReturnSuccess;
     }
     bool backed() const {return storage_.descriptor || imported_ || pooled_;}

@@ -31,6 +31,8 @@ enum {
     NativeAdrenoMethodGetDeviceInfo = 15,
     NativeAdrenoMethodBoImport = 16,
     NativeAdrenoMethodReportBoProfile = 17,
+    NativeAdrenoMethodBoCpuMapV2 = 18,
+    NativeAdrenoMethodBoCpuUnmapV2 = 19,
     NativeAdrenoAbiMetadataBytes = 64,
     NativeAdrenoAbiMaxQueues = 8
 };
@@ -43,7 +45,10 @@ struct NativeAdrenoAbiParams {
 };
 enum {
     NativeAdrenoParamsHostImport = 1, /* BoImport pins the caller's own pages (an IOSurface's) as a BO */
-    NativeAdrenoParamsBoProfile = 2
+    NativeAdrenoParamsBoProfile = 2,
+    NativeAdrenoParamsCpuMapV2 = 4,
+    NativeAdrenoParamsBoProfileBudget = 8,
+    NativeAdrenoCpuMapVersion = 1
 };
 
 /* NativeAdrenoAbiBoProfile carries software allocation statistics from one
@@ -58,6 +63,7 @@ enum {
     NativeAdrenoBoProfileSize = 1,
     NativeAdrenoBoProfileUsage = 2,
     NativeAdrenoBoProfileSlow = 3,
+    NativeAdrenoBoProfileBudget = 4,
     NativeAdrenoBoProfileSizeCount = 17,
     NativeAdrenoBoProfileUsageCount = 16,
     NativeAdrenoBoProfileSlowCount = 64,
@@ -98,6 +104,10 @@ struct NativeAdrenoAbiBoSlowEvent {
     uint32_t connection_fence,cached_objects,pending_objects,status;
     char name[32];
 };
+struct NativeAdrenoAbiBoCacheBudget {
+    uint64_t node_objects,node_limit,metadata_bytes,cache_budget_bytes;
+    uint64_t reclaim_bytes,reclaim_high_bytes,reclaim_low_bytes;
+};
 struct NativeAdrenoAbiBoProfile {
     uint32_t version,kind,index,reserved;
     uint64_t sequence,sampled_us,device_id;
@@ -105,6 +115,7 @@ struct NativeAdrenoAbiBoProfile {
         NativeAdrenoAbiBoCacheCounters counters;
         NativeAdrenoAbiBoCacheBin bin;
         NativeAdrenoAbiBoSlowEvent slow;
+        NativeAdrenoAbiBoCacheBudget budget;
     } data;
 };
 struct NativeAdrenoAbiBoAlloc {
@@ -177,6 +188,25 @@ struct NativeAdrenoAbiBoCpuUnmap {
     uint64_t handle;
     uint32_t token;               /* exactly the token returned by map */
     uint32_t reserved;            /* zero */
+};
+/* NativeAdrenoAbiBoCpuMapV2 creates a complete CPU mapping in the calling task.
+ * The connection retains the IOMemoryMap and its BO lease until UnmapV2 or
+ * connection close removes the actual mapping. A nonzero address requests an
+ * exact placement; zero lets the VM select an address. */
+struct NativeAdrenoAbiBoCpuMapV2 {
+    uint64_t handle;
+    uint64_t address;
+    uint32_t version;
+    uint32_t flags;               /* zero */
+};
+struct NativeAdrenoAbiBoCpuMapV2Reply {
+    uint64_t map_id;              /* unique within this connection */
+    uint64_t address;
+    uint64_t bytes;
+};
+struct NativeAdrenoAbiBoCpuUnmapV2 {
+    uint64_t handle;
+    uint64_t map_id;
 };
 struct NativeAdrenoAbiQueue {
     uint64_t queue;               /* zero for create, an open id for close */
