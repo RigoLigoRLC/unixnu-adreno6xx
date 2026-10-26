@@ -12,6 +12,7 @@ extern "C" {volatile uint32_t native_adreno_trace_stage;}
 extern "C" {
 extern uint64_t (*native_adreno_vm_now_us)(void);
 extern unsigned int memorystatus_available_pages;
+void proc_selfname(char *,int);
 volatile uint64_t native_adreno_memory_stage_stats[10][4];
 /* hits, misses, insertions, evictions, rejected insertions, cached objects,
  * cached bytes, peak cached bytes, pressure drains, allocation-failure drains,
@@ -76,6 +77,127 @@ struct CachedBacking {
 CachedBacking backing_cache[BackingCacheEntries];
 size_t backing_cache_bytes=0,backing_cache_count=0;
 uint64_t backing_cache_sequence=0;
+NativeAdrenoMemoryDiagnostics memory_diagnostics;
+
+enum BackingMissReason : unsigned {
+    BackingMissEmpty,
+    BackingMissSize,
+    BackingMissAttributes,
+    BackingMissQuarantined
+};
+
+enum BackingRejectReason : unsigned {
+    BackingRejectNotOwned,
+    BackingRejectNotPrepared,
+    BackingRejectNotWriteCombined,
+    BackingRejectQuarantined,
+    BackingRejectNoSpans,
+    BackingRejectZeroSize,
+    BackingRejectOversized,
+    BackingRejectNoEvictableEntry,
+    BackingRejectNoSlot,
+    BackingRejectImported,
+    BackingRejectPooled,
+    BackingRejectPressure,
+    BackingRejectBusy
+};
+
+unsigned backingSizeBucket(size_t bytes)
+{
+    uint64_t upper=4096;
+    for(unsigned index=0;index+1<NativeAdrenoMemorySizeBucketCount;++index) {
+        if(bytes<=upper) {
+            return index;
+        }
+        upper*=2;
+    }
+    return NativeAdrenoMemorySizeBucketCount-1;
+}
+
+void noteBackingRequest(size_t bytes,bool reuse)
+{
+    NativeAdrenoMemoryBucketStats &bucket=memory_diagnostics.buckets[backingSizeBucket(bytes)];
+    ++bucket.requests;
+    bucket.bytes+=bytes;
+    if(reuse) {
+        ++bucket.lookups;
+    } else {
+        ++bucket.bypassed;
+    }
+}
+
+void noteBackingReject(BackingRejectReason reason)
+{
+    ++memory_diagnostics.insert_reject[reason];
+    native_adreno_backing_cache_stats[4]=native_adreno_backing_cache_stats[4]+1;
+}
+
+/* MemorySlowTime retains the storage attributes needed after a descriptor is
+ * released. Allocation and import refresh those attributes when they finish,
+ * so their records include the physical spans found during the operation. */
+class MemorySlowTime final {
+    const NativeAdrenoBackingStorage *storage_;
+    const bool *pooled_;
+    NativeAdrenoMemorySlowEvent event_;
+    uint64_t began_;
+    bool refresh_;
+
+    void captureStorage()
+    {
+        event_.spans=storage_->span_count;
+        event_.source=storage_->diagnostic_source;
+        event_.cache_result=storage_->diagnostic_cache_result;
+        if(storage_->contiguous) {
+            event_.flags|=NativeAdrenoMemoryDiagnosticContiguous;
+        }
+        if(storage_->write_combined) {
+            event_.flags|=NativeAdrenoMemoryDiagnosticWriteCombined;
+        }
+        if(storage_->quarantined) {
+            event_.flags|=NativeAdrenoMemoryDiagnosticQuarantined;
+        }
+        if(storage_->diagnostic_source==NativeAdrenoMemorySource::Imported) {
+            event_.flags|=NativeAdrenoMemoryDiagnosticImported;
+        }
+        if(pooled_ && *pooled_) {
+            event_.flags|=NativeAdrenoMemoryDiagnosticPooled;
+        }
+    }
+
+public:
+    MemorySlowTime(NativeAdrenoMemorySlowOperation operation,const NativeAdrenoBackingStorage &storage,
+        size_t bytes,unsigned bits,uint32_t flags=0,bool refresh=false,const bool *pooled=nullptr):
+        storage_(&storage),pooled_(pooled),began_(native_adreno_vm_now_us?native_adreno_vm_now_us():0),refresh_(refresh)
+    {
+        event_.operation=operation;
+        event_.bytes=bytes;
+        event_.output_bits=bits;
+        event_.flags=flags;
+        captureStorage();
+    }
+
+    ~MemorySlowTime()
+    {
+        const uint64_t ended=native_adreno_vm_now_us?native_adreno_vm_now_us():0;
+        if(!began_ || ended<began_ || ended-began_<8000) {
+            return;
+        }
+        if(refresh_ && storage_->bytes) {
+            captureStorage();
+        }
+        event_.sequence=++memory_diagnostics.slow_total;
+        event_.sampled_us=ended;
+        event_.elapsed_us=ended-began_;
+        event_.cached_bytes=backing_cache_bytes;
+        event_.cached_objects=static_cast<uint32_t>(backing_cache_count);
+        event_.available_pages=memorystatus_available_pages;
+        proc_selfname(event_.process,sizeof(event_.process));
+        memory_diagnostics.slow[(event_.sequence-1)%NativeAdrenoMemorySlowEventCount]=event_;
+        if(memory_diagnostics.slow_count<NativeAdrenoMemorySlowEventCount) {
+            ++memory_diagnostics.slow_count;
+        }
+    }
+};
 
 bool backingPressure()
 {
@@ -89,6 +211,14 @@ void noteBackingCacheSize()
     if(backing_cache_bytes>native_adreno_backing_cache_stats[7]) {
         native_adreno_backing_cache_stats[7]=backing_cache_bytes;
     }
+    memory_diagnostics.cached_objects=backing_cache_count;
+    memory_diagnostics.cached_bytes=backing_cache_bytes;
+    if(backing_cache_count>memory_diagnostics.peak_objects) {
+        memory_diagnostics.peak_objects=backing_cache_count;
+    }
+    if(backing_cache_bytes>memory_diagnostics.peak_bytes) {
+        memory_diagnostics.peak_bytes=backing_cache_bytes;
+    }
 }
 
 IOReturn destroyOwnedStorage(NativeAdrenoBackingStorage &storage)
@@ -96,6 +226,7 @@ IOReturn destroyOwnedStorage(NativeAdrenoBackingStorage &storage)
     if(storage.quarantined) {
         return kIOReturnBusy;
     }
+    const uint32_t release_flags=storage.write_combined?NativeAdrenoMemoryDiagnosticWriteCombined:0;
     if(storage.write_combined) {
         MemoryStageTime elapsed(MemoryRestoreAttributes,storage.bytes);
         const IOReturn status=NativeAdrenoSetPagesCacheMode(storage.spans,storage.span_count,false);
@@ -119,6 +250,8 @@ IOReturn destroyOwnedStorage(NativeAdrenoBackingStorage &storage)
         }
         {
             MemoryStageTime elapsed(MemoryDescriptorRelease,storage.bytes);
+            MemorySlowTime slow(NativeAdrenoMemorySlowOperation::OwnedDescriptorRelease,storage,
+                storage.bytes,storage.output_bits,release_flags);
             native_adreno_trace_stage=33;
             storage.descriptor->release();
             native_adreno_trace_stage=34;
@@ -132,12 +265,14 @@ IOReturn destroyOwnedStorage(NativeAdrenoBackingStorage &storage)
     return kIOReturnSuccess;
 }
 
-IOReturn evictBacking(CachedBacking &entry)
+IOReturn evictBacking(CachedBacking &entry,unsigned reason)
 {
     const size_t bytes=entry.storage.bytes;
     const bool quarantined=entry.storage.quarantined;
+    ++memory_diagnostics.eviction_attempts[reason];
     const IOReturn status=destroyOwnedStorage(entry.storage);
     if(status) {
+        ++memory_diagnostics.eviction_failures[reason];
         if(!quarantined && entry.storage.quarantined) {
             native_adreno_backing_cache_stats[11]=native_adreno_backing_cache_stats[11]+1;
         }
@@ -146,6 +281,8 @@ IOReturn evictBacking(CachedBacking &entry)
     entry.sequence=0;
     backing_cache_bytes-=bytes;
     --backing_cache_count;
+    ++memory_diagnostics.evictions[reason];
+    memory_diagnostics.evicted_bytes[reason]+=bytes;
     native_adreno_backing_cache_stats[3]=native_adreno_backing_cache_stats[3]+1;
     noteBackingCacheSize();
     return kIOReturnSuccess;
@@ -153,21 +290,41 @@ IOReturn evictBacking(CachedBacking &entry)
 
 bool takeBacking(size_t bytes,unsigned bits,bool contiguous,NativeAdrenoBackingStorage &storage)
 {
+    NativeAdrenoMemoryBucketStats &bucket=memory_diagnostics.buckets[backingSizeBucket(bytes)];
+    bool any=false,sized=false,quarantined_match=false;
     for(auto &entry:backing_cache) {
         const NativeAdrenoBackingStorage &candidate=entry.storage;
-        if(!candidate.descriptor || candidate.quarantined || candidate.bytes!=bytes ||
-            candidate.output_bits!=bits || candidate.contiguous!=contiguous) {
+        if(!candidate.descriptor) {
+            continue;
+        }
+        any=true;
+        if(candidate.bytes!=bytes) {
+            continue;
+        }
+        sized=true;
+        if(candidate.output_bits!=bits || candidate.contiguous!=contiguous) {
+            continue;
+        }
+        if(candidate.quarantined) {
+            quarantined_match=true;
             continue;
         }
         storage=candidate;
+        storage.diagnostic_cache_result=NativeAdrenoMemoryCacheResult::Hit;
         entry={};
         backing_cache_bytes-=bytes;
         --backing_cache_count;
         native_adreno_backing_cache_stats[0]=native_adreno_backing_cache_stats[0]+1;
+        ++bucket.hits;
         noteBackingCacheSize();
         return true;
     }
     native_adreno_backing_cache_stats[1]=native_adreno_backing_cache_stats[1]+1;
+    ++bucket.misses;
+    const BackingMissReason reason=quarantined_match?BackingMissQuarantined:
+        sized?BackingMissAttributes:any?BackingMissSize:BackingMissEmpty;
+    ++bucket.miss_reason[reason];
+    storage.diagnostic_cache_result=NativeAdrenoMemoryCacheResult::Miss;
     return false;
 }
 
@@ -175,6 +332,11 @@ bool cacheBacking(NativeAdrenoBackingStorage &storage)
 {
     if(!storage.descriptor || !storage.prepared || !storage.write_combined || storage.quarantined ||
         !storage.spans || !storage.span_count || !storage.bytes || storage.bytes>BackingCacheObjectBytes) {
+        const BackingRejectReason reason=!storage.descriptor?BackingRejectNotOwned:
+            !storage.prepared?BackingRejectNotPrepared:!storage.write_combined?BackingRejectNotWriteCombined:
+            storage.quarantined?BackingRejectQuarantined:!storage.spans || !storage.span_count?BackingRejectNoSpans:
+            !storage.bytes?BackingRejectZeroSize:BackingRejectOversized;
+        noteBackingReject(reason);
         return false;
     }
     while(backing_cache_count==BackingCacheEntries || backing_cache_bytes>BackingCacheBytes-storage.bytes) {
@@ -186,10 +348,11 @@ bool cacheBacking(NativeAdrenoBackingStorage &storage)
             }
         }
         if(!oldest) {
-            native_adreno_backing_cache_stats[4]=native_adreno_backing_cache_stats[4]+1;
+            noteBackingReject(BackingRejectNoEvictableEntry);
             return false;
         }
-        (void)evictBacking(*oldest);
+        const unsigned reason=backing_cache_count==BackingCacheEntries?0:1;
+        (void)evictBacking(*oldest,reason);
     }
     for(auto &entry:backing_cache) {
         if(entry.storage.descriptor) {
@@ -201,26 +364,45 @@ bool cacheBacking(NativeAdrenoBackingStorage &storage)
         ++backing_cache_count;
         storage={};
         native_adreno_backing_cache_stats[2]=native_adreno_backing_cache_stats[2]+1;
+        ++memory_diagnostics.insertions;
         noteBackingCacheSize();
         return true;
     }
+    noteBackingReject(BackingRejectNoSlot);
     return false;
 }
 }
 
-IOReturn NativeAdrenoMemory::trimBackingCache()
+IOReturn NativeAdrenoMemory::trimBackingCache(NativeAdrenoBackingTrimReason reason)
 {
     IOReturn result=kIOReturnSuccess;
     for(auto &entry:backing_cache) {
         if(!entry.storage.descriptor) {
             continue;
         }
-        const IOReturn status=evictBacking(entry);
+        const IOReturn status=evictBacking(entry,static_cast<unsigned>(reason));
         if(status && !result) {
             result=status;
         }
     }
     return result;
+}
+
+void NativeAdrenoMemory::copyDiagnostics(NativeAdrenoMemoryDiagnostics *out)
+{
+    if(!out) {
+        return;
+    }
+    *out=memory_diagnostics;
+    uint64_t upper=4096;
+    for(unsigned index=0;index+1<NativeAdrenoMemorySizeBucketCount;++index) {
+        out->buckets[index].upper_bound_bytes=upper;
+        upper*=2;
+    }
+    for(unsigned index=0;index<out->slow_count;++index) {
+        const uint64_t retained=out->slow_total-out->slow_count+index;
+        out->slow[index]=memory_diagnostics.slow[retained%NativeAdrenoMemorySlowEventCount];
+    }
 }
 
 static bool outputWidth(unsigned bits)
@@ -323,17 +505,27 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
     if(bytes>budget) {
         return kIOReturnNoResources;
     }
+    const NativeAdrenoMemorySource source=pooled?NativeAdrenoMemorySource::UserOwned:NativeAdrenoMemorySource::KernelOwned;
+    storage_.diagnostic_source=source;
+    storage_.diagnostic_cache_result=NativeAdrenoMemoryCacheResult::NotRequested;
+    storage_.output_bits=bits;
+    storage_.contiguous=contiguous;
+    MemorySlowTime slow(NativeAdrenoMemorySlowOperation::Allocation,storage_,bytes,bits,
+        reuse_write_combined?NativeAdrenoMemoryDiagnosticReuseRequested:0,true,&pooled_);
+
     NativeAdrenoCpuState cpu{};
     IOReturn status=NativeAdrenoQueryCpu4K(&cpu);
     if(status) {
         return status;
     }
+    noteBackingRequest(bytes,reuse_write_combined);
     if(backing_cache_count && backingPressure()) {
         native_adreno_backing_cache_stats[8]=native_adreno_backing_cache_stats[8]+1;
-        (void)trimBackingCache();
+        (void)trimBackingCache(NativeAdrenoBackingTrimReason::MemoryPressure);
     }
 
     if(reuse_write_combined && takeBacking(bytes,bits,contiguous,storage_)) {
+        storage_.diagnostic_source=source;
         uint32_t reset=0;
         {
             MemoryStageTime elapsed(MemoryReassertAttributes,bytes);
@@ -405,7 +597,7 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
     }
     if(!storage_.descriptor && backing_cache_count) {
         native_adreno_backing_cache_stats[9]=native_adreno_backing_cache_stats[9]+1;
-        (void)trimBackingCache();
+        (void)trimBackingCache(NativeAdrenoBackingTrimReason::AllocationRetry);
         MemoryStageTime elapsed(MemoryAllocate,bytes);
         storage_.descriptor=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,bytes,(limit-1)&~UINT64_C(4095));
     }
@@ -418,6 +610,7 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
     }
     if(status) {
         MemoryStageTime elapsed(MemoryDescriptorRelease,bytes);
+        MemorySlowTime slowRelease(NativeAdrenoMemorySlowOperation::OwnedDescriptorRelease,storage_,bytes,bits);
         storage_.descriptor->release();
         storage_.descriptor=nullptr;
         return status;
@@ -501,6 +694,11 @@ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes
         !budget || budget>256u*1024u*1024u)return kIOReturnBadArgument;
     native_adreno_import_stage=12;
     if(bytes>budget)return kIOReturnNoResources;
+    storage_.diagnostic_source=NativeAdrenoMemorySource::Imported;
+    storage_.diagnostic_cache_result=NativeAdrenoMemoryCacheResult::NotRequested;
+    storage_.output_bits=bits;
+    MemorySlowTime slow(NativeAdrenoMemorySlowOperation::Import,storage_,bytes,bits,
+        NativeAdrenoMemoryDiagnosticImported,true);
     NativeAdrenoCpuState cpu{};
     native_adreno_import_stage=13;
     IOReturn status=NativeAdrenoQueryCpu4K(&cpu);if(status!=kIOReturnSuccess)return status;
@@ -599,17 +797,31 @@ IOReturn NativeAdrenoMemory::makeWriteCombined()
 IOReturn NativeAdrenoMemory::release(bool cache_backing)
 {
     native_adreno_trace_stage=30;
+    if(cache_backing) {
+        ++memory_diagnostics.insert_attempts;
+    }
     if(device_references_ || storage_.quarantined) {
+        if(cache_backing) {
+            noteBackingReject(storage_.quarantined?BackingRejectQuarantined:BackingRejectBusy);
+        }
         return kIOReturnBusy;
     }
     const bool pressure=backingPressure();
     if(pressure && backing_cache_count) {
         native_adreno_backing_cache_stats[8]=native_adreno_backing_cache_stats[8]+1;
-        (void)trimBackingCache();
+        (void)trimBackingCache(NativeAdrenoBackingTrimReason::MemoryPressure);
     }
-    if(cache_backing && !pressure && !imported_ && !pooled_ && cacheBacking(storage_)) {
-        read_only_=false;
-        return kIOReturnSuccess;
+    if(cache_backing) {
+        if(pressure) {
+            noteBackingReject(BackingRejectPressure);
+        } else if(imported_) {
+            noteBackingReject(BackingRejectImported);
+        } else if(pooled_) {
+            noteBackingReject(BackingRejectPooled);
+        } else if(cacheBacking(storage_)) {
+            read_only_=false;
+            return kIOReturnSuccess;
+        }
     }
     if(storage_.write_combined && pooled_ && pool.write_combined) {
         storage_.write_combined=false;
@@ -635,6 +847,8 @@ IOReturn NativeAdrenoMemory::release(bool cache_backing)
         }
         {
             MemoryStageTime elapsed(MemoryDescriptorRelease,storage_.bytes);
+            MemorySlowTime slow(NativeAdrenoMemorySlowOperation::ImportedDescriptorRelease,storage_,
+                storage_.bytes,storage_.output_bits);
             imported_->release();
         }
         imported_=nullptr;

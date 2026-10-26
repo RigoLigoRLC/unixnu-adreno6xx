@@ -30,6 +30,7 @@ enum {
     NativeAdrenoMethodBoCpuUnmap = 14,
     NativeAdrenoMethodGetDeviceInfo = 15,
     NativeAdrenoMethodBoImport = 16,
+    NativeAdrenoMethodReportBoProfile = 17,
     NativeAdrenoAbiMetadataBytes = 64,
     NativeAdrenoAbiMaxQueues = 8
 };
@@ -41,7 +42,70 @@ struct NativeAdrenoAbiParams {
     uint64_t max_bo_bytes;
 };
 enum {
-    NativeAdrenoParamsHostImport = 1  /* BoImport pins the caller's own pages (an IOSurface's) as a BO */
+    NativeAdrenoParamsHostImport = 1, /* BoImport pins the caller's own pages (an IOSurface's) as a BO */
+    NativeAdrenoParamsBoProfile = 2
+};
+
+/* NativeAdrenoAbiBoProfile carries software allocation statistics from one
+ * Vulkan device. A background reporter copies counters under the allocator
+ * mutex, releases it, then sends these fixed records to the connection. USB
+ * diagnostics print the saved records on request. The sequence and sample time
+ * identify each snapshot; slow records have their own monotonically increasing
+ * sequence. The driver retains bounded records per connection. */
+enum {
+    NativeAdrenoBoProfileVersion = 1,
+    NativeAdrenoBoProfileCounters = 0,
+    NativeAdrenoBoProfileSize = 1,
+    NativeAdrenoBoProfileUsage = 2,
+    NativeAdrenoBoProfileSlow = 3,
+    NativeAdrenoBoProfileSizeCount = 17,
+    NativeAdrenoBoProfileUsageCount = 16,
+    NativeAdrenoBoProfileSlowCount = 64,
+    NativeAdrenoBoSlowAllocate = 1,
+    NativeAdrenoBoSlowImport = 2,
+    NativeAdrenoBoSlowRelease = 3,
+    NativeAdrenoBoSlowRetire = 4,
+    NativeAdrenoBoCacheHit = 0,
+    NativeAdrenoBoCacheEmpty = 1,
+    NativeAdrenoBoCacheSize = 2,
+    NativeAdrenoBoCacheAlignment = 3,
+    NativeAdrenoBoCacheFlags = 4,
+    NativeAdrenoBoCacheMemoryProperty = 5,
+    NativeAdrenoBoCachePending = 6,
+    NativeAdrenoBoCacheFixedAddress = 7,
+    NativeAdrenoBoCacheExcludedFlags = 8,
+    NativeAdrenoBoCacheOversize = 9,
+    NativeAdrenoBoCacheImport = 10,
+    NativeAdrenoBoCacheFailure = 11,
+    NativeAdrenoBoCacheNotRequested = 12
+};
+struct NativeAdrenoAbiBoCacheCounters {
+    uint64_t requests,requested_bytes,eligible,hits,misses;
+    uint64_t miss_empty,miss_size,miss_alignment,miss_flags,miss_memory_property,miss_pending;
+    uint64_t bypass_fixed,bypass_flags,bypass_oversize,imports,import_bytes;
+    uint64_t puts,evict_objects,evict_bytes,evict_iova,evict_allocation,evict_close;
+    uint64_t cached_objects,cached_bytes,peak_objects,peak_bytes,pending_objects,pending_bytes;
+    uint64_t compatible_pending_requests,pressure_waits,reaped,slow_total,slow_overwritten,report_failures;
+};
+struct NativeAdrenoAbiBoCacheBin {
+    uint64_t upper_bytes;         /* Inclusive size bound; UINT64_MAX is the final bin. */
+    uint64_t requests,requested_bytes,eligible,hits,misses,compatible_pending_requests;
+    char name[32];               /* Allocation purpose, or empty for a size bin. */
+};
+struct NativeAdrenoAbiBoSlowEvent {
+    uint64_t elapsed_us,bytes,alignment,handle,iova,cached_bytes,pending_bytes;
+    uint32_t operation,cache_reason,alloc_flags,memory_property;
+    uint32_t connection_fence,cached_objects,pending_objects,status;
+    char name[32];
+};
+struct NativeAdrenoAbiBoProfile {
+    uint32_t version,kind,index,reserved;
+    uint64_t sequence,sampled_us,device_id;
+    union {
+        NativeAdrenoAbiBoCacheCounters counters;
+        NativeAdrenoAbiBoCacheBin bin;
+        NativeAdrenoAbiBoSlowEvent slow;
+    } data;
 };
 struct NativeAdrenoAbiBoAlloc {
     uint64_t bytes;               /* 4KiB multiple, <= max_bo_bytes */

@@ -29,6 +29,91 @@ IOReturn NativeAdrenoSetPagesCacheMode(const NativeAdrenoPhysicalSpan *,size_t c
  * then rewrites every mapping it tracks and writes the page's cache lines back); *reset counts them. */
 IOReturn NativeAdrenoReassertWriteCombined(const NativeAdrenoPhysicalSpan *,size_t count,uint32_t *reset);
 
+enum : unsigned {
+    NativeAdrenoMemorySizeBucketCount=18,
+    NativeAdrenoMemorySlowEventCount=64,
+    NativeAdrenoBackingMissReasonCount=4,
+    NativeAdrenoBackingEvictReasonCount=5,
+    NativeAdrenoBackingRejectReasonCount=13
+};
+
+enum class NativeAdrenoBackingTrimReason : uint32_t {
+    ClientClose=2,
+    MemoryPressure=3,
+    AllocationRetry=4
+};
+
+enum class NativeAdrenoMemorySource : uint32_t {
+    Unknown,
+    KernelOwned,
+    UserOwned,
+    Imported
+};
+
+enum class NativeAdrenoMemoryCacheResult : uint32_t {
+    NotRequested,
+    Hit,
+    Miss
+};
+
+enum class NativeAdrenoMemorySlowOperation : uint32_t {
+    Allocation,
+    OwnedDescriptorRelease,
+    ImportedDescriptorRelease,
+    Import
+};
+
+enum NativeAdrenoMemoryDiagnosticFlags : uint32_t {
+    NativeAdrenoMemoryDiagnosticContiguous=1u<<0,
+    NativeAdrenoMemoryDiagnosticWriteCombined=1u<<1,
+    NativeAdrenoMemoryDiagnosticImported=1u<<2,
+    NativeAdrenoMemoryDiagnosticPooled=1u<<3,
+    NativeAdrenoMemoryDiagnosticQuarantined=1u<<4,
+    NativeAdrenoMemoryDiagnosticReuseRequested=1u<<5
+};
+
+/* NativeAdrenoMemoryBucketStats counts accepted allocation requests whose CPU
+ * page configuration was available. A lookup has one hit or one miss reason;
+ * bypassed requests did not ask to reuse write-combined backing. */
+struct NativeAdrenoMemoryBucketStats {
+    uint64_t upper_bound_bytes=0; // Zero denotes sizes above the preceding bucket.
+    uint64_t requests=0,bytes=0,lookups=0,hits=0,misses=0,bypassed=0;
+    uint64_t miss_reason[NativeAdrenoBackingMissReasonCount]{}; // Empty, size, attributes, quarantined.
+};
+
+/* NativeAdrenoMemorySlowEvent describes one completed operation of at least
+ * 8000 us. Storage metadata identifies its owner and allocation attributes;
+ * the cache and available-page values are sampled when the operation ends. */
+struct NativeAdrenoMemorySlowEvent {
+    uint64_t sequence=0,sampled_us=0,elapsed_us=0,bytes=0,spans=0;
+    uint64_t cached_bytes=0,available_pages=0;
+    uint32_t cached_objects=0,output_bits=0,flags=0;
+    NativeAdrenoMemorySlowOperation operation=NativeAdrenoMemorySlowOperation::Allocation;
+    NativeAdrenoMemorySource source=NativeAdrenoMemorySource::Unknown;
+    NativeAdrenoMemoryCacheResult cache_result=NativeAdrenoMemoryCacheResult::NotRequested;
+    char process[20]{};
+};
+
+/* NativeAdrenoMemoryDiagnostics is a fixed-size copy of backing-cache counters
+ * and slow operations. The resource gate serializes producers and the copy;
+ * the published service owns the copied value while printing outside its lock. */
+struct NativeAdrenoMemoryDiagnostics {
+    NativeAdrenoMemoryBucketStats buckets[NativeAdrenoMemorySizeBucketCount]{};
+    uint64_t insert_attempts=0,insertions=0;
+    // Not owned, not prepared, not WC, quarantine, no spans, zero size,
+    // oversized, no evictable entry, no slot, imported, pooled, pressure, busy.
+    uint64_t insert_reject[NativeAdrenoBackingRejectReasonCount]{};
+    // Object limit, byte limit, client close, memory pressure, allocation retry.
+    uint64_t eviction_attempts[NativeAdrenoBackingEvictReasonCount]{};
+    uint64_t eviction_failures[NativeAdrenoBackingEvictReasonCount]{};
+    uint64_t evictions[NativeAdrenoBackingEvictReasonCount]{};
+    uint64_t evicted_bytes[NativeAdrenoBackingEvictReasonCount]{};
+    uint64_t cached_objects=0,cached_bytes=0,peak_objects=0,peak_bytes=0;
+    uint64_t slow_total=0;
+    uint32_t slow_count=0;
+    NativeAdrenoMemorySlowEvent slow[NativeAdrenoMemorySlowEventCount]{}; // Oldest first in a copied result.
+};
+
 /* NativeAdrenoBackingStorage owns a prepared allocation and the physical spans
  * discovered from its descriptor. The reusable-storage cache keeps these fields
  * after a user BO is unmapped, then transfers them to the next matching BO.
@@ -41,6 +126,8 @@ struct NativeAdrenoBackingStorage {
     size_t bytes=0,span_count=0,span_capacity=0;
     unsigned output_bits=0;
     bool contiguous=false,prepared=false,quarantined=false,write_combined=false;
+    NativeAdrenoMemorySource diagnostic_source=NativeAdrenoMemorySource::Unknown;
+    NativeAdrenoMemoryCacheResult diagnostic_cache_result=NativeAdrenoMemoryCacheResult::NotRequested;
 };
 
 /* NativeAdrenoMemory owns one BO's backing storage and counts references held
@@ -77,7 +164,10 @@ public:
      * allocate() reasserts the attributes and clears every byte before reuse.
      * Allocation failure and low available memory drain it. Client close also
      * drains it; failed teardown stays owned and quarantined in the cache. */
-    static IOReturn trimBackingCache();
+    static IOReturn trimBackingCache(NativeAdrenoBackingTrimReason reason=NativeAdrenoBackingTrimReason::ClientClose);
+    /* The caller holds the same queue/resource gate as allocate and release.
+     * The result contains the retained slow events in increasing sequence order. */
+    static void copyDiagnostics(NativeAdrenoMemoryDiagnostics *out);
     /* One physically contiguous block taken from the VM early (while memory is not yet fragmented) and cut into BOs afterwards: a BO from it is
      * one span of the GPU's table instead of one per scattered page (int-137: 59474 spans for 332 MiB, the 65536 span capacity ran out,
      * BoMap failed, the translator answered out of device memory and the compositor fell back to the CPU; each map also walked every span, 167 ms).
