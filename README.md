@@ -11,6 +11,10 @@ IOKit transport connect to the A6xx power, GMU, CP and interrupt implementations
 The startup sequence requires actual firmware replies and a GPU memory write
 before publishing the GPU service.
 
+BO ownership, the GPU address tree, incremental page-table updates, reusable
+backing allocations and USB timing counters are described in
+[BO memory management](BO_MEMORY_MANAGEMENT.md).
+
 ## Board interface
 
 The device kit implements `native_adreno_a6xx_resources` from

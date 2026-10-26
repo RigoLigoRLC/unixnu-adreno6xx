@@ -29,22 +29,31 @@ IOReturn NativeAdrenoSetPagesCacheMode(const NativeAdrenoPhysicalSpan *,size_t c
  * then rewrites every mapping it tracks and writes the page's cache lines back); *reset counts them. */
 IOReturn NativeAdrenoReassertWriteCombined(const NativeAdrenoPhysicalSpan *,size_t count,uint32_t *reset);
 
-/* Native XNU backing store, not a Metal device or user ABI. No IOMMU mapper,
- * Linux fd/ioctl, hardware address, guessed PA or implicit destructor cleanup.
- * Driver owns this object until release() succeeds; do not destroy/copy it
- * with outstanding memory. Serialize every call under the queue/resource gate.
- * Every published mapping/job must hold a device reference BEFORE publication,
- * and retire it only after actual DMA quiescence and completed native TLB unmap.
- * References are lifetime accounting, never fences or proof of quiescence. */
+/* NativeAdrenoBackingStorage owns a prepared allocation and the physical spans
+ * discovered from its descriptor. The reusable-storage cache keeps these fields
+ * after a user BO is unmapped, then transfers them to the next matching BO.
+ * Imported pages use the same span metadata while NativeAdrenoMemory owns the
+ * importing descriptor and its task lifetime. */
+struct NativeAdrenoBackingStorage {
+    IOBufferMemoryDescriptor *descriptor=nullptr;
+    void *mapping=nullptr;
+    NativeAdrenoPhysicalSpan *spans=nullptr;
+    size_t bytes=0,span_count=0,span_capacity=0;
+    unsigned output_bits=0;
+    bool contiguous=false,prepared=false,quarantined=false,write_combined=false;
+};
+
+/* NativeAdrenoMemory owns one BO's backing storage and counts references held
+ * by GPU mappings and jobs. Calls run under the queue/resource gate. The VM
+ * retires each reference after DMA completion and native TLB unmap, and the
+ * user client removes every CPU view before offering storage for reuse.
+ * release() keeps failed teardown state owned so the caller can retain it. */
 class NativeAdrenoMemory final {
-    IOBufferMemoryDescriptor *descriptor_=nullptr;
+    NativeAdrenoBackingStorage storage_;
     IOMemoryDescriptor *imported_=nullptr;
     bool read_only_=false;
-    void *mapping_=nullptr;
-    NativeAdrenoPhysicalSpan *spans_=nullptr;
-    size_t bytes_=0,span_count_=0,span_capacity_=0;
     uint32_t device_references_=0;
-    bool prepared_=false,quarantined_=false,write_combined_=false,pooled_=false;
+    bool pooled_=false;
     size_t pool_offset_=0;
     IOReturn maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation);
 public:
@@ -61,7 +70,14 @@ public:
     /* `pooled`: take the bytes from the BO pool when one is reserved and has room. Only user BOs do: the pool is write-combined for
      * the CPU (writeCombinePool), and the kernel's own objects (SMMU tables, ring, fence and firmware pages) are walked or read by the
      * CPU through their cacheable mapping (int-153: page tables from the write-combined pool made each map's table update 2.6x slower). */
-    IOReturn allocate(size_t bytes,unsigned output_bits,bool contiguous,size_t byte_budget,bool pooled=false);
+    IOReturn allocate(size_t bytes,unsigned output_bits,bool contiguous,size_t byte_budget,bool pooled=false,
+        bool reuse_write_combined=false);
+    /* The cache owns at most 64 allocations and 64 MiB. Matching allocations
+     * retain their prepared descriptors, spans and write-combined attributes;
+     * allocate() reasserts the attributes and clears every byte before reuse.
+     * Allocation failure and low available memory drain it. Client close also
+     * drains it; failed teardown stays owned and quarantined in the cache. */
+    static IOReturn trimBackingCache();
     /* One physically contiguous block taken from the VM early (while memory is not yet fragmented) and cut into BOs afterwards: a BO from it is
      * one span of the GPU's table instead of one per scattered page (int-137: 59474 spans for 332 MiB, the 65536 span capacity ran out,
      * BoMap failed, the translator answered out of device memory and the compositor fell back to the CPU; each map also walked every span, 167 ms).
@@ -79,21 +95,25 @@ public:
     /* An import of memory the owner maps read-only (the kernel could pin it for reading only): the GPU may read it, never write it. */
     bool readOnly() const {return read_only_;}
     /* After allocate(), before any device or client mapping: cleans and invalidates the pages and makes every CPU mapping of them
-     * write-combined, so publishForDevice/acquireDeviceWrites have nothing left to do. release() restores the default attribute. */
+     * write-combined. Cached storage already has this attribute. */
     IOReturn makeWriteCombined();
-    bool writeCombined() const {return write_combined_;}
-    /* NativeAdrenoReassertWriteCombined over this object's pages; nothing for an object that is not write-combined, nor for one from the
-     * BO pool: XNU set scattered BOs' pages back to the default attribute (int-160: 123847 pages), never a pool page (int-161: none in
-     * 1280 submissions, while walking the pool's pages took 0.65 ms of each). The submissions' line audit still covers every object. */
+    bool writeCombined() const {return storage_.write_combined;}
+    /* CPU view creation and teardown can change scattered pages' attributes.
+     * This call restores WC on those pages before the device uses them. The
+     * reserved contiguous pool keeps its fixed WC attribute. */
     IOReturn reassertWriteCombined(uint32_t *reset) const
-    {return write_combined_ && span_count_ && !pooled_?NativeAdrenoReassertWriteCombined(spans_,span_count_,reset):kIOReturnSuccess;}
-    bool backed() const {return descriptor_ || imported_ || pooled_;}
-    /* Refuses device references/quarantine; only clears ownership after real
-     * descriptor complete() succeeds. No automatic reset or resource recycling. */
-    IOReturn release();
+    {
+        return storage_.write_combined && storage_.span_count && !pooled_?
+            NativeAdrenoReassertWriteCombined(storage_.spans,storage_.span_count,reset):kIOReturnSuccess;
+    }
+    bool backed() const {return storage_.descriptor || imported_ || pooled_;}
+    /* cache_backing requires the caller to have removed every CPU mapping.
+     * A prepared, write-combined owned allocation can then enter the cache if
+     * device references are zero. Imports and quarantined storage cannot enter. */
+    IOReturn release(bool cache_backing=false);
     IOReturn holdForDevice();
     IOReturn retireAfterQuiescence();
-    void quarantine() {quarantined_=true;}
+    void quarantine() {storage_.quarantined=true;}
     /* Requires real CPU/device exclusion and retained ownership. Before GPU
      * writes, clean+invalidate; after genuine completion, invalidate only.
      * CPU must not dirty these pages while the device owns access. */
@@ -101,14 +121,14 @@ public:
      * for a client whose view turned out to be cacheable after all (NativeAdrenoVm::distrustWriteCombined). */
     IOReturn publishForDevice(size_t offset,size_t bytes,bool device_writes,bool include_write_combined=false);
     IOReturn acquireDeviceWrites(size_t offset,size_t bytes);
-    bool quarantined() const {return quarantined_;}
+    bool quarantined() const {return storage_.quarantined;}
     uint32_t deviceReferences() const {return device_references_;}
-    size_t bytes() const {return bytes_;}
-    size_t spanCount() const {return span_count_;}
-    const NativeAdrenoPhysicalSpan *spans() const {return spans_;}
-    void *mapping() const {return mapping_;}
+    size_t bytes() const {return storage_.bytes;}
+    size_t spanCount() const {return storage_.span_count;}
+    const NativeAdrenoPhysicalSpan *spans() const {return storage_.spans;}
+    void *mapping() const {return storage_.mapping;}
     /* Borrowed descriptor, never release independently or expose table pools
      * through clientMemoryForType. Sharing requires a separate owner/task ABI. */
-    IOBufferMemoryDescriptor *descriptor() const {return descriptor_;}
+    IOBufferMemoryDescriptor *descriptor() const {return storage_.descriptor;}
 };
 #endif

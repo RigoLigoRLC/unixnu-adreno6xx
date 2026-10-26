@@ -6,19 +6,23 @@
 #include "NativeAdrenoTimer.h"
 #include "NativeAdrenoStatus.h"
 
-/* Kernel-side body of the Adreno user client, deliberately free of IOKit so it
- * can be exercised on a host. The future IOService/IOUserClient wrapper only
- * copies one fixed ABI record in and out and calls these methods; it must not
- * add policy. Handles are this object's own identities, never VM, IOVA or
- * pointer values. A mapping is retirable only through freeBo, which unmaps
- * first and then releases the backing object; both steps must succeed.
- * Up to NativeAdrenoClientMaxObjects live objects and the execbuf's own eight-job limit apply. */
+/* NativeAdrenoUserClient owns a bounded table of BOs and the queues associated
+ * with one connection. A handle stores a slot and its generation so a freed
+ * handle cannot identify the next BO allocated in that slot. Allocation takes
+ * an entry from a free list; lookup and live-object accounting are constant time.
+ *
+ * The IOKit wrapper removes CPU views before surrendering their final lease.
+ * freeBo retires completed submissions, removes the VM mapping and releases
+ * the backing storage in that order. Storage may enter the shared cache only
+ * after these steps and all device references have retired. */
 enum : size_t {NativeAdrenoClientMaxObjects=4096};
 class NativeAdrenoUserClient final {
     struct Queue {uint32_t id=0;bool active=false;};
     struct Entry {
         NativeAdrenoMemory memory;
         uint64_t handle=0;
+        uint64_t generation=0;
+        uint32_t next_free=NativeAdrenoClientMaxObjects;
         uint64_t mapped=0;
         uint64_t iova=0;
         bool used=false;
@@ -30,9 +34,11 @@ class NativeAdrenoUserClient final {
         uint32_t mapping_leases=0;
         char metadata[NativeAdrenoAbiMetadataBytes]{};
     };
-    /* Allocated at open(), all-zero is the free state. */
+    /* open() allocates the entries and links them in ascending slot order. */
     Entry *entries_=nullptr;
     size_t entry_count_=0;
+    size_t live_count_=0;
+    uint32_t free_head_=NativeAdrenoClientMaxObjects;
     Queue queues_[NativeAdrenoAbiMaxQueues]{};
     NativeAdrenoVm *vm_=nullptr;
     NativeAdrenoSubmit *submit_=nullptr;
@@ -49,11 +55,11 @@ class NativeAdrenoUserClient final {
      * test someone else's jobs. */
     bool scoped_=false,used_=false;
     uint64_t window_start_=0,window_bytes_=0,window_peak_=0;
-    uint64_t next_handle_=1;
     bool open_=false;
     Entry *find(uint64_t);
-    Entry *free();
-    static void clear(Entry &);
+    const Entry *find(uint64_t) const;
+    Entry *takeEntry();
+    void returnEntry(Entry &);
 public:
     NativeAdrenoUserClient()=default;
     ~NativeAdrenoUserClient()=default;
@@ -72,13 +78,17 @@ public:
     bool ownRangeOutstanding() const;
     /* Refuses while any object is live or any of this client's jobs is unobserved. */
     IOReturn close();
-    /* Connection teardown: waits for every outstanding job, then unmaps and frees every object, closes every queue and
-     * closes the client. The first failure stops it and leaves what remains live; nothing is forced. */
+    /* Connection teardown requires the IOKit wrapper to remove every CPU view
+     * first. It waits for outstanding jobs, removes each GPU mapping, releases
+     * its storage, closes the queues and drains the backing cache. A failure
+     * retains every object whose teardown has not completed. */
     IOReturn releaseAll(const NativeAdrenoRingClock *,uint32_t timeout_us);
     /* Backing object of a token returned by cpuMap while its lease is held (clientMemoryForType); null otherwise. */
     NativeAdrenoMemory *memoryForToken(uint32_t token);
     /* CPU mappings of the BO of this token that BoCpuMap handed out and BoCpuUnmap has not given back; 0 for no such BO. */
     uint32_t mappingLeases(uint32_t token) const;
+    /* The IOKit wrapper checks this before removing views named by a token. */
+    bool hasMappingLease(uint64_t handle,uint32_t token) const;
     IOReturn query(NativeAdrenoAbiParams *);
     IOReturn allocBo(const NativeAdrenoAbiBoAlloc *,NativeAdrenoAbiBoAllocReply *);
     IOReturn allocBoInner(const NativeAdrenoAbiBoAlloc *,NativeAdrenoAbiBoAllocReply *);

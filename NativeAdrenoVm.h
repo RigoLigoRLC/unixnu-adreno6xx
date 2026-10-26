@@ -3,6 +3,7 @@
 #define NATIVE_ADRENO_VM_H
 #include "NativeAdrenoSmmuMemory.h"
 #include "ArmSmmu4KStreams.h"
+#include <libkern/tree.h>
 struct NativeAdrenoVmRegion {
     NativeAdrenoMemory *tables;
     ArmSmmu4KLiveArena *arena;
@@ -13,21 +14,18 @@ struct NativeAdrenoVmResult {
     size_t completed_spans;
     bool complete;
 };
-/* Kernel-owned BO mapping transactions, not a userspace ABI or GPU scheduler.
- * Attach only under the actual bank/ASID/stream and powered-MMIO lease, with
- * fault IRQ handling installed and empty native4K arenas already active.
- * The real table allocations, context/streams and BO objects remain retained
- * by the owning driver. No implicit destructor cleanup; detach must succeed.
- * Serialize all methods, table updates and submission under the DRIVER gate.
- * ALL masters must stay genuinely quiesced through each map/unmap transaction.
- * Job counts are lifetime accounting; neither they nor these APIs are fences.
- * Each active region is audited, including the unmodified peer. Partial failure
- * keeps every old/new BO reference, poisons both arenas and attempts to FAULT
- * only the owned streams. Uncertain resources require independent real reset.
- * No VM may be advertised to apps until per-client isolation, submission
- * validation/protection, genuine IRQ fences and reset are implemented. */
-/* One table for every client's mappings: 1024 filled up once the render server primed its shaders (int-237: BoMap refused with
- * kIOReturnNoResources at objects=1024, Turnip wrote through a NULL command stream and backboardd crashed). */
+/* NativeAdrenoVm owns the CPU records for BOs mapped into the GPU context.
+ * Each record retains its backing memory, physical ranges and a physical-address
+ * index. A red-black tree locates neighboring GPU address ranges;
+ * generation handles locate records directly. Mapping validates the BO against
+ * its neighbors, conflicting physical attributes and both page-table pools,
+ * then asks ArmSmmu4K to change only that BO's leaves. Unmapping completes the
+ * context's TLB synchronization before releasing the memory reference.
+ *
+ * The service serializes these operations and owns the powered context, streams
+ * and page-table allocations. NativeAdrenoSubmit retains job references until
+ * the GPU fence completes. A failed page-table transaction keeps the records
+ * and memory, faults the owned streams and requires service recovery. */
 enum : size_t {NativeAdrenoVmMaxObjects=4096};
 /* Board hook for sampleWord(): reads one aligned word of physical memory through a fresh uncached mapping; 0 on success. */
 extern "C" int (*native_adreno_dram_read32)(uint64_t physical,uint32_t *value);
@@ -40,33 +38,47 @@ extern "C" int (*native_adreno_line_audit)(uint64_t physical,size_t bytes,uint32
 class NativeAdrenoVm final {
     struct Mapping {
         NativeAdrenoMemory *memory=nullptr;
+        ArmSmmu4KRange *ranges=nullptr;
+        uint32_t *physical_order=nullptr;
+        size_t physical_count=0;
         uint64_t handle=0,iova=0;
         size_t spans=0,mapped_spans=0;
         unsigned permissions=0,writeback=0,shareability=0,jobs=0;
+        size_t next_free=0;
+        RB_ENTRY(Mapping) address_link;
+        Mapping *previous=nullptr,*next=nullptr;
     };
+    struct AddressTree {
+        RB_HEAD(Root,Mapping) root{};
+        static int compare(Mapping *left,Mapping *right) {
+            if(left->iova<right->iova) {
+                return -1;
+            }
+            return left->iova>right->iova?1:0;
+        }
+        RB_GENERATE(Root,Mapping,address_link,compare)
+    } addresses_;
     Mapping *mappings_=nullptr;
+    Mapping *first_=nullptr,*last_=nullptr;
     NativeAdrenoVmRegion regions_[2]{};
     ArmSmmu4KLiveVisibility visibility_[2]{};
     ArmSmmu4KIo io_{};
     ArmSmmu4KContextConfig *context_=nullptr;
     ArmSmmu4KStreamState *streams_=nullptr;
-    ArmSmmu4KRange *ranges_=nullptr;
-    size_t capacity_=0,lower_count_=0,upper_count_=0,objects_=0;
+    size_t lower_count_=0,upper_count_=0,objects_=0,free_head_=0,mapping_capacity_=0;
+    size_t class_objects_[16]{};
     unsigned budget_=0;
     uint64_t next_handle_=1;
     bool attached_=false,poisoned_=false,distrust_write_combined_=false;
     NativeAdrenoVmResult result_{};
     ArmSmmu4KLiveRegion region(unsigned) const;
     ArmSmmu4KStatus observe() const;
-    /* The route check alone: the table walk is the update's own (it verifies every region before the first store and after the last), so
-     * map/unmap pay a full extra audit only every 64th operation (int-139: 4 full walks of the 2 GiB aperture made every map 70 ms). */
-    ArmSmmu4KStatus observeStreamsOnly() const;
-    ArmSmmu4KStatus observeCheap();
-    unsigned since_audit_=0;
     IOReturn fail(ArmSmmu4KStatus);
-    Mapping *find(uint64_t);
-    void insert(size_t,unsigned);
-    void erase(size_t,size_t,unsigned);
+    Mapping *find(uint64_t) const;
+    const Mapping *findAddressRecord(uint64_t) const;
+    Mapping *lowerBound(uint64_t) const;
+    void insert(Mapping *,unsigned);
+    void erase(Mapping *,unsigned);
     IOReturn preflight(const NativeAdrenoMemory *,unsigned,uint64_t,unsigned,unsigned,unsigned) const;
 public:
     NativeAdrenoVm()=default;
@@ -75,7 +87,7 @@ public:
     NativeAdrenoVm &operator=(const NativeAdrenoVm &)=delete;
     IOReturn attach(const ArmSmmu4KIo *,ArmSmmu4KContextConfig *,ArmSmmu4KStreamState *,
         const NativeAdrenoVmRegion *lower,const NativeAdrenoVmRegion *upper,
-        size_t max_spans,unsigned poll_budget);
+        size_t max_objects,unsigned poll_budget);
     /* Frees CPU metadata only, with no BOs remaining. Never releases roots,
      * disables a bank or returns the platform lease; board lifecycle owns it. */
     IOReturn detach();

@@ -72,9 +72,9 @@ static uint32_t profileLock;
  * show the BO work between two submissions without sampling the clock. */
 static uint32_t profileLastCalls[6];
 static uint32_t profileLastUs[6];
-static uint32_t profileMapCalls[4];
-static uint64_t profileMapUs[4];
-static uint64_t profileMapMax[4];
+static uint32_t profileMapCalls[5];
+static uint64_t profileMapUs[5];
+static uint64_t profileMapMax[5];
 static uint32_t profileLockCalls[20];
 static uint64_t profileLockUs[20];
 static uint64_t profileLockMax[20];
@@ -108,7 +108,7 @@ extern "C" void native_adreno_profile_set_client(const char *name)
 }
 extern "C" void native_adreno_profile_map(uint32_t pages, uint64_t us)
 {
-    const unsigned bucket = pages < 16 ? 0 : pages < 256 ? 1 : pages < 4096 ? 2 : 3;
+    const unsigned bucket = pages == 1 ? 4 : pages < 16 ? 0 : pages < 256 ? 1 : pages < 4096 ? 2 : 3;
     profileEnter();
     profileMapCalls[bucket] = profileMapCalls[bucket] + 1;
     profileMapUs[bucket] += us;
@@ -211,9 +211,9 @@ extern "C" void native_adreno_profile_dump(void)
     static uint32_t submitted, completed;
     static uint64_t latencyTotal, latencyMax;
     static uint64_t buckets[ProfileBuckets];
-    static uint32_t mapCalls[4];
-    static uint64_t mapUs[4];
-    static uint64_t mapMax[4];
+    static uint32_t mapCalls[5];
+    static uint64_t mapUs[5];
+    static uint64_t mapMax[5];
     static uint32_t lockCalls[20];
     static uint64_t lockUs[20];
     static uint64_t lockMax[20];
@@ -228,7 +228,7 @@ extern "C" void native_adreno_profile_dump(void)
     for (unsigned at = 0; at < ProfileBuckets; ++at) {
         buckets[at] = profileLatencyBuckets[at];
     }
-    for (unsigned at = 0; at < 4; ++at) {
+    for (unsigned at = 0; at < 5; ++at) {
         mapCalls[at] = profileMapCalls[at];
         mapUs[at] = profileMapUs[at];
         mapMax[at] = profileMapMax[at];
@@ -249,7 +249,8 @@ extern "C" void native_adreno_profile_dump(void)
         lockCalls[3], (unsigned long long)lockUs[3], (unsigned long long)lockMax[3],
         lockCalls[4], (unsigned long long)lockUs[4], (unsigned long long)lockMax[4],
         lockCalls[5], (unsigned long long)lockUs[5], (unsigned long long)lockMax[5]);
-    IOLog("NativeAdrenoProfile: map_pages small=%u/%llu/%llu medium=%u/%llu/%llu large=%u/%llu/%llu huge=%u/%llu/%llu\n",
+    IOLog("NativeAdrenoProfile: map_pages one=%u/%llu/%llu small=%u/%llu/%llu medium=%u/%llu/%llu large=%u/%llu/%llu huge=%u/%llu/%llu\n",
+        mapCalls[4], (unsigned long long)mapUs[4], (unsigned long long)mapMax[4],
         mapCalls[0], (unsigned long long)mapUs[0], (unsigned long long)mapMax[0],
         mapCalls[1], (unsigned long long)mapUs[1], (unsigned long long)mapMax[1],
         mapCalls[2], (unsigned long long)mapUs[2], (unsigned long long)mapMax[2],

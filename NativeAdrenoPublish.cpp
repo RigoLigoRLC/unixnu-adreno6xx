@@ -621,10 +621,15 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
          * second requests in int-177) lost both mappings at the first unmap, and the other holder's next store hit an unmapped page: the
          * render server's crash in the command stream writes of vkCmdCopyBuffer. Only the last lease takes the view down; the earlier
          * ones leave their mapping until it, or the client unmaps it itself (IOConnectUnmapMemory64 works on the cached view). */
-        const uint32_t token=static_cast<const NativeAdrenoAbiBoCpuUnmap *>(input)->token;
+        const auto *request=static_cast<const NativeAdrenoAbiBoCpuUnmap *>(input);
+        const uint32_t token=request->token;
         IOLockLock(g.lock);
+        const bool current=live_ && core_->hasMappingLease(request->handle,token);
         const uint32_t leases=live_?core_->mappingLeases(token):0;
         IOLockUnlock(g.lock);
+        if(!current) {
+            return kIOReturnBadArgument;
+        }
         if(leases>1)native_adreno_view_kept=native_adreno_view_kept+1;
         else {
             const IOReturn status=dropViews(token);
@@ -943,6 +948,9 @@ extern volatile uint32_t native_adreno_client_stats[5][6];
 extern volatile uint32_t native_adreno_pool_stats[8];
 extern volatile uint32_t native_adreno_import_stage;
 extern volatile uint64_t native_adreno_import_fail_pa,native_adreno_import_fail_offset;
+extern volatile uint64_t native_adreno_vm_phase_us[2][8];
+extern volatile uint64_t native_adreno_memory_stage_stats[10][4];
+extern volatile uint64_t native_adreno_backing_cache_stats[12];
 }
 
 /* The USB worker requests one sample of discovery, client and submission
@@ -1034,6 +1042,21 @@ extern "C" void native_adreno_metal_dump_stats(void)
     }
 
     if(g.published && g.lock && IOLockTryLock(g.lock)) {
+        uint64_t vmPhases[2][8],tablePhases[2][8],memoryStages[10][4],backingCache[12];
+        for(unsigned row=0;row<2;++row) {
+            for(unsigned slot=0;slot<8;++slot) {
+                vmPhases[row][slot]=native_adreno_vm_phase_us[row][slot];
+                tablePhases[row][slot]=arm_smmu_4k_live_phase_us[row][slot];
+            }
+        }
+        for(unsigned row=0;row<10;++row) {
+            for(unsigned slot=0;slot<4;++slot) {
+                memoryStages[row][slot]=native_adreno_memory_stage_stats[row][slot];
+            }
+        }
+        for(unsigned slot=0;slot<12;++slot) {
+            backingCache[slot]=native_adreno_backing_cache_stats[slot];
+        }
         const NativeAdrenoSubmitStats submit=g.submit->stats();
         const size_t objects=g.vm->objectCount(),spans=g.vm->spanCount(),jobs=g.submit->outstanding();
         const uint32_t submitted=g.ring->lastSubmitted(),completed=g.ring->completedFence();
@@ -1042,6 +1065,25 @@ extern "C" void native_adreno_metal_dump_stats(void)
         const bool failed=g.failed,vmPoisoned=g.vm->poisoned(),submitPoisoned=g.submit->poisoned(),ringPoisoned=g.ring->poisoned();
         IOLockUnlock(g.lock);
 
+        for(unsigned row=0;row<2;++row) {
+            const uint64_t *phase=vmPhases[row];
+            IOLog("NativeAdrenoMetal: vm_%s calls=%llu metadata_us=%llu cache_us=%llu tables_us=%llu index_us=%llu %s_us=%llu max_us=%llu bytes=%llu\n",
+                row?"unmap":"map",phase[0],phase[1],phase[2],phase[3],phase[4],
+                row?"release":"preflight",phase[5],phase[6],phase[7]);
+            phase=tablePhases[row];
+            IOLog("NativeAdrenoMetal: pte_%s calls=%llu validation_us=%llu old_leaf_us=%llu publish_us=%llu tlb_us=%llu new_leaf_us=%llu max_us=%llu pages=%llu\n",
+                row?"unmap":"map",phase[0],phase[1],phase[2],phase[3],phase[4],phase[5],phase[6],phase[7]);
+        }
+        static const char *memoryNames[]={"allocation","prepare","spans","zero","initial_clean",
+            "set_wc","reassert_wc","restore_attributes","complete","descriptor_release"};
+        for(unsigned row=0;row<10;++row) {
+            const uint64_t *phase=memoryStages[row];
+            IOLog("NativeAdrenoMetal: memory_stage=%s calls=%llu total_us=%llu max_us=%llu bytes=%llu\n",
+                memoryNames[row],phase[0],phase[1],phase[2],phase[3]);
+        }
+        IOLog("NativeAdrenoMetal: backing_cache hits=%llu misses=%llu puts=%llu evictions=%llu rejected=%llu objects=%llu bytes=%llu peak_bytes=%llu pressure=%llu allocation_retry=%llu reset_pages=%llu quarantined=%llu\n",
+            backingCache[0],backingCache[1],backingCache[2],backingCache[3],backingCache[4],backingCache[5],
+            backingCache[6],backingCache[7],backingCache[8],backingCache[9],backingCache[10],backingCache[11]);
         IOLog("NativeAdrenoMetal: opened=%u closed=%u failed=%u faults=%llu suspends=%llu objects=%zu spans=%zu jobs=%zu poisoned_vm=%u poisoned_submit=%u poisoned_ring=%u\n",
             opened,closed,unsigned(failed),faults,suspends,objects,spans,jobs,
             unsigned(vmPoisoned),unsigned(submitPoisoned),unsigned(ringPoisoned));
