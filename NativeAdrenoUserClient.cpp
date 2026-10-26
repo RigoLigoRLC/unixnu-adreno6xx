@@ -20,6 +20,7 @@ static void noteImportState(uint64_t handle,uint64_t state)
 extern "C" volatile uint32_t native_adreno_io_coherent;
 /* Per kernel method: [method][0] calls, [1] calls that returned non-zero, [2] last status, [3] total time (us, 32-bit). Method numbers are the ABI's (1..16). */
 extern "C" {extern uint64_t (*native_adreno_vm_now_us)(void);volatile uint32_t native_adreno_method_stats[20][4];volatile uint32_t native_adreno_map_fail[7][2];}
+extern "C" void native_adreno_profile_map(uint32_t pages,uint64_t us);
 static void noteImport(IOReturn status,uint32_t stage,uint64_t bytes,uint64_t address)
 {
     if(!status)return;
@@ -263,8 +264,14 @@ IOReturn NativeAdrenoUserClient::mapBo(const NativeAdrenoAbiBoMap *request,
     /* Only memory the GPU never writes is mapped coherent: sysmem passes written through write-back inner-shareable mappings stopped
      * the GPU inside its end-of-pass cache clean (BR and BV idle at the clean events), while non-coherent mappings never did. */
     const bool coherent=entry->memory.imported() && native_adreno_io_coherent && !(permissions&2u);
+    const uint64_t mapBegan=native_adreno_vm_now_us?native_adreno_vm_now_us():0;
     const IOReturn status=vm_->map(&entry->memory,0,request->iova,permissions,
         coherent?1u:request->writeback,coherent?3u:request->shareability,&handle);
+    if(mapBegan && native_adreno_vm_now_us) {
+        const uint64_t mapEnded=native_adreno_vm_now_us();
+        const uint64_t pages=(entry->memory.bytes()+4095)/4096;
+        native_adreno_profile_map(uint32_t(pages>0xffffffffu?0xffffffffu:pages),mapEnded>mapBegan?mapEnded-mapBegan:0);
+    }
     if(status)return status;
     entry->mapped=handle;entry->iova=request->iova;entry->mapped_state=true;
     if(end>window_peak_)window_peak_=end;

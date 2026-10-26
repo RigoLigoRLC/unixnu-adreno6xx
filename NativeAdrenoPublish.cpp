@@ -55,6 +55,9 @@ struct NativeAdrenoMetalDiag {
 } native_adreno_metal_diag;
 /* BO CPU views (clientMemoryForType for a BO token): [0] calls, [1] new descriptors, [2] served from the view cache, [3] refused (not a BO / out of
  * resources), [4] last refusal's IOReturn, [5] threads inside now. int-115 showed a backboardd thread in IOConnectMapMemory64 ~650 times a second. */
+extern "C" void native_adreno_profile_lock_wait(uint32_t method,uint64_t us);
+extern "C" void native_adreno_profile_set_client(const char *name);
+extern "C" void native_adreno_profile_dump(void);
 extern "C" {volatile uint32_t native_adreno_view_diag[6],native_adreno_view_kept;}   /* kept: BoCpuUnmap calls that left the view for another lease */
 }
 
@@ -571,7 +574,14 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         native_adreno_wait_outer[0]=native_adreno_wait_outer[0]+1;native_adreno_wait_outer[1]=native_adreno_wait_outer[1]+waited;
         if(waited>native_adreno_wait_outer[3])native_adreno_wait_outer[3]=waited;
     } else {
+        const uint64_t lockBegan=g.clock.now_us?g.clock.now_us(g.clock.cookie):0;
         IOLockLock(g.lock);
+        if(lockBegan && g.clock.now_us) {
+            native_adreno_profile_lock_wait(method,g.clock.now_us(g.clock.cookie)-lockBegan);
+        }
+        if(method==NativeAdrenoMethodSubmit) {
+            native_adreno_profile_set_client(connection->name_);
+        }
         status=connection->live_ && !connection->closing_ && !connection->viewTeardownStatus_ && (!g.failed || method==NativeAdrenoMethodGetStatus)?
             connection->core_->dispatch(method,input,input_size,output,output_size,&g.clock):kIOReturnNotReady;
         if(method==NativeAdrenoMethodBoMap && !status && connection->live_ && !connection->kernel_)
@@ -1041,6 +1051,7 @@ extern "C" void native_adreno_metal_dump_stats(void)
     } else {
         IOLog("NativeAdrenoMetal: submission_sample=%s\n",g.published?"lock_busy":"not_published");
     }
+    native_adreno_profile_dump();
     IOLog("NativeAdrenoMetal: end\n");
 }
 
