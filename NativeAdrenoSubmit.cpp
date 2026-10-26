@@ -21,7 +21,7 @@ extern "C" {volatile uint32_t native_adreno_wc_audit[6];}
 extern "C" {volatile uint32_t native_adreno_fence_wait[8];}
 /* The IBs of the last submissions: [slot] fence, iova low/high, bytes, then the first 28 dwords of the first IB (read as the kernel maps it). */
 extern "C" {volatile uint32_t native_adreno_ib_log[4][4+28];volatile uint32_t native_adreno_ib_log_count;}
-extern "C" {extern uint64_t (*native_adreno_vm_now_us)(void);volatile uint32_t native_adreno_method_stats[20][4];}
+extern "C" {extern uint64_t (*native_adreno_vm_now_us)(void);extern volatile uint32_t native_adreno_method_stats[20][4];}
 
 /* Bounded render-path profile for the GPU performance investigation.
  *
