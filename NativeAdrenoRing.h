@@ -5,7 +5,6 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "NativeAdrenoGeneration.h"
-#include "NativeAdrenoSubmissionProfile.h"
 
 /* NativeAdrenoRing owns a command processor ring and its timestamp fence.
  * Register indices are dword offsets; the platform adds the MMIO base and
@@ -52,7 +51,6 @@ enum NativeAdrenoRingFence {
 class NativeAdrenoRing final {
     NativeAdrenoRingIo io_{};
     NativeAdrenoRingCache cache_{};
-    NativeAdrenoSubmissionProfile profile_;
     volatile uint32_t *ring_=nullptr,*fence_=nullptr;
     size_t ring_bytes_=0,fence_bytes_=0;
     uint64_t ring_iova_=0,fence_iova_=0;
@@ -63,14 +61,12 @@ class NativeAdrenoRing final {
     IOReturn poison();
     IOReturn readRptr(uint32_t *);
     IOReturn reserveA6xx(uint32_t words,uint32_t *at);
-    IOReturn commit(uint32_t end,uint32_t serial,bool profiled=false);
+    IOReturn commit(uint32_t end,uint32_t serial);
     void logBootstrap(uint32_t target,uint32_t rptr,uint32_t busy,const char *result);
     IOReturn emitPrologue(uint32_t at,bool reset,uint32_t *end);
     IOReturn emitFence(uint32_t at,uint32_t seqno,uint32_t *end);
     IOReturn emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *end);
-    IOReturn emitProfile(uint32_t at,uint32_t fence,bool end,uint32_t *next);
-    IOReturn submitWords(const uint32_t *words,size_t word_count,uint32_t *fence,bool framed,
-        const NativeAdrenoProfileCpuTiming *timing=nullptr);
+    IOReturn submitWords(const uint32_t *words,size_t word_count,uint32_t *fence,bool framed);
 public:
     NativeAdrenoRing()=default;
     ~NativeAdrenoRing()=default;
@@ -98,20 +94,7 @@ public:
         uint32_t timeout_us,uint32_t *observed);
     /* A642L user buffers receive A6xx IB-list markers and CACHE_FLUSH_TS.
      * A740 user buffers receive its BR/BV thread synchronization packets. */
-    IOReturn submitFramed(const uint32_t *words,size_t word_count,uint32_t *fence,
-        const NativeAdrenoProfileCpuTiming *timing=nullptr);
-    /* Optional A642L sampling is configured after attach, before SQE starts.
-     * Completed slots are consumed by Submit under the same submission lock. */
-    IOReturn enableProfiling(NativeAdrenoVm *);
-    bool profilingEnabled() const { return profile_.enabled(); }
-    void setProfileCpuTiming(uint32_t fence,const NativeAdrenoProfileCpuTiming &timing)
-    {
-        profile_.setCpuTiming(fence,timing);
-    }
-    void collectProfile(uint32_t fence)
-    {
-        profile_.collect(fence);
-    }
+    IOReturn submitFramed(const uint32_t *words,size_t word_count,uint32_t *fence);
     /* The next user submission waits for idle on A642L or clears the A740
      * thread counters, timestamps and resource table between thread syncs. */
     void requestContextReset() {reset_pending_=true;}

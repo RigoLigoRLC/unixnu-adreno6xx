@@ -55,7 +55,7 @@ struct NativeAdrenoA6xxReport {
 };
 
 /* NativeAdrenoA6xxTables contains the A660 HFI wire payloads. GPU entry zero
- * requests off; entry one requests 315 MHz. GMU entry one
+ * requests the off level; entry one requests 315 MHz at LOW_SVS. GMU entry one
  * requests 200 MHz at MIN_SVS. Power builds the ARC indexes and BCM commands
  * from the running SM7325 command database before changing a power register. */
 struct NativeAdrenoA6xxTables {
@@ -73,7 +73,7 @@ struct NativeAdrenoA6xxTables {
 /* NativeAdrenoA6xxPower owns the host votes that keep the GMU and SMMU alive.
  * enableCx reads command-db, disables ACD through AOP QMP, raises the parent
  * rails through an unused APPS DRV2 active TCS, and enables the Yupik clocks
- * and CX domain. The GMU subsequently controls the GPU clock and bandwidth through
+ * and CX domain. The GMU subsequently controls the 315 MHz GPU clock through
  * HFI. enableGx observes the GX power, GMU fence and GX clock state after the
  * GMU wake request. stop requires the caller to have stopped GPU and GMU DMA
  * first; host votes and mappings remain owned throughout this one-shot run. */

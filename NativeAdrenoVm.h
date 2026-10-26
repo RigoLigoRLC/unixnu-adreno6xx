@@ -3,7 +3,6 @@
 #define NATIVE_ADRENO_VM_H
 #include "NativeAdrenoSmmuMemory.h"
 #include "ArmSmmu4KStreams.h"
-#include "NativeAdrenoHandleIndex.h"
 struct NativeAdrenoVmRegion {
     NativeAdrenoMemory *tables;
     ArmSmmu4KLiveArena *arena;
@@ -14,11 +13,7 @@ struct NativeAdrenoVmResult {
     size_t completed_spans;
     bool complete;
 };
-struct NativeAdrenoVmCapacity {
-    size_t allocated=0,limit=0,peak=0,last_required=0;
-    uint32_t growths=0,failures=0;
-};
-/* NativeAdrenoVm owns BO mapping transactions for the configured SMMU context.
+/* Kernel-owned BO mapping transactions, not a userspace ABI or GPU scheduler.
  * Attach only under the actual bank/ASID/stream and powered-MMIO lease, with
  * fault IRQ handling installed and empty native4K arenas already active.
  * The real table allocations, context/streams and BO objects remain retained
@@ -26,14 +21,14 @@ struct NativeAdrenoVmCapacity {
  * Serialize all methods, table updates and submission under the DRIVER gate.
  * ALL masters must stay genuinely quiesced through each map/unmap transaction.
  * Job counts are lifetime accounting; neither they nor these APIs are fences.
- * The first update audits both regions; subsequent updates validate the modified
- * descriptors and counts. Partial failure
+ * Each active region is audited, including the unmodified peer. Partial failure
  * keeps every old/new BO reference, poisons both arenas and attempts to FAULT
  * only the owned streams. Uncertain resources require independent real reset.
  * No VM may be advertised to apps until per-client isolation, submission
  * validation/protection, genuine IRQ fences and reset are implemented. */
-/* The shared VM table bounds the total live mappings across all clients. */
-enum : size_t {NativeAdrenoVmMaxObjects=16384};
+/* One table for every client's mappings: 1024 filled up once the render server primed its shaders (int-237: BoMap refused with
+ * kIOReturnNoResources at objects=1024, Turnip wrote through a NULL command stream and backboardd crashed). */
+enum : size_t {NativeAdrenoVmMaxObjects=4096};
 /* Board hook for sampleWord(): reads one aligned word of physical memory through a fresh uncached mapping; 0 on success. */
 extern "C" int (*native_adreno_dram_read32)(uint64_t physical,uint32_t *value);
 /* The board's reader through the kernel's cacheable physical aperture (null on the host: the BO's own mapping is read). */
@@ -50,10 +45,6 @@ class NativeAdrenoVm final {
         unsigned permissions=0,writeback=0,shareability=0,jobs=0;
     };
     Mapping *mappings_=nullptr;
-    NativeAdrenoHandleIndex<NativeAdrenoVmMaxObjects> index_;   /* live handle -> its mappings_ slot */
-    size_t free_hint_=0;   /* no free mappings_ slot below it */
-    size_t high_=0;   /* no live mappings_ slot at or above it: the walks over every mapping stop there */
-    size_t class_spans_[16]{};   /* ranges_ per alias class, so a map counts the other classes without a walk */
     NativeAdrenoVmRegion regions_[2]{};
     ArmSmmu4KLiveVisibility visibility_[2]{};
     ArmSmmu4KIo io_{};
@@ -61,27 +52,22 @@ class NativeAdrenoVm final {
     ArmSmmu4KStreamState *streams_=nullptr;
     ArmSmmu4KRange *ranges_=nullptr;
     size_t capacity_=0,lower_count_=0,upper_count_=0,objects_=0;
-    NativeAdrenoVmCapacity capacity_stats_{};
     unsigned budget_=0;
     uint64_t next_handle_=1;
     bool attached_=false,poisoned_=false,distrust_write_combined_=false;
     NativeAdrenoVmResult result_{};
     ArmSmmu4KLiveRegion region(unsigned) const;
     ArmSmmu4KStatus observe() const;
-    /* Stream observation reads the context and routes; page-table validation
-     * belongs to the ArmSmmu4K update that changes the descriptors. */
+    /* The route check alone: the table walk is the update's own (it verifies every region before the first store and after the last), so
+     * map/unmap pay a full extra audit only every 64th operation (int-139: 4 full walks of the 2 GiB aperture made every map 70 ms). */
     ArmSmmu4KStatus observeStreamsOnly() const;
     ArmSmmu4KStatus observeCheap();
     unsigned since_audit_=0;
     IOReturn fail(ArmSmmu4KStatus);
     Mapping *find(uint64_t);
-    const Mapping *find(uint64_t) const;
-    size_t rangeAt(uint64_t iova) const;
     void insert(size_t,unsigned);
     void erase(size_t,size_t,unsigned);
-    IOReturn preflight(const NativeAdrenoMemory *,unsigned,uint64_t,unsigned,unsigned,unsigned,bool exclusive) const;
-    bool exclusivePages(const NativeAdrenoMemory *) const;
-    IOReturn reserveSpans(size_t);
+    IOReturn preflight(const NativeAdrenoMemory *,unsigned,uint64_t,unsigned,unsigned,unsigned) const;
 public:
     NativeAdrenoVm()=default;
     ~NativeAdrenoVm()=default;
@@ -98,7 +84,9 @@ public:
         unsigned permissions,unsigned writeback,unsigned shareability,uint64_t *handle);
     IOReturn unmap(uint64_t handle);
     IOReturn holdJob(uint64_t handle);
-    /* Explicit context recovery invalidates every translation in the bank and waits for TLBSYNC. */
+    /* TLBIALL for the context bank plus TLBSYNC: drops every cached translation of the bank whatever its ASID. Unmap already
+     * synchronizes by ASID; this is the stronger form the submit path uses before each submission (int-070: on sheng the CP read
+     * zeros from an IB whose table entry and DRAM were both correct, after the address had been mapped to other pages before). */
     IOReturn invalidateTlb();
     /* Cleans and invalidates the CPU caches over every mapped BO (whole objects; imported ones through their physical pages), so
      * no CPU cache line can hold data the GPU should see or hide what it wrote. Lines are physically tagged, so this also reaches
@@ -133,7 +121,6 @@ public:
     bool poisoned() const {return poisoned_;}
     size_t objectCount() const {return objects_;}
     size_t spanCount() const {return lower_count_+upper_count_;}
-    NativeAdrenoVmCapacity capacityStats() const {return capacity_stats_;}
     NativeAdrenoVmResult lastResult() const {return result_;}
 };
 #endif

@@ -11,10 +11,8 @@
  * disagrees with the storage. Unknown versions, methods and flags are refused
  * rather than ignored. */
 enum {
-    NativeAdrenoAbiVersion = 2,
-    NativeAdrenoAbiLegacyVersion = 1,
-    NativeAdrenoAbiLegacyMaxBuffers = 16,
-    NativeAdrenoAbiMaxBuffers = 128,
+    NativeAdrenoAbiVersion = 1,
+    NativeAdrenoAbiMaxBuffers = 16,
     NativeAdrenoAbiMaxBoBytesShift = 28, /* 256MiB per object */
     NativeAdrenoMethodQuery = 1,
     NativeAdrenoMethodBoAlloc = 2,
@@ -39,12 +37,11 @@ struct NativeAdrenoAbiParams {
     uint32_t abi_version;
     uint32_t input_bits;          /* GPU VA bits below 2^input_bits */
     uint32_t output_bits;         /* physical address bits */
-    uint32_t flags;               /* Supported NativeAdrenoParams capability bits. */
+    uint32_t flags;               /* NativeAdrenoParamsHostImport or zero */
     uint64_t max_bo_bytes;
 };
 enum {
-    NativeAdrenoParamsHostImport = 1, /* BoImport pins the caller's own pages (an IOSurface's) as a BO */
-    NativeAdrenoParamsSleepingWait = 2 /* External WaitFence sleeps outside the GPU lock between hardware observations. */
+    NativeAdrenoParamsHostImport = 1  /* BoImport pins the caller's own pages (an IOSurface's) as a BO */
 };
 struct NativeAdrenoAbiBoAlloc {
     uint64_t bytes;               /* 4KiB multiple, <= max_bo_bytes */
@@ -87,15 +84,6 @@ struct NativeAdrenoAbiSubmit {
     uint64_t wait_fence;          /* zero or an earlier fence of this client */
     uint64_t wait_timeout_ns;     /* used only when wait_fence is nonzero */
     NativeAdrenoAbiSubmitBuffer buffers[NativeAdrenoAbiMaxBuffers];
-};
-/* NativeAdrenoAbiSubmitV1 retains the version 1 submit record accepted by the kernel. */
-struct NativeAdrenoAbiSubmitV1 {
-    uint32_t buffer_count;
-    uint32_t reserved;
-    uint64_t queue;
-    uint64_t wait_fence;
-    uint64_t wait_timeout_ns;
-    NativeAdrenoAbiSubmitBuffer buffers[NativeAdrenoAbiLegacyMaxBuffers];
 };
 struct NativeAdrenoAbiMetadata {
     uint64_t handle;              /* object identity */
@@ -163,8 +151,7 @@ static_assert(sizeof(NativeAdrenoAbiBoAlloc) == 16, "ABI alloc layout");
 static_assert(sizeof(NativeAdrenoAbiBoMap) == 32, "ABI map layout");
 static_assert(sizeof(NativeAdrenoAbiBoImport) == 16, "ABI import layout");
 static_assert(sizeof(NativeAdrenoAbiSubmitBuffer) == 24, "ABI buffer layout");
-static_assert(sizeof(NativeAdrenoAbiSubmit) == 32 + 24 * NativeAdrenoAbiMaxBuffers, "ABI submit layout");
-static_assert(sizeof(NativeAdrenoAbiSubmitV1) == 416, "ABI version 1 submit layout");
+static_assert(sizeof(NativeAdrenoAbiSubmit) == 416, "ABI submit layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuMap) == 8, "ABI cpu map layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuMapReply) == 16, "ABI cpu map reply layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuUnmap) == 16, "ABI cpu unmap layout");

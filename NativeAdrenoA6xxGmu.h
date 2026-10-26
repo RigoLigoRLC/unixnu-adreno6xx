@@ -3,7 +3,6 @@
 #define NATIVE_ADRENO_A6XX_GMU_H
 
 #include "NativeAdrenoA6xxPower.h"
-#include <IOKit/IOLocks.h>
 
 struct NativeAdrenoA6xxGmuBuffer {
     void *cpu;
@@ -24,9 +23,8 @@ struct NativeAdrenoA6xxGmuConfig {
  * start holds CM3 in reset while loading its TCM and mapped firmware segments,
  * initializes the A6xx HFI queues, configures the A660 RSCC program and the
  * AOP-owned PDC handoff, then requires real firmware acknowledgements for the
- * performance table, bandwidth table and core start. The HFI startup vote selects
- * 315 MHz and bandwidth entry three.
- * poll reads the GMU fault registers and consumes bounded
+ * performance table, bandwidth table and core start. The final HFI vote fixes
+ * the GPU at 315 MHz. poll reads the GMU fault registers and consumes bounded
  * response/debug queue contents while the service owns the running device.
  * The caller owns GPU/SMMU setup and retains every buffer until stop has
  * halted CM3 and GPU DMA has separately stopped. */
@@ -34,7 +32,6 @@ class NativeAdrenoA6xxGmu final {
     NativeAdrenoA6xxGmuConfig config_{};
     NativeAdrenoA6xxReport report_{};
     uint32_t sequence_ = 0;
-    IOLock *lock_ = nullptr;
     bool attempted_ = false;
     bool running_ = false;
 

@@ -5,14 +5,15 @@
 #include "NativeAdrenoSubmit.h"
 #include "NativeAdrenoTimer.h"
 #include "NativeAdrenoStatus.h"
-#include "NativeAdrenoHandleIndex.h"
 
-/* NativeAdrenoUserClient owns each connection's BO handles, CPU mapping leases
- * and queue identifiers. The IOKit wrapper serializes calls, copies ABI records
- * and supplies the caller's task for imports. A mapping is retirable only through freeBo, which unmaps
+/* Kernel-side body of the Adreno user client, deliberately free of IOKit so it
+ * can be exercised on a host. The future IOService/IOUserClient wrapper only
+ * copies one fixed ABI record in and out and calls these methods; it must not
+ * add policy. Handles are this object's own identities, never VM, IOVA or
+ * pointer values. A mapping is retirable only through freeBo, which unmaps
  * first and then releases the backing object; both steps must succeed.
  * Up to NativeAdrenoClientMaxObjects live objects and the execbuf's own eight-job limit apply. */
-enum : size_t {NativeAdrenoClientMaxObjects=16384};
+enum : size_t {NativeAdrenoClientMaxObjects=4096};
 class NativeAdrenoUserClient final {
     struct Queue {uint32_t id=0;bool active=false;};
     struct Entry {
@@ -32,10 +33,6 @@ class NativeAdrenoUserClient final {
     /* Allocated at open(), all-zero is the free state. */
     Entry *entries_=nullptr;
     size_t entry_count_=0;
-    NativeAdrenoHandleIndex<NativeAdrenoClientMaxObjects> index_;   /* live handle -> its entries_ index */
-    size_t free_hint_=0,live_=0;   /* no free entry below free_hint_; live_ entries are used */
-    NativeAdrenoAbiSubmit submit_request_{};
-    NativeAdrenoSubmitBuffer submit_buffers_[NativeAdrenoAbiMaxBuffers]{};
     Queue queues_[NativeAdrenoAbiMaxQueues]{};
     NativeAdrenoVm *vm_=nullptr;
     NativeAdrenoSubmit *submit_=nullptr;
@@ -56,8 +53,7 @@ class NativeAdrenoUserClient final {
     bool open_=false;
     Entry *find(uint64_t);
     Entry *free();
-    void clear(Entry &);
-    void publish(Entry &);
+    static void clear(Entry &);
 public:
     NativeAdrenoUserClient()=default;
     ~NativeAdrenoUserClient()=default;

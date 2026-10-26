@@ -45,7 +45,6 @@ class NativeAdrenoMemory final {
     size_t bytes_=0,span_count_=0,span_capacity_=0;
     uint32_t device_references_=0;
     bool prepared_=false,quarantined_=false,write_combined_=false,pooled_=false;
-    bool client_mapping_exposed_=false;
     size_t pool_offset_=0;
     IOReturn maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation);
 public:
@@ -77,16 +76,6 @@ public:
      * publishForDevice/acquireDeviceWrites have nothing to do for this object. Spans and PA bounds are checked as for allocate. */
     IOReturn importTask(void *task,uint64_t address,size_t bytes,unsigned output_bits,size_t byte_budget);
     bool imported() const {return imported_!=nullptr;}
-    /* A CPU mapping token allows a client to import the same physical pages
-     * through another BO. This fact stays set until backing memory is released. */
-    void exposeClientMapping()
-    {
-        client_mapping_exposed_=true;
-    }
-    bool clientMappingExposed() const
-    {
-        return client_mapping_exposed_;
-    }
     /* An import of memory the owner maps read-only (the kernel could pin it for reading only): the GPU may read it, never write it. */
     bool readOnly() const {return read_only_;}
     /* After allocate(), before any device or client mapping: cleans and invalidates the pages and makes every CPU mapping of them

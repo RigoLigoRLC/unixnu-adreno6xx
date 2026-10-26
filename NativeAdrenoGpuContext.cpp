@@ -113,8 +113,8 @@ IOReturn NativeAdrenoGpuContext::initialize(const ArmSmmu4KIo *io,unsigned bank,
     if(!status) {
         step(VmAttach);
         NativeAdrenoVmRegion lower={&tables_,smmu_.arenaHandle(),smmu_.stateHandle()};
-        /* The initial span array grows with live mappings up to the aperture's
-         * actual leaf budget, including scattered allocations and imports. */
+        /* 65536 spans: 256 MiB of BOs even when every page is its own span. The Metal runtime pools its memory in 64 MiB blocks,
+         * which XNU rarely finds physically contiguous; one scattered block is 16384 spans (int-070 ran out at 16384). */
         status=vm_.attach(io,smmu_.configHandle(),smmu_.streamsHandle(),&lower,nullptr,131072,262144);
     }
     if(!status) {

@@ -4,8 +4,6 @@
 #include "NativeAdrenoRing.h"
 #include "NativeAdrenoVm.h"
 
-enum : size_t {NativeAdrenoSubmitMaxBuffers=128};
-
 struct NativeAdrenoSubmitBuffer {
     uint64_t handle;
     uint64_t iova;
@@ -35,7 +33,7 @@ class NativeAdrenoSubmit final {
     struct Job {
         uint32_t fence=0;
         size_t count=0;
-        uint64_t handles[NativeAdrenoSubmitMaxBuffers]{};
+        uint64_t handles[16]{};
         uint32_t queue=0;
         bool active=false;
     } jobs_[8];
@@ -43,11 +41,7 @@ class NativeAdrenoSubmit final {
     NativeAdrenoRing *ring_=nullptr;
     NativeAdrenoSubmitStats stats_{};
     bool attached_=false,poisoned_=false;
-    uint32_t audit_tick_=0;
-    uint32_t coherence_tick_=0;
-    // The caller holds the GPU lock while these submission arrays are used.
-    uint64_t scratch_handles_[NativeAdrenoSubmitMaxBuffers]{};
-    uint32_t scratch_words_[NativeAdrenoSubmitMaxBuffers*4]{};
+    uint32_t audit_tick_=0;   /* submissions since attach; every eighth one audits its IB lines */
     Job *find(uint32_t fence);
     Job *free();
     IOReturn release(Job &, bool acquire_imported = true);

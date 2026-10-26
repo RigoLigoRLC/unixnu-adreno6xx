@@ -10,20 +10,6 @@ constexpr uint32_t QueueOffset = 0x350;
 constexpr uint32_t QueueWords = 1024;
 constexpr uint32_t QueueTableWords = 210;
 
-/* GmuLock holds the HFI command and response queues for one public operation. */
-class GmuLock final {
-    IOLock *lock_;
-public:
-    explicit GmuLock(IOLock *lock) : lock_(lock)
-    {
-        IOLockLock(lock_);
-    }
-    ~GmuLock()
-    {
-        IOLockUnlock(lock_);
-    }
-};
-
 uint32_t gmuOffset(uint32_t index)
 {
     return index * 4 - GmuWindowOffset;
@@ -373,7 +359,7 @@ IOReturn NativeAdrenoA6xxGmu::clearQueueInterrupts()
     return kIOReturnSuccess;
 }
 
-IOReturn NativeAdrenoA6xxGmu::drainQueue(unsigned queue, uint32_t expectedHeader,
+IOReturn NativeAdrenoA6xxGmu::drainQueue(unsigned queue, uint32_t expectedSequence,
     bool *acknowledged, uint32_t *returned)
 {
     if (queue < 1 || queue > 2) {
@@ -457,7 +443,7 @@ IOReturn NativeAdrenoA6xxGmu::drainQueue(unsigned queue, uint32_t expectedHeader
                     queue, messageHeader, message[1]);
                 return report_.status;
             }
-            if (expectedHeader && message[1] == expectedHeader) {
+            if (expectedSequence && (message[1] >> 20) == expectedSequence) {
                 if (acknowledged && !*acknowledged) {
                     *acknowledged = true;
                     ++report_.acknowledged;
@@ -466,8 +452,8 @@ IOReturn NativeAdrenoA6xxGmu::drainQueue(unsigned queue, uint32_t expectedHeader
                     *returned = message[3];
                 }
             } else {
-                IOLog("NativeAdrenoGmu: HFI unmatched ACK queue=%u request=%08x expected_header=%08x\n",
-                    queue, message[1], expectedHeader);
+                IOLog("NativeAdrenoGmu: HFI unmatched ACK queue=%u request=%08x expected_sequence=%u\n",
+                    queue, message[1], expectedSequence);
             }
         } else if (id == 101 && words >= 4) {
             IOLog("NativeAdrenoGmu: HFI debug queue=%u type=%08x timestamp=%08x data=%08x\n",
@@ -571,7 +557,7 @@ IOReturn NativeAdrenoA6xxGmu::exchange(uint32_t id, const uint32_t *payload,
             return result;
         }
         bool acknowledged = false;
-        result = drainQueue(1, sent, &acknowledged, returned);
+        result = drainQueue(1, sequence_, &acknowledged, returned);
         if (result || acknowledged) {
             return result;
         }
@@ -606,12 +592,6 @@ IOReturn NativeAdrenoA6xxGmu::start(const NativeAdrenoA6xxGmuConfig &config)
         config.tables->performance[7] != 315000 || config.tables->performance[53] != 200000) {
         return kIOReturnBadArgument;
     }
-
-    lock_ = IOLockAlloc();
-    if (!lock_) {
-        return kIOReturnNoMemory;
-    }
-    GmuLock held(lock_);
 
     config_ = config;
     attempted_ = true;
@@ -739,10 +719,6 @@ IOReturn NativeAdrenoA6xxGmu::start(const NativeAdrenoA6xxGmuConfig &config)
 
 IOReturn NativeAdrenoA6xxGmu::keepAlive(bool enabled)
 {
-    if (!lock_) {
-        return kIOReturnNotReady;
-    }
-    GmuLock held(lock_);
     if (report_.status) {
         return report_.status;
     }
@@ -762,10 +738,6 @@ IOReturn NativeAdrenoA6xxGmu::keepAlive(bool enabled)
 
 IOReturn NativeAdrenoA6xxGmu::poll()
 {
-    if (!lock_) {
-        return kIOReturnNotReady;
-    }
-    GmuLock held(lock_);
     if (report_.status) {
         return report_.status;
     }
@@ -796,10 +768,6 @@ IOReturn NativeAdrenoA6xxGmu::poll()
 
 IOReturn NativeAdrenoA6xxGmu::stop()
 {
-    if (!lock_) {
-        return kIOReturnNotReady;
-    }
-    GmuLock held(lock_);
     if (!attempted_) {
         return kIOReturnNotReady;
     }

@@ -9,12 +9,10 @@
 #include "NativeAdrenoIrq.h"
 #include "NativeAdrenoKernelTime.h"
 #include "NativeAdrenoUserClient.h"
-#include "NativeAdrenoPerformance.hpp"
 #include "ArmSmmu4KMmio.h"
 #include "AdrenoPM4.h"
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOLib.h>
-#include <IOKit/IOLocks.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOService.h>
 #include <kern/thread.h>
@@ -38,49 +36,10 @@ volatile uint32_t native_adreno_a6xx_stats[24];
 }
 
 namespace {
-IOLock *performanceLock = nullptr;
-NativeAdrenoPerformanceSnapshot performanceSnapshot{};
-uint32_t performanceRunning = 0;
-
-/* PerformanceCounter names a counter reserved by this kernel before CP starts.
- * Turnip's Darwin backend does not expose selectable performance queries. The
- * service retains GX through GMU keepalive and never changes these selectors
- * while commands execute. A changed selector invalidates that counter sample. */
-struct PerformanceCounter {
-    uint32_t selector;
-    uint32_t event;
-    uint32_t low;
-    uint32_t loadBit;
-};
-
-// A6xx register indexes and events follow adreno_a6xx_perfcounter.c and a6xx.xml.
-constexpr PerformanceCounter performanceCounters[] = {
-    {0x50a, 0, 0x422, 17},
-    {0xae24, 0, 0x4ce, 103},
-    {0xae25, 1, 0x4d0, 104},
-    {0xae26, 35, 0x4d2, 105},
-    {0xae27, 40, 0x4d4, 106},
-    {0xb61b, 0, 0x4a4, 82},
-    {0xe27, 0, 0x48c, 70},
-};
-
-// adreno_ft_regs_default resolved through the stock A6xx register table.
-constexpr uint32_t progressRegisters[] = {0x210,0x806,0x928,0x92a,0x92b,0x92d};
-constexpr unsigned ProgressRegisterCount=sizeof(progressRegisters)/sizeof(progressRegisters[0]);
-constexpr unsigned progressShaderCounters[] = {
-    NativeAdrenoSpAluCycles,
-    NativeAdrenoVsFullAluInstructions,
-    NativeAdrenoFsFullAluInstructions
-};
-constexpr unsigned ProgressShaderCounterCount=sizeof(progressShaderCounters)/sizeof(progressShaderCounters[0]);
-constexpr uint64_t ProgressIntervalUs=500000;
-
 /* A642LState owns all mappings, contexts and DMA allocations for this boot.
- * Its worker starts the GPU and consumes runtime hardware status. A runtime
- * failure freezes submissions and retains powered hardware and DMA memory;
- * only an initialization failure can stop hardware before clients exist. */
+ * A failed attempt retains them while the GMU and CP are stopped. The CPU
+ * framebuffer continues independently of whether this object publishes a GPU. */
 class A642LState final {
-    enum Lifecycle : uint32_t { Initializing, Runtime, Failed };
     OSSharedPtr<IOMemoryMap> maps_[NativeAdrenoA6xxDomains];
     OSSharedPtr<IOMemoryMap> zapMap_;
     OSSharedPtr<IOMemoryMap> smmuMap_;
@@ -109,20 +68,10 @@ class A642LState final {
     NativeAdrenoRingClock clock_{};
     bool cpTouched_=false;
     bool cpTrace_=false;
-    uint32_t lifecycle_=Initializing;
+    bool ready_=false;
     bool irqAttached_=false;
     uint32_t watchedFence_=0;
     uint64_t watchedSince_=0;
-    uint32_t watchedRegisters_[ProgressRegisterCount]{};
-    uint64_t watchedShaderCounters_[ProgressShaderCounterCount]{};
-    uint32_t watchedShaderMask_=0;
-    bool watchedActive_=false;
-    NativeAdrenoPerformanceSnapshot performance_{};
-    uint64_t previousSampleUs_=0;
-    uint64_t previousBusy_=0;
-    uint64_t previousCounters_[NativeAdrenoPerformanceCounterCount]{};
-    uint32_t previousCounterMask_=0;
-    bool previousBusyValid_=false;
     unsigned gpuSlots_[2]{},gmuSlots_[2]{},lpacSlots_[2]{};
 
     static int read(void *,uint32_t,uint32_t,uint32_t *);
@@ -143,11 +92,7 @@ class A642LState final {
     IOReturn contexts();
     IOReturn reserveSmmuResources();
     IOReturn startCp();
-    IOReturn initializePerformance();
-    bool readCounter(uint32_t domain,uint32_t lowOffset,uint64_t *value);
-    void samplePerformance(uint64_t current);
-    IOReturn observeProgress(uint64_t current,uint32_t submitted,uint32_t completed,bool *stalled);
-    IOReturn fail(IOReturn,const char *reason="initialization");
+    IOReturn fail(IOReturn);
 public:
     IOReturn start();
     void poll();
@@ -304,18 +249,8 @@ uint64_t A642LState::now(void *)
 
 int A642LState::idle(void *cookie)
 {
-    auto *self=static_cast<A642LState *>(cookie);
-    const uint32_t lifecycle=__atomic_load_n(&self->lifecycle_,__ATOMIC_ACQUIRE);
-    if(lifecycle==Failed) {
-        return 1;
-    }
-    if(lifecycle==Runtime) {
-        IOSleep(1);
-        return __atomic_load_n(&self->lifecycle_,__ATOMIC_ACQUIRE)==Failed?1:0;
-    }
-
     IODelay(5);
-    return self->observeInitialization()?1:0;
+    return static_cast<A642LState *>(cookie)->observeInitialization()?1:0;
 }
 
 IOReturn A642LState::observeInitialization()
@@ -335,125 +270,6 @@ IOReturn A642LState::observeInitialization()
         return status?status:kIOReturnIOError;
     }
     return kIOReturnSuccess;
-}
-
-bool A642LState::readCounter(uint32_t domain,uint32_t lowOffset,uint64_t *value)
-{
-    for(unsigned attempt=0;attempt<4;++attempt) {
-        uint32_t highBefore=0,low=0,highAfter=0;
-        if(read(this,domain,lowOffset+4,&highBefore) ||
-            read(this,domain,lowOffset,&low) || read(this,domain,lowOffset+4,&highAfter)) {
-            return false;
-        }
-        if(highBefore==highAfter) {
-            *value=uint64_t(highAfter)<<32|low;
-            return true;
-        }
-    }
-    return false;
-}
-
-IOReturn A642LState::initializePerformance()
-{
-    performance_={};
-    performance_.acknowledgedHz=315000000;
-
-    // CP is stopped here. LOAD_CMD initializes only the seven owned counters.
-    if(gpuWrite(this,0x505,0) || gpuWrite(this,0x506,0)) {
-        return kIOReturnIOError;
-    }
-    for(unsigned index=0;index<NativeAdrenoPerformanceCounterCount;++index) {
-        const auto &counter=performanceCounters[index];
-        performance_.counterSelectors[index]=counter.event;
-        if(gpuWrite(this,0x501+counter.loadBit/32,1u<<(counter.loadBit%32)) ||
-            gpuWrite(this,counter.selector,counter.event)) {
-            return kIOReturnIOError;
-        }
-    }
-    if(gpuWrite(this,0x500,1)) {
-        return kIOReturnIOError;
-    }
-    __asm__ volatile("dsb sy" ::: "memory");
-    return kIOReturnSuccess;
-}
-
-void A642LState::samplePerformance(uint64_t current)
-{
-    if(previousSampleUs_ && current-previousSampleUs_<16000) {
-        return;
-    }
-    const uint64_t interval=previousSampleUs_?current-previousSampleUs_:0;
-    performance_.sampledUs=current;
-    performance_.intervalUs=interval;
-    performance_.busyValid=0;
-    performance_.busyTicks=0;
-    performance_.totalTicks=interval*192/10;
-    performance_.busyPermille=0;
-    performance_.counterValidMask=0;
-    performance_.coreCyclesRateHz=0;
-    ++performance_.samples;
-
-    uint32_t selector=0;
-    uint64_t busy=0;
-    const bool busyRead=!read(this,NativeAdrenoA6xxGmuRegisters,0x14104,&selector) &&
-        (selector&0xff)==0x20 && readCounter(NativeAdrenoA6xxGmuRegisters,0x14110,&busy);
-    if(busyRead) {
-        performance_.busyCounter=busy;
-        if(previousBusyValid_ && interval && busy>=previousBusy_) {
-            const uint64_t elapsed=busy-previousBusy_;
-            if(elapsed<=performance_.totalTicks+19200) {
-                performance_.busyTicks=elapsed;
-                const uint64_t permille=elapsed*1000/performance_.totalTicks;
-                performance_.busyPermille=permille>1000?1000:uint32_t(permille);
-                performance_.busyValid=1;
-            }
-        }
-        if(previousBusyValid_ && !performance_.busyValid) {
-            ++performance_.counterDiscontinuities;
-        }
-        previousBusy_=busy;
-    }
-    previousBusyValid_=busyRead;
-    uint64_t ifpc=0;
-    if(readCounter(NativeAdrenoA6xxGmuRegisters,0x14130,&ifpc)) {
-        performance_.ifpcCounter=ifpc;
-    }
-
-    uint32_t gx=0,fence=0;
-    const bool accessible=!read(this,NativeAdrenoA6xxGmuRegisters,0x1f8d0*4-0x6a000,&gx) &&
-        !read(this,NativeAdrenoA6xxGmuRegisters,0x23b10*4-0x6a000,&fence) && !(gx&0xc0) && !fence;
-    uint32_t readMask=0;
-    for(unsigned index=0;index<NativeAdrenoPerformanceCounterCount;++index) {
-        const auto &counter=performanceCounters[index];
-        uint64_t value=0;
-        performance_.counterDeltas[index]=0;
-        if(!accessible || gpuRead(this,counter.selector,&selector) || selector!=counter.event ||
-            !readCounter(NativeAdrenoA6xxGpu,counter.low*4,&value)) {
-            continue;
-        }
-        readMask|=1u<<index;
-        performance_.counterValues[index]=value;
-        if(interval && (previousCounterMask_&(1u<<index)) && value>=previousCounters_[index]) {
-            performance_.counterDeltas[index]=value-previousCounters_[index];
-            performance_.counterValidMask|=1u<<index;
-            if(performance_.counterDeltas[index]) {
-                performance_.counterPopulatedMask|=1u<<index;
-            }
-        } else if(previousCounterMask_&(1u<<index)) {
-            ++performance_.counterDiscontinuities;
-        }
-        previousCounters_[index]=value;
-    }
-    previousCounterMask_=readMask;
-    if(interval && (performance_.counterValidMask&1)) {
-        const uint64_t rate=performance_.counterDeltas[NativeAdrenoCoreCycles]*1000000/interval;
-        performance_.coreCyclesRateHz=rate>UINT32_MAX?UINT32_MAX:uint32_t(rate);
-    }
-    previousSampleUs_=current;
-
-    IOLockLock(performanceLock);
-    performanceSnapshot=performance_;
-    IOLockUnlock(performanceLock);
 }
 
 IOReturn A642LState::checkGpuTranslations()
@@ -507,10 +323,7 @@ IOReturn A642LState::mapWindows()
     };
     for(unsigned index=0;index<NativeAdrenoA6xxDomains;++index) {
         windows_[index]=supplied[index];
-        // Command-db is immutable firmware-populated DDR, read through Normal NC.
-        const IOOptionBits cache=index==NativeAdrenoA6xxCommandDb?
-            kIOMapWriteCombineCache:kIOMapInhibitCache;
-        maps_[index]=mapWindow(windows_[index],cache);
+        maps_[index]=mapWindow(windows_[index]);
         if(!maps_[index]) {
             return kIOReturnNoMemory;
         }
@@ -838,10 +651,6 @@ IOReturn A642LState::startCp()
     if(status) {
         return status;
     }
-    status=initializePerformance();
-    if(status) {
-        return status;
-    }
 
     IOLog("NativeAdrenoCp: checking TBU translations before SQE start\n");
     status=checkGpuTranslations();
@@ -899,14 +708,6 @@ IOReturn A642LState::startCp()
         return status;
     }
     native_adreno_fence_phys=gpuContext_.buffer(2).spans()[0].physical;
-    unsigned profileEnabled=0;
-    PE_parse_boot_argn("native-adreno-profile",&profileEnabled,sizeof(profileEnabled));
-    if(profileEnabled) {
-        status=ring_.enableProfiling(gpuContext_.vm());
-        if(status) {
-            return status;
-        }
-    }
     NativeAdrenoCpInit cp;
     NativeAdrenoCpInitConfig config{GpuSqeIova,GpuPwrupIova,0,NativeAdrenoA642L};
     uint32_t bootstrapWptr=0;
@@ -1009,39 +810,19 @@ IOReturn A642LState::startCp()
     info_.ubwc_version = 3;
     info_.flags = NativeAdrenoDeviceClientIova;
 
-    // Runtime waits must stop consuming IRQ status before publication admits clients.
-    __atomic_store_n(&lifecycle_,Runtime,__ATOMIC_RELEASE);
-    status=native_adreno_publish(gpuContext_.vm(),&submit_,&ring_,&clock_,&timer_,&info_,32,40);
-    if(status) {
-        // Publication errors occur before the service becomes available to clients.
-        __atomic_store_n(&lifecycle_,Initializing,__ATOMIC_RELEASE);
-    }
-    return status;
+    return native_adreno_publish(gpuContext_.vm(),&submit_,&ring_,&clock_,&timer_,&info_,32,40);
 }
 
-IOReturn A642LState::fail(IOReturn status,const char *reason)
+IOReturn A642LState::fail(IOReturn status)
 {
-    const uint32_t previous=__atomic_exchange_n(&lifecycle_,Failed,__ATOMIC_ACQ_REL);
-    if(previous==Failed) {
-        return status;
-    }
-
-    __atomic_store_n(&performanceRunning,0u,__ATOMIC_RELEASE);
-    IOLog("NativeAdrenoA6xx: failure reason=%s status=%08x step=%u runtime=%u hardware_retained=%u\n",
-        reason,uint32_t(status),native_adreno_a6xx_stats[0],unsigned(previous==Runtime),unsigned(previous==Runtime));
+    smmuProvider_.observe();
+    smmuProvider_.disableInterrupts();
     native_adreno_a6xx_stats[1]=uint32_t(status);
+    native_adreno_control_update(native_adreno_a6xx_stats[0],uint32_t(status),"failed");
     failedPowerReport_=power_.report();
     failedGmuReport_=gmu_.report();
     failureCaptured_=true;
     native_adreno_fault();
-    native_adreno_control_update(native_adreno_a6xx_stats[0],uint32_t(status),"failed");
-    if(previous==Runtime) {
-        dump();
-        return status;
-    }
-
-    smmuProvider_.observe();
-    smmuProvider_.disableInterrupts();
     bool stopped=true;
     if(cpTouched_) {
         stopped=NativeAdrenoA6xxHwInit::stop(&ringIo_,1000)==kIOReturnSuccess;
@@ -1058,10 +839,6 @@ IOReturn A642LState::fail(IOReturn status,const char *reason)
 
 IOReturn A642LState::start()
 {
-    performanceLock=IOLockAlloc();
-    if(!performanceLock) {
-        return kIOReturnNoMemory;
-    }
     native_adreno_a6xx_stats[0]=1;
     native_adreno_control_update(1,0,"starting");
     IOLog("NativeAdrenoA6xx: mapping SM7325 board resources\n");
@@ -1121,89 +898,16 @@ IOReturn A642LState::start()
     if(status) {
         return fail(status);
     }
-    __atomic_store_n(&performanceRunning,1u,__ATOMIC_RELEASE);
+    ready_=true;
     native_adreno_a6xx_stats[0]=7;
     native_adreno_control_update(7,0,"ready");
     dump();
     return kIOReturnSuccess;
 }
 
-IOReturn A642LState::observeProgress(uint64_t current,uint32_t submitted,uint32_t completed,bool *stalled)
-{
-    *stalled=false;
-    if(submitted==completed) {
-        watchedActive_=false;
-        watchedFence_=completed;
-        watchedSince_=current;
-        return kIOReturnSuccess;
-    }
-    if(watchedActive_ && current-watchedSince_<ProgressIntervalUs) {
-        return kIOReturnSuccess;
-    }
-
-    uint32_t registers[ProgressRegisterCount]{};
-    for(unsigned index=0;index<ProgressRegisterCount;++index) {
-        if(gpuRead(this,progressRegisters[index],&registers[index])) {
-            return kIOReturnIOError;
-        }
-    }
-    uint32_t writePointer=0;
-    if(gpuRead(this,0x807,&writePointer)) {
-        return kIOReturnIOError;
-    }
-
-    uint64_t counters[ProgressShaderCounterCount]{};
-    uint32_t counterMask=0;
-    for(unsigned index=0;index<ProgressShaderCounterCount;++index) {
-        const auto &counter=performanceCounters[progressShaderCounters[index]];
-        uint32_t selector=0;
-        if(gpuRead(this,counter.selector,&selector)) {
-            return kIOReturnIOError;
-        }
-        if(selector==counter.event) {
-            if(!readCounter(NativeAdrenoA6xxGpu,counter.low*4,&counters[index])) {
-                return kIOReturnIOError;
-            }
-            counterMask|=1u<<index;
-        }
-    }
-
-    // The stock idle check requires an empty ring and no RBBM work bits.
-    const bool idle=registers[1]==writePointer && !(registers[0]&0xfffffffeu);
-    bool advanced=!watchedActive_ || idle || completed!=watchedFence_;
-    uint32_t changedRegisters=0,changedCounters=0;
-    for(unsigned index=0;index<ProgressRegisterCount;++index) {
-        if(registers[index]!=watchedRegisters_[index]) {
-            changedRegisters|=1u<<index;
-        }
-        watchedRegisters_[index]=registers[index];
-    }
-    for(unsigned index=0;index<ProgressShaderCounterCount;++index) {
-        const uint32_t bit=1u<<index;
-        if((counterMask&watchedShaderMask_&bit) && counters[index]!=watchedShaderCounters_[index]) {
-            changedCounters|=bit;
-        }
-        watchedShaderCounters_[index]=counters[index];
-    }
-    advanced=advanced || changedRegisters || changedCounters;
-    *stalled=watchedActive_ && !advanced;
-    if(*stalled) {
-        IOLog("NativeAdrenoA6xx: no hardware progress interval_us=%llu submitted=%u completed=%u rbbm=%08x rptr=%x wptr=%x ib1=%08x/%x ib2=%08x/%x shader_valid=%x alu_cycles=%llu vs_alu=%llu fs_alu=%llu\n",
-            current-watchedSince_,submitted,completed,registers[0],registers[1],writePointer,
-            registers[2],registers[3],registers[4],registers[5],counterMask&watchedShaderMask_,
-            counters[0],counters[1],counters[2]);
-    } else {
-        watchedSince_=current;
-    }
-    watchedFence_=completed;
-    watchedShaderMask_=counterMask;
-    watchedActive_=!idle;
-    return kIOReturnSuccess;
-}
-
 void A642LState::poll()
 {
-    if(__atomic_load_n(&lifecycle_,__ATOMIC_ACQUIRE)!=Runtime) {
+    if(!ready_) {
         return;
     }
 
@@ -1212,9 +916,9 @@ void A642LState::poll()
         gmuStatus=gmu_.poll();
     }
     if(gmuStatus) {
+        ready_=false;
         native_adreno_a6xx_stats[0]=8;
-        IOLog("NativeAdrenoA6xx: runtime poll failed gmu_status=%08x\n",uint32_t(gmuStatus));
-        fail(gmuStatus,"smmu-or-gmu-poll");
+        fail(gmuStatus);
         return;
     }
 
@@ -1226,21 +930,16 @@ void A642LState::poll()
     uint32_t submitted=0,completed=0;
     const int progress=native_adreno_progress(&submitted,&completed);
     const uint64_t current=now(nullptr);
-    bool timeout=false;
-    IOReturn observationStatus=kIOReturnSuccess;
-    if(!status && !progress && !(result.flags&NativeAdrenoIrqFatal)) {
-        observationStatus=observeProgress(current,submitted,completed,&timeout);
+    if(completed!=watchedFence_ || submitted==completed) {
+        watchedFence_=completed;
+        watchedSince_=current;
     }
-    if(status || progress || (result.flags&NativeAdrenoIrqFatal) || observationStatus || timeout) {
+    const bool timeout=submitted!=completed && current-watchedSince_>500000;
+    if(status || progress || (result.flags&NativeAdrenoIrqFatal) || timeout) {
+        ready_=false;
         native_adreno_a6xx_stats[0]=8;
-        IOLog("NativeAdrenoA6xx: runtime poll failed irq_status=%08x irq=%08x cp=%08x protect=%08x flags=%08x progress=%d observation=%08x submitted=%u completed=%u elapsed_us=%llu timeout=%u\n",
-            uint32_t(status),result.status,result.cp_status,result.protect_status,result.flags,
-            progress,uint32_t(observationStatus),submitted,completed,current-watchedSince_,unsigned(timeout));
-        fail(status?status:(observationStatus?observationStatus:(timeout?kIOReturnTimeout:kIOReturnIOError)),
-            timeout?"gpu-progress-timeout":(observationStatus?"gpu-progress-observation":"irq-or-submit-progress"));
-        return;
+        fail(status?status:(timeout?kIOReturnTimeout:kIOReturnIOError));
     }
-    samplePerformance(current);
 }
 
 void A642LState::dump() const
@@ -1314,7 +1013,7 @@ void hardwareWorker(void *,wait_result_t)
         return;
     }
     for(;;) {
-        IOSleep(16);
+        IOSleep(10);
         state->poll();
     }
 }
@@ -1367,17 +1066,3 @@ extern "C" void native_adreno_a6xx_dump_stats(void)
         state->dump();
     }
 }
-
-extern "C" bool native_adreno_performance_snapshot(NativeAdrenoPerformanceSnapshot *output)
-{
-    IOLock *lock=__atomic_load_n(&performanceLock,__ATOMIC_ACQUIRE);
-    if(!output || !lock) {
-        return false;
-    }
-    IOLockLock(lock);
-    *output=performanceSnapshot;
-    IOLockUnlock(lock);
-    output->running=__atomic_load_n(&performanceRunning,__ATOMIC_ACQUIRE);
-    return output->samples!=0;
-}
-

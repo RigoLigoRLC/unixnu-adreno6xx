@@ -19,14 +19,12 @@
 #include <IOKit/IOUserClient.h>
 #include <string.h>
 #include <kern/thread.h>
-#include <kern/clock.h>
 #include <mach/kmod.h>
 #include <pexpert/pexpert.h>
 #include "NativeAdrenoUserClient.h"
 #include "NativeAdrenoIntegration.h"
 #include "NativeAdrenoA6xxService.h"
 #include "NativeAdrenoDisplay.h"
-#include "NativeAdrenoPerformance.hpp"
 
 static NativeAdrenoIntegration integration = {};
 extern "C" kmod_info_t g_kernel_kmod_info;
@@ -414,19 +412,12 @@ IOReturn AGXDeviceUserClient::clientClose()
 {
     IOLockLock(g.lock);
     closing_=true;
-    if(g.failed) {
-        IOLockUnlock(g.lock);
-        return kIOReturnNotReady;
-    }
     AGXDeviceUserClient *mailbox=nullptr;
     if(gMailboxOwner==this) {mailbox=gMailboxOwner;gMailboxOwner=nullptr;}
     IOLockUnlock(g.lock);
 
     IOReturn status=dropViews(0);
     IOLockLock(g.lock);
-    if(!status && g.failed) {
-        status=kIOReturnNotReady;
-    }
     if(!status && live_) {
         const uint64_t peak=core_->windowPeak();
         status=core_->releaseAll(&g.clock,2000000);
@@ -448,15 +439,6 @@ IOReturn AGXDeviceUserClient::clientClose()
 }
 void AGXDeviceUserClient::free()
 {
-    IOLockLock(g.lock);
-    const bool retainBacking=g.failed && live_;
-    IOLockUnlock(g.lock);
-    if(retainBacking) {
-        // The retained core and views own pages whose DMA completion is unknown.
-        IOUserClient::free();
-        return;
-    }
-
     const IOReturn status=dropViews(0);
     if(!status && views_) {IODelete(views_,View,MaxViews);views_=nullptr;}
     /* Still live only when a teardown failed: its objects stay referenced by the VM and the ring, so the core is kept, not freed. */
@@ -491,7 +473,7 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
     /* [5]: threads inside this function right now (a thread stuck here, on the gate or in a mapping, shows as a non-zero count that stays). */
     struct Inside {Inside() {__atomic_fetch_add(&native_adreno_view_diag[5],1,__ATOMIC_RELAXED);} ~Inside() {__atomic_fetch_sub(&native_adreno_view_diag[5],1,__ATOMIC_RELAXED);}} inside;
     IOLockLock(g.lock);
-    if(!live_ || closing_ || viewTeardownStatus_ || g.failed) {
+    if(!live_ || closing_ || viewTeardownStatus_) {
         IOLockUnlock(g.lock);
         return kIOReturnNotReady;
     }
@@ -548,8 +530,6 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
 /* Fence waits as the callers see them (int-147; method 6's own statistics count every poll): [0] waits, [1] us waited in total, [2] pauses
  * taken outside the connection lock, [3] the longest wait in us. */
 extern "C" {volatile uint64_t native_adreno_wait_outer[4];}
-extern "C" volatile uint64_t native_adreno_cache_stats[5];
-extern "C" volatile uint64_t native_adreno_reassert_ticks;
 static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const void *input,size_t input_size,void *output,size_t output_size)
 {
     if(method==NativeAdrenoMethodSetMetadata && input && input_size==sizeof(NativeAdrenoAbiMetadata)) {
@@ -568,9 +548,10 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
     native_adreno_metal_diag.inflight_since_calls=native_adreno_metal_diag.calls;
     IOReturn status;
     if(method==NativeAdrenoMethodWaitFence && connection->live_ && input && input_size==sizeof(NativeAdrenoAbiWaitFence) && g.clock.now_us) {
-        /* The external wait observes fences under the GPU lock. The board's
-         * runtime idle hook sleeps and checks its failure state; the hardware
-         * worker owns GMU and interrupt consumption. */
+        /* int-147: a fence wait polls under the lock but pauses outside it. int-146 slept inside the lock (up to the caller's 1 ms slice per
+         * call), so every other thread's submit, map or allocation waited for the GPU to finish unrelated work: a frame could not be queued
+         * while the previous one ran. Each poll is the core's own zero-timeout wait (same checks, retirement and statistics); the pause is the
+         * board's (until the next GPU interrupt, at most 100 us). */
         NativeAdrenoAbiWaitFence poll{};
         memcpy(&poll,input,sizeof(poll));
         const uint64_t timeout_us=poll.timeout_ns/1000,began=g.clock.now_us(g.clock.cookie);
@@ -585,14 +566,7 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
             waited=g.clock.now_us(g.clock.cookie)-began;
             if(status!=kIOReturnTimeout || waited>=timeout_us)break;
             native_adreno_wait_outer[2]=native_adreno_wait_outer[2]+1;
-            if(g.clock.idle) {
-                if(g.clock.idle(g.clock.cookie)) {
-                    status=kIOReturnNotReady;
-                    break;
-                }
-            } else {
-                IOSleep(1);
-            }
+            if(!g.clock.idle || g.clock.idle(g.clock.cookie))break;
         }
         native_adreno_wait_outer[0]=native_adreno_wait_outer[0]+1;native_adreno_wait_outer[1]=native_adreno_wait_outer[1]+waited;
         if(waited>native_adreno_wait_outer[3])native_adreno_wait_outer[3]=waited;
@@ -604,9 +578,6 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
             if(NativeAdrenoClientRecord *record=clientRecord(connection->name_))
                 if(connection->core_->windowPeak()>>20>record->peak_mib)record->peak_mib=uint32_t(connection->core_->windowPeak()>>20);
         IOLockUnlock(g.lock);
-    }
-    if(!status && method==NativeAdrenoMethodQuery && output && output_size==sizeof(NativeAdrenoAbiParams)) {
-        static_cast<NativeAdrenoAbiParams *>(output)->flags|=NativeAdrenoParamsSleepingWait;
     }
     native_adreno_metal_diag.inflight=0;
     native_adreno_metal_diag.calls=native_adreno_metal_diag.calls+1;
@@ -642,10 +613,6 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
          * ones leave their mapping until it, or the client unmaps it itself (IOConnectUnmapMemory64 works on the cached view). */
         const uint32_t token=static_cast<const NativeAdrenoAbiBoCpuUnmap *>(input)->token;
         IOLockLock(g.lock);
-        if(g.failed) {
-            IOLockUnlock(g.lock);
-            return kIOReturnNotReady;
-        }
         const uint32_t leases=live_?core_->mappingLeases(token):0;
         IOLockUnlock(g.lock);
         if(leases>1)native_adreno_view_kept=native_adreno_view_kept+1;
@@ -665,7 +632,7 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
         NativeAdrenoAbiBoAllocReply reply{};
         native_adreno_metal_diag.inflight=method+1;
         IOLockLock(g.lock);
-        const IOReturn status=live_ && !closing_ && !viewTeardownStatus_ && !g.failed?
+        const IOReturn status=live_ && !closing_ && !viewTeardownStatus_?
             core_->importBo(&request,current_task(),&reply):kIOReturnNotReady;
         IOLockUnlock(g.lock);
         native_adreno_metal_diag.inflight=0;
@@ -693,7 +660,7 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
         {&action,0,sizeof(NativeAdrenoAbiBoAlloc),0,sizeof(NativeAdrenoAbiBoAllocReply)},
         {&action,0,sizeof(NativeAdrenoAbiBoMap),0,sizeof(NativeAdrenoAbiBoMapReply)},
         {&action,0,sizeof(NativeAdrenoAbiBoFree),0,0},
-        {&action,0,kIOUCVariableStructureSize,0,sizeof(NativeAdrenoAbiSubmitReply)},
+        {&action,0,sizeof(NativeAdrenoAbiSubmit),0,sizeof(NativeAdrenoAbiSubmitReply)},
         {&action,0,sizeof(NativeAdrenoAbiWaitFence),0,0},
         {&action,0,0,0,sizeof(NativeAdrenoAbiTimestamp)},
         {&action,0,0,0,sizeof(NativeAdrenoAbiStatus)},
@@ -1059,7 +1026,6 @@ extern "C" void native_adreno_metal_dump_stats(void)
     if(g.published && g.lock && IOLockTryLock(g.lock)) {
         const NativeAdrenoSubmitStats submit=g.submit->stats();
         const size_t objects=g.vm->objectCount(),spans=g.vm->spanCount(),jobs=g.submit->outstanding();
-        const NativeAdrenoVmCapacity capacity=g.vm->capacityStats();
         const uint32_t submitted=g.ring->lastSubmitted(),completed=g.ring->completedFence();
         const uint32_t opened=g.opened,closed=g.closed;
         const uint64_t faults=g.status.faults(),suspends=g.status.suspends();
@@ -1069,36 +1035,11 @@ extern "C" void native_adreno_metal_dump_stats(void)
         IOLog("NativeAdrenoMetal: opened=%u closed=%u failed=%u faults=%llu suspends=%llu objects=%zu spans=%zu jobs=%zu poisoned_vm=%u poisoned_submit=%u poisoned_ring=%u\n",
             opened,closed,unsigned(failed),faults,suspends,objects,spans,jobs,
             unsigned(vmPoisoned),unsigned(submitPoisoned),unsigned(ringPoisoned));
-        IOLog("NativeAdrenoMetal: span_capacity=%zu span_limit=%zu span_peak=%zu span_required=%zu span_growths=%u span_allocation_failures=%u\n",
-            capacity.allocated,capacity.limit,capacity.peak,capacity.last_required,
-            capacity.growths,capacity.failures);
         IOLog("NativeAdrenoMetal: submissions=%u completed=%u timeouts=%u poisoned_jobs=%u held=%zu retired=%zu peak_jobs=%zu submitted_fence=%u completed_fence=%u\n",
             submit.submissions,submit.completed,submit.timeouts,submit.poisoned_jobs,
             submit.references_held,submit.references_retired,submit.peak_jobs,submitted,completed);
     } else {
         IOLog("NativeAdrenoMetal: submission_sample=%s\n",g.published?"lock_busy":"not_published");
-    }
-    uint64_t cacheNs=0,cacheMaxNs=0,reassertNs=0;
-    absolutetime_to_nanoseconds(__atomic_load_n(&native_adreno_cache_stats[0],__ATOMIC_RELAXED),&cacheNs);
-    absolutetime_to_nanoseconds(__atomic_load_n(&native_adreno_cache_stats[2],__ATOMIC_RELAXED),&cacheMaxNs);
-    absolutetime_to_nanoseconds(__atomic_load_n(&native_adreno_reassert_ticks,__ATOMIC_RELAXED),&reassertNs);
-    IOLog("NativeAdrenoMetal: cache_us=%llu cache_bytes=%llu cache_passes=%llu cache_max_us=%llu wc_pages=%llu reassert_us=%llu\n",
-        cacheNs/1000,__atomic_load_n(&native_adreno_cache_stats[1],__ATOMIC_RELAXED),
-        __atomic_load_n(&native_adreno_cache_stats[3],__ATOMIC_RELAXED),cacheMaxNs/1000,
-        __atomic_load_n(&native_adreno_cache_stats[4],__ATOMIC_RELAXED),reassertNs/1000);
-    NativeAdrenoPerformanceSnapshot performance{};
-    if(native_adreno_performance_snapshot(&performance)) {
-        IOLog("NativeAdrenoMetal: gpu_sample_us=%llu interval_us=%llu busy_valid=%u busy_ticks=%llu total_ticks=%llu busy_permille=%u ack_hz=%u gated_cycle_rate_hz=%u\n",
-            performance.sampledUs,performance.intervalUs,performance.busyValid,performance.busyTicks,
-            performance.totalTicks,performance.busyPermille,performance.acknowledgedHz,
-            performance.coreCyclesRateHz);
-        IOLog("NativeAdrenoMetal: gpu_running=%u gpu_samples=%llu counter_discontinuities=%llu counters_populated=%x\n",
-            performance.running,performance.samples,performance.counterDiscontinuities,performance.counterPopulatedMask);
-        for(unsigned index=0;index<NativeAdrenoPerformanceCounterCount;++index) {
-            IOLog("NativeAdrenoMetal: gpu_counter=%u valid=%u selector=%u value=%llu delta=%llu\n",
-                index,(performance.counterValidMask>>index)&1u,performance.counterSelectors[index],
-                performance.counterValues[index],performance.counterDeltas[index]);
-        }
     }
     IOLog("NativeAdrenoMetal: end\n");
 }

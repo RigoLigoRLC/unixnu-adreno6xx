@@ -281,7 +281,6 @@ IOReturn NativeAdrenoMemory::release()
         native_adreno_trace_stage=34;
     }
     if(pooled_) {poolGive(pool_offset_,bytes_);pooled_=false;prepared_=false;pool_offset_=0;}
-    client_mapping_exposed_=false;
     if(spans_)IODeleteData(spans_,NativeAdrenoPhysicalSpan,span_capacity_);
     mapping_=nullptr;spans_=nullptr;bytes_=span_count_=span_capacity_=0;read_only_=false;
     return kIOReturnSuccess;

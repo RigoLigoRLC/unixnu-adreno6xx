@@ -4,8 +4,7 @@
   real chip ID `0x06030500`, 512 KiB GMEM, 315 MHz first GPU request and A660
   firmware family. Read README.md and the affected implementation before edits.
 - The component ID and resolved checkout are `Adreno6xx`. Preserve the
-  NativeAdreno runtime names. The user authorized ABI v2 with 128 IBs; keep
-  query, Turnip wire sizes and the accepted 16-IB v1 submit record consistent.
+  NativeAdreno runtime names and ABI v1 records in `NativeAdrenoABI.h`.
 - The device kit supplies physical resources and SMMU assignments through
   `native_adreno_a6xx_resources`. The service owns mappings, DMA memory and
   publication. Keep board addresses and private firmware paths in the device

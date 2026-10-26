@@ -97,7 +97,7 @@ extern "C" IOReturn native_adreno_accelerator_publish(IOService *provider,uint32
     service->setName("AGXAccelerator");
     if(!service->setProperty("MetalPluginName","NativeAdrenoMetal") ||
        !service->setProperty("MetalPluginClassName","NativeAdrenoMetalDevice") ||
-       !service->setProperty("NativeSandboxGrantProcess","backboardd,iconservicesagent,KaleidoscopePoster,AegirPoster") ||
+       !service->setProperty("NativeSandboxGrantProcess","backboardd,iconservicesagent") ||
        !service->setProperty("ChipId",chipId,32)) {
         service->release();
         return kIOReturnNoMemory;
