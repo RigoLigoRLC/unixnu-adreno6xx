@@ -1307,9 +1307,9 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
         const int stored=valid && integration.exportPut?integration.exportPut(piece.generation,piece.total,piece.offset,
             static_cast<const uint8_t *>(input)+sizeof(piece),piece.bytes):-1;
         if(stored) {
-            ++native_adreno_export_stats[1];
+            native_adreno_export_stats[1]=native_adreno_export_stats[1]+1;
         } else {
-            ++native_adreno_export_stats[0];
+            native_adreno_export_stats[0]=native_adreno_export_stats[0]+1;
             native_adreno_export_stats[2]=piece.generation;
             native_adreno_export_stats[3]=piece.total;
         }
