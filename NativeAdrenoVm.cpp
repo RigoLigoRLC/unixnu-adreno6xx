@@ -308,12 +308,16 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
     const size_t spans=memory->spanCount();
     ArmSmmu4KRange *changes=IONewData(ArmSmmu4KRange,spans);
     uint32_t *physical_order=IONewData(uint32_t,spans);
-    if(!changes || !physical_order) {
+    PhysicalRange *physical_ranges=IONewData(PhysicalRange,spans);
+    if(!changes || !physical_order || !physical_ranges) {
         if(changes) {
             IODeleteData(changes,ArmSmmu4KRange,spans);
         }
         if(physical_order) {
             IODeleteData(physical_order,uint32_t,spans);
+        }
+        if(physical_ranges) {
+            IODeleteData(physical_ranges,PhysicalRange,spans);
         }
         return kIOReturnNoMemory;
     }
@@ -327,6 +331,7 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
     if(checked) {
         IODeleteData(changes,ArmSmmu4KRange,spans);
         IODeleteData(physical_order,uint32_t,spans);
+        IODeleteData(physical_ranges,PhysicalRange,spans);
         return checked;
     }
 
@@ -338,6 +343,7 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
     record->memory=memory;
     record->ranges=changes;
     record->physical_order=physical_order;
+    record->physical_ranges=physical_ranges;
     record->physical_count=index.count();
     record->handle=(next_handle_++<<12)|size_t(record-mappings_);
     record->iova=iova;
@@ -359,6 +365,17 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
     if(status)return fail(status);
     clock.lap(0,3);
     insert(record,upper);record->mapped_spans=spans;result_.completed_spans=spans;
+    for(size_t at=0;at<spans;++at) {
+        const auto &span=memory->spans()[at];
+        PhysicalRange &range=physical_ranges[at];
+        range={};
+        range.mapping=record;
+        range.physical=span.physical;
+        range.end=span.physical+span.bytes;
+        range.subtree_end=range.end;
+        range.offset=span.offset;
+        physical_.PhysicalRoot_RB_INSERT(&physical_.root,&range);
+    }
     --reserved_objects_;
     clock.lap(0,4);clock.done(0,memory->bytes());
     *handle=record->handle;result_.complete=true;return kIOReturnSuccess;
@@ -391,11 +408,15 @@ IOReturn NativeAdrenoVm::unmap(uint64_t handle)
     if(status)return fail(status);
     clock.lap(1,3);
     erase(record,upper);record->mapped_spans=0;result_.completed_spans=spans;
+    for(size_t at=0;at<spans;++at) {
+        physical_.PhysicalRoot_RB_REMOVE(&physical_.root,&record->physical_ranges[at]);
+    }
     native_adreno_trace_stage=14;
     clock.lap(1,4);
     if(record->memory->retireAfterQuiescence()!=kIOReturnSuccess)return fail(ArmSmmu4KStateMismatch);
     IODeleteData(record->ranges,ArmSmmu4KRange,spans);
     IODeleteData(record->physical_order,uint32_t,spans);
+    IODeleteData(record->physical_ranges,PhysicalRange,spans);
     clock.lap(1,5);clock.done(1,record->memory->bytes());
     *record={};
     record->next_free=free_head_;
@@ -575,30 +596,67 @@ bool NativeAdrenoVm::resourceImported(uint64_t handle) const
     return record && record->memory->imported();
 }
 
-bool NativeAdrenoVm::resourcesAlias(uint64_t first,uint64_t second) const
+bool NativeAdrenoVm::visitPhysicalAliases(const PhysicalRange *range,uint64_t first,uint64_t end,
+    bool (*visit)(void *,uint64_t,size_t,size_t),void *context,uint64_t *hits) const
 {
-    const Mapping *left=find(first);
-    const Mapping *right=find(second);
-    if(!left || !right) {
+    if(!range || range->subtree_end<=first) {
         return false;
     }
-    if(left->memory==right->memory) {
+    if(visitPhysicalAliases(RB_LEFT(range,link),first,end,visit,context,hits)) {
         return true;
     }
-    if(left->spans>right->spans) {
-        const Mapping *temporary=left;
-        left=right;
-        right=temporary;
+    if(range->physical>=end) {
+        return false;
     }
-
-    NativeAdrenoPhysicalIndex index(right->memory->spans(),right->physical_order,right->physical_count,true);
-    for(size_t at=0;at<left->spans;++at) {
-        const NativeAdrenoPhysicalSpan &span=left->memory->spans()[at];
-        if(index.overlaps(span.physical,span.bytes)) {
+    if(range->end>first) {
+        const uint64_t begin=range->physical>first?range->physical:first;
+        const uint64_t limit=range->end<end?range->end:end;
+        if(*hits==NativeAdrenoAliasHitLimit) {
+            return true;
+        }
+        ++*hits;
+        if(visit(context,range->mapping->handle,range->offset+size_t(begin-range->physical),size_t(limit-begin))) {
             return true;
         }
     }
-    return false;
+    return visitPhysicalAliases(RB_RIGHT(range,link),first,end,visit,context,hits);
+}
+
+IOReturn NativeAdrenoVm::visitResourceAliases(uint64_t handle,size_t offset,size_t bytes,size_t cache_line,
+    bool (*visit)(void *,uint64_t,size_t,size_t),void *context,uint64_t *queries,uint64_t *hits) const
+{
+    const Mapping *record=find(handle);
+    if(!record || !visit || !queries || !hits || !bytes || !cache_line || cache_line>4096 ||
+        (cache_line&(cache_line-1)) || offset>record->memory->bytes() || bytes>record->memory->bytes()-offset) {
+        return kIOReturnBadArgument;
+    }
+    const auto *spans=record->memory->spans();
+    const size_t count=record->memory->spanCount();
+    const size_t limit=offset+bytes;
+    size_t first=0,last=count;
+    while(first<last) {
+        const size_t middle=first+(last-first)/2;
+        if(spans[middle].offset+spans[middle].bytes<=offset) {
+            first=middle+1;
+        } else {
+            last=middle;
+        }
+    }
+    for(size_t at=first;at<count && spans[at].offset<limit;++at) {
+        const auto &span=spans[at];
+        const size_t begin=offset>span.offset?offset:span.offset;
+        const size_t end=limit<span.offset+span.bytes?limit:span.offset+span.bytes;
+        const uint64_t physical=(span.physical+begin-span.offset)&~uint64_t(cache_line-1);
+        const uint64_t physical_end=(span.physical+end-span.offset+cache_line-1)&~uint64_t(cache_line-1);
+        if(*queries==NativeAdrenoAliasQueryLimit) {
+            return kIOReturnBusy;
+        }
+        ++*queries;
+        if(visitPhysicalAliases(RB_ROOT(&physical_.root),physical,physical_end,visit,context,hits)) {
+            return kIOReturnBusy;
+        }
+    }
+    return kIOReturnSuccess;
 }
 
 IOReturn NativeAdrenoVm::publishResource(uint64_t handle,size_t offset,size_t bytes,unsigned access)

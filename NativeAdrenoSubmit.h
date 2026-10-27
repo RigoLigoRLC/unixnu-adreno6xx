@@ -19,6 +19,7 @@ struct NativeAdrenoSubmitResource {
     unsigned access=0;
     bool maintenance=false;
     bool owns_reference=false;
+    uint16_t next_for_mapping=0; /* One-based index of another interval of this mapping. */
 };
 enum class NativeAdrenoResourceReject : uint32_t {
     None,HandleMissing,HandleUnmapped,HandleUnreleasable,AccessFormat,VmDescribe,Permissions,Range
@@ -67,8 +68,17 @@ class NativeAdrenoSubmit final {
         NativeAdrenoSubmitResource *resources=nullptr;
         size_t resource_count=0;
         size_t maintenance_count=0; /* Resources needing CPU maintenance occupy the first entries. */
+        uint16_t *mapping_resources=nullptr;
+        size_t cache_line=0;
     } jobs_[8];
+    struct AliasQuery {
+        const NativeAdrenoSubmitResource *resources;
+        const uint16_t *mapping_resources;
+        size_t cache_line;
+        bool writes,skip_maintenance;
+    };
     NativeAdrenoSubmitResource *resource_storage_=nullptr;
+    uint16_t *mapping_resource_storage_=nullptr;
     uint32_t *command_words_=nullptr;
     NativeAdrenoVm *vm_=nullptr;
     NativeAdrenoRing *ring_=nullptr;
@@ -79,6 +89,7 @@ class NativeAdrenoSubmit final {
     Job *free();
     IOReturn release(Job &, bool acquire_imported = true);
     IOReturn poison();
+    static bool resourceConflict(void *,uint64_t,size_t,size_t);
 public:
     NativeAdrenoSubmit()=default;
     ~NativeAdrenoSubmit()=default;

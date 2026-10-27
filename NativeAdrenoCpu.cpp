@@ -57,6 +57,15 @@ IOReturn NativeAdrenoQueryCpu4K(NativeAdrenoCpuState *out)
         (out->sctlr&1) && (out->ttbr1&UINT64_C(0x0000fffffffff000));
     return native?kIOReturnSuccess:kIOReturnUnsupported;
 }
+size_t NativeAdrenoCpuCacheLineBytes()
+{
+    disable_preemption();
+    uint64_t ctr;
+    __asm__ volatile("mrs %0, ctr_el0":"=r"(ctr));
+    const size_t line=size_t(4)<<((ctr>>16)&15);
+    enable_preemption();
+    return line<=4096?line:0;
+}
 static IOReturn maintainOwnedPages(void *mapping,size_t bytes,NativeAdrenoCacheOperation op)
 {
     /* The caller owns every cache line intersecting this byte interval. CPU
@@ -105,8 +114,17 @@ IOReturn NativeAdrenoMaintainPhysicalSpans(const NativeAdrenoPhysicalSpan *spans
 
     const uint64_t began=mach_absolute_time();
     const size_t limit=offset+bytes;
+    size_t first=0,last=count;
+    while(first<last) {
+        const size_t middle=first+(last-first)/2;
+        if(spans[middle].offset<=offset && spans[middle].bytes<=offset-spans[middle].offset) {
+            first=middle+1;
+        } else {
+            last=middle;
+        }
+    }
     size_t covered=offset;
-    for(size_t i=0;i<count && covered<limit;++i) {
+    for(size_t i=first;i<count && covered<limit;++i) {
         const NativeAdrenoPhysicalSpan &span=spans[i];
         if(!span.physical || !span.bytes || ((span.offset|span.physical|span.bytes)&4095) ||
             span.offset>UINT64_MAX-span.bytes || span.physical>UINT64_MAX-span.bytes) {
@@ -128,7 +146,7 @@ IOReturn NativeAdrenoMaintainPhysicalSpans(const NativeAdrenoPhysicalSpan *spans
      * on the issuing core before preemption is enabled, and the next batch reads that core's cache-line size again. */
     unsigned run=0;
     size_t line=0;
-    for(size_t i=0;i<count;++i) {
+    for(size_t i=first;i<count;++i) {
         const NativeAdrenoPhysicalSpan &span=spans[i];
         if(span.offset>=limit) {
             break;

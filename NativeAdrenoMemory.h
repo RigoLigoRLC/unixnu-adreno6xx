@@ -15,6 +15,7 @@ IOReturn NativeAdrenoQueryCpu4K(NativeAdrenoCpuState *);
 /* The native-adreno-cache-trace boot argument enables per-BO and per-span cache logs. */
 bool NativeAdrenoCacheTraceEnabled();
 enum NativeAdrenoCacheOperation {NativeAdrenoClean,NativeAdrenoCleanInvalidate,NativeAdrenoInvalidate};
+size_t NativeAdrenoCpuCacheLineBytes();
 /* The byte interval is expanded only to intersecting CPU cache lines. The
  * caller excludes conflicting CPU and GPU access to those complete lines. */
 IOReturn NativeAdrenoMaintainOwnedPages(void *,size_t,NativeAdrenoCacheOperation);

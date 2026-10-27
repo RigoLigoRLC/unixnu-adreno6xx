@@ -26,7 +26,11 @@ struct NativeAdrenoVmResult {
  * and page-table allocations. NativeAdrenoSubmit retains job references until
  * the GPU fence completes. A failed page-table transaction keeps the records
  * and memory, faults the owned streams and requires service recovery. */
-enum : size_t {NativeAdrenoVmMaxObjects=4096};
+enum : size_t {
+    NativeAdrenoVmMaxObjects=4096,
+    NativeAdrenoAliasQueryLimit=262144,
+    NativeAdrenoAliasHitLimit=1048576
+};
 /* Board hook for sampleWord(): reads one aligned word of physical memory through a fresh uncached mapping; 0 on success. */
 extern "C" int (*native_adreno_dram_read32)(uint64_t physical,uint32_t *value);
 /* The board's reader through the kernel's cacheable physical aperture (null on the host: the BO's own mapping is read). */
@@ -36,10 +40,12 @@ extern "C" int (*native_adreno_cached_read32)(uint64_t physical,uint32_t *value)
  * cached copy the line was dirty (*dirty), when DRAM is unchanged it was a stale clean copy (*stale). 0 on success. */
 extern "C" int (*native_adreno_line_audit)(uint64_t physical,size_t bytes,uint32_t *dirty,uint32_t *stale);
 class NativeAdrenoVm final {
+    struct PhysicalRange;
     struct Mapping {
         NativeAdrenoMemory *memory=nullptr;
         ArmSmmu4KRange *ranges=nullptr;
         uint32_t *physical_order=nullptr;
+        PhysicalRange *physical_ranges=nullptr;
         size_t physical_count=0;
         uint64_t handle=0,iova=0;
         size_t spans=0,mapped_spans=0;
@@ -58,6 +64,47 @@ class NativeAdrenoVm final {
         }
         RB_GENERATE(Root,Mapping,address_link,compare)
     } addresses_;
+    struct PhysicalRange {
+        Mapping *mapping=nullptr;
+        uint64_t physical=0,end=0,subtree_end=0;
+        size_t offset=0;
+        RB_ENTRY(PhysicalRange) link;
+        void augment() {
+            subtree_end=end;
+            const PhysicalRange *left=RB_LEFT(this,link),*right=RB_RIGHT(this,link);
+            if(left && left->subtree_end>subtree_end) {
+                subtree_end=left->subtree_end;
+            }
+            if(right && right->subtree_end>subtree_end) {
+                subtree_end=right->subtree_end;
+            }
+        }
+    };
+    /* PhysicalTree contains each mapped span once. Augmented ends let a byte
+     * interval find overlapping mappings without scanning other BOs. */
+    struct PhysicalTree {
+        RB_HEAD(PhysicalRoot,PhysicalRange) root{};
+        void augment(PhysicalRange *range) {
+            while(range) {
+                range->augment();
+                range=PhysicalRoot_RB_GETPARENT(range);
+            }
+        }
+        static int compare(PhysicalRange *left,PhysicalRange *right) {
+            if(left->physical!=right->physical) {
+                return left->physical<right->physical?-1:1;
+            }
+            if(left==right) {
+                return 0;
+            }
+            return uintptr_t(left)<uintptr_t(right)?-1:1;
+        }
+#pragma push_macro("RB_AUGMENT")
+#undef RB_AUGMENT
+#define RB_AUGMENT(node) augment(node)
+        RB_GENERATE(PhysicalRoot,PhysicalRange,link,compare)
+#pragma pop_macro("RB_AUGMENT")
+    } physical_;
     Mapping *mappings_=nullptr;
     Mapping *first_=nullptr,*last_=nullptr;
     NativeAdrenoVmRegion regions_[2]{};
@@ -85,6 +132,8 @@ class NativeAdrenoVm final {
     void erase(Mapping *,unsigned);
     IOReturn preflight(const NativeAdrenoMemory *,unsigned,uint64_t,unsigned,unsigned,unsigned) const;
     bool activeAlias(const NativeAdrenoMemory *,uint64_t excluded) const;
+    bool visitPhysicalAliases(const PhysicalRange *,uint64_t,uint64_t,
+        bool (*)(void *,uint64_t,size_t,size_t),void *,uint64_t *) const;
 public:
     NativeAdrenoVm()=default;
     ~NativeAdrenoVm()=default;
@@ -107,7 +156,11 @@ public:
     IOReturn acquireResource(uint64_t handle,size_t offset,size_t bytes,unsigned access);
     bool resourceNeedsMaintenance(uint64_t handle) const;
     bool resourceImported(uint64_t handle) const;
-    bool resourcesAlias(uint64_t first,uint64_t second) const;
+    /* The callback receives each overlapping mapping and its BO-relative byte
+     * interval. A conflict or exhausted query budget returns Busy. The caller
+     * retries after active jobs retire; an empty queue needs no alias query. */
+    IOReturn visitResourceAliases(uint64_t handle,size_t offset,size_t bytes,size_t cache_line,
+        bool (*)(void *,uint64_t,size_t,size_t),void *,uint64_t *queries,uint64_t *hits) const;
     /* TLBIALL for the context bank plus TLBSYNC: drops every cached translation of the bank whatever its ASID. Unmap already
      * synchronizes by ASID; this is the stronger form the submit path uses before each submission (int-070: on sheng the CP read
      * zeros from an IB whose table entry and DRAM were both correct, after the address had been mapped to other pages before). */
