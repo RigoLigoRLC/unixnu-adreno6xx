@@ -336,11 +336,11 @@ IOReturn NativeAdrenoSubmit::attach(NativeAdrenoVm *vm,NativeAdrenoRing *ring)
 {
     if(attached_ || poisoned_ || vm_ || ring_)return kIOReturnBusy;
     if(!vm || !ring || vm->poisoned() || ring->poisoned())return kIOReturnBadArgument;
-    resource_storage_=IONewData(NativeAdrenoSubmitResource,SubmitMaxJobs*NativeAdrenoSubmitMaxResources);
+    resource_storage_=IONewData(NativeAdrenoSubmitResource,size_t(SubmitMaxJobs)*NativeAdrenoSubmitMaxResources);
     command_words_=IONewData(uint32_t,NativeAdrenoSubmitMaxIbs*4);
     if(!resource_storage_ || !command_words_) {
         if(resource_storage_) {
-            IODeleteData(resource_storage_,NativeAdrenoSubmitResource,SubmitMaxJobs*NativeAdrenoSubmitMaxResources);
+            IODeleteData(resource_storage_,NativeAdrenoSubmitResource,size_t(SubmitMaxJobs)*NativeAdrenoSubmitMaxResources);
             resource_storage_=nullptr;
         }
         if(command_words_) {
@@ -395,7 +395,7 @@ IOReturn NativeAdrenoSubmit::detach()
 {
     if(poisoned_ || outstanding())return kIOReturnBusy;
     if(!attached_)return kIOReturnNotReady;
-    IODeleteData(resource_storage_,NativeAdrenoSubmitResource,SubmitMaxJobs*NativeAdrenoSubmitMaxResources);
+    IODeleteData(resource_storage_,NativeAdrenoSubmitResource,size_t(SubmitMaxJobs)*NativeAdrenoSubmitMaxResources);
     IODeleteData(command_words_,uint32_t,NativeAdrenoSubmitMaxIbs*4);
     resource_storage_=nullptr;
     command_words_=nullptr;
