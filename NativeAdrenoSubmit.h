@@ -4,6 +4,7 @@
 #include "NativeAdrenoRing.h"
 #include "NativeAdrenoVm.h"
 #include "NativeAdrenoABI.h"
+#include "NativeAdrenoDisplay.h"
 
 struct NativeAdrenoSubmitBuffer {
     uint64_t handle;
@@ -100,6 +101,7 @@ public:
         uint32_t *fence);
     IOReturn submitResources(const NativeAdrenoSubmitBuffer *,size_t,
         const NativeAdrenoSubmitResource *,size_t,uint32_t queue,uint32_t fallback_reason,uint32_t *fence);
+    void captureSurfaceProfile(IOMemoryDescriptor *,uint32_t,uint64_t,NativeAdrenoSurfaceProfile *);
     bool queueOutstanding(uint32_t queue) const;
     /* Queues [first, first+count): whether any of their jobs is outstanding, and a wait for every one of them (oldest first) that
      * leaves other queues' jobs alone. Each client of the shared ring owns one such range. */

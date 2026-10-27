@@ -21,6 +21,7 @@
 #include <IOKit/IOBSD.h>
 #include <string.h>
 #include <kern/thread.h>
+#include <kern/clock.h>
 #include <mach/kmod.h>
 #include <pexpert/pexpert.h>
 #include "NativeAdrenoUserClient.h"
@@ -60,6 +61,8 @@ struct NativeAdrenoMetalDiag {
 extern "C" void native_adreno_profile_lock_wait(uint32_t method,uint64_t us);
 extern "C" void native_adreno_profile_set_client(const char *name);
 extern "C" void native_adreno_profile_dump(void);
+extern "C" void native_adreno_profile_set_continuous_clock(uint64_t (*)(void));
+extern "C" void native_legacy_frame_profile_dump(void) __attribute__((weak_import));
 extern "C" {volatile uint32_t native_adreno_view_diag[6],native_adreno_view_kept;}   /* kept: BoCpuUnmap calls that left the view for another lease */
 }
 
@@ -1697,6 +1700,13 @@ IOReturn NativeAdrenoGpuPublished::newUserClient(task_t owningTask,void *securit
     return native_adreno_new_user_client(this,owningTask,securityID,type,properties,handler,0);
 }
 
+static uint64_t profileContinuousMicroseconds()
+{
+    uint64_t nanoseconds = 0;
+    absolutetime_to_nanoseconds(mach_continuous_time(), &nanoseconds);
+    return nanoseconds / 1000;
+}
+
 /* Publishes the service once. Everything passed in must outlive the system (the board probe keeps them in statics) and
  * the VM, submit object and ring must already be attached to the live GPU context. The core must not be open. */
 extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit *submit,NativeAdrenoRing *ring,
@@ -1720,6 +1730,7 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
         return kIOReturnNoMemory;
     }
     g.vm=vm;g.submit=submit;g.ring=ring;g.clock=*clock;g.timer=timer;g.info=info;g.input_bits=input_bits;g.output_bits=output_bits;
+    native_adreno_profile_set_continuous_clock(profileContinuousMicroseconds);
     g.service=service;g.published=true;
     service->setName("NativeAdrenoGpu");
     service->registerService();
@@ -1910,6 +1921,9 @@ extern "C" void native_adreno_metal_dump_stats(void)
     }
     dumpBoProfiles();
     native_adreno_profile_dump();
+    if (native_legacy_frame_profile_dump) {
+        native_legacy_frame_profile_dump();
+    }
     IOLog("NativeAdrenoMetal: end\n");
 }
 
@@ -2015,6 +2029,27 @@ extern "C" IOReturn native_adreno_poll_surface_producer(uint32_t captured_fence)
     const IOReturn status=pollSurfaceProducerLocked(captured_fence);
     IOLockUnlock(g.lock);
     return status;
+}
+
+extern "C" IOReturn native_adreno_surface_profile_capture(IOMemoryDescriptor *memory,
+    uint32_t captured_fence, uint64_t composition_start_continuous_us,
+    NativeAdrenoSurfaceProfile *profile)
+{
+    if (!memory || !profile) {
+        return kIOReturnBadArgument;
+    }
+    *profile = {};
+    if (!g.published || !g.lock) {
+        return kIOReturnNotReady;
+    }
+    if (!IOLockTryLock(g.lock)) {
+        return kIOReturnTimeout;
+    }
+
+    g.submit->captureSurfaceProfile(memory, captured_fence,
+        composition_start_continuous_us, profile);
+    IOLockUnlock(g.lock);
+    return kIOReturnSuccess;
 }
 
 extern "C" IOReturn native_adreno_wait_surface_producer(uint32_t timeout_us,

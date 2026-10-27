@@ -2,6 +2,7 @@
 #include "NativeAdrenoSubmit.h"
 #include "AdrenoPM4.h"
 #include <IOKit/IOLib.h>
+#include <IOKit/IOMemoryDescriptor.h>
 
 /* CP_INDIRECT_BUFFER is opcode 0x3f with a 3-word payload: 64-bit GPU address
  * and IB_SIZE in dwords (bits 0..19), exactly as the pinned adreno_pm4.xml
@@ -57,6 +58,8 @@ struct ProfileSample {
     uint64_t importBytes;
     uint32_t aliasUs;
     uint64_t aliasQueries,aliasHits;
+    uint64_t continuousSubmitUs;
+    uint64_t continuousCompleteObservedUs;
 };
 static ProfileSample profileSamples[ProfileSamples];
 static uint32_t profileHead;
@@ -68,6 +71,154 @@ static uint64_t profileLatencyMax;
 static uint64_t profileLatencyBuckets[ProfileBuckets];
 static char profileClient[ProfileClientChars];
 static uint32_t profileLock;
+static uint64_t (*profileContinuousClock)(void);
+
+enum : unsigned {
+    ProfileSurfaceWrites = 4096,
+    ProfileSurfaceDescriptors = 32,
+    ProfileSurfaceBackings = 16,
+    ProfileReleasedWriters = 64,
+};
+
+/* SurfaceWrite records one submission's declared writes to one imported BO.
+ * Each BO links its own records through sequence numbers in the bounded ring.
+ * A sequence mismatch identifies overwritten history without a global scan. */
+struct SurfaceWrite {
+    uint64_t sequence = 0;
+    uint64_t previous = 0;
+    uint64_t handle = 0;
+    uint64_t submitUs = 0;
+    uint64_t ringUs = 0;
+    uint32_t fence = 0;
+    uint32_t submitSequence = 0;
+    uint32_t fallback = 0;
+};
+
+struct SurfaceWriter {
+    uint64_t handle = 0;
+    uint64_t firstPhysical = 0;
+    uint64_t bytes = 0;
+    uint64_t latestWrite = 0;
+};
+
+struct ReleasedSurfaceWriter {
+    uint64_t firstPhysical = 0;
+    uint64_t bytes = 0;
+    uint64_t releasedUs = 0;
+};
+
+/* SurfaceDescriptor retains an exactly matched source descriptor while its
+ * imported BOs remain mapped. Its generation handles keep repeated captures
+ * independent of unrelated BO allocation. New aliases of the same first
+ * physical byte and length require one additional complete extent comparison. */
+struct SurfaceDescriptor {
+    IOMemoryDescriptor *memory = nullptr;
+    uint64_t firstPhysical = 0;
+    uint64_t bytes = 0;
+    uint64_t used = 0;
+    uint64_t handles[ProfileSurfaceBackings]{};
+    uint32_t count = 0;
+    uint32_t flags = 0;
+    bool dirty = false;
+};
+
+static SurfaceWrite surfaceWrites[ProfileSurfaceWrites];
+static SurfaceWriter surfaceWriters[NativeAdrenoVmMaxObjects];
+static SurfaceDescriptor surfaceDescriptors[ProfileSurfaceDescriptors];
+static uint64_t surfaceWriteSequence;
+static uint64_t surfaceDescriptorSequence;
+static ReleasedSurfaceWriter releasedSurfaceWriters[ProfileReleasedWriters];
+static uint32_t releasedSurfaceWriterNext;
+static uint64_t releasedSurfaceHistoryExpiredUs;
+
+extern "C" void native_adreno_profile_set_continuous_clock(uint64_t (*clock)(void))
+{
+    profileContinuousClock = clock;
+}
+
+static uint64_t profileContinuousNow()
+{
+    return profileContinuousClock ? profileContinuousClock() : 0;
+}
+
+static void profileForgetBacking(uint64_t handle)
+{
+    const size_t slot = size_t(handle & (NativeAdrenoVmMaxObjects - 1));
+    if (surfaceWriters[slot].handle == handle) {
+        const SurfaceWriter &writer = surfaceWriters[slot];
+        ReleasedSurfaceWriter &released = releasedSurfaceWriters[releasedSurfaceWriterNext];
+        if (released.releasedUs > releasedSurfaceHistoryExpiredUs) {
+            releasedSurfaceHistoryExpiredUs = released.releasedUs;
+        }
+        released = {writer.firstPhysical, writer.bytes, profileContinuousNow()};
+        releasedSurfaceWriterNext = (releasedSurfaceWriterNext + 1) % ProfileReleasedWriters;
+        surfaceWriters[slot] = {};
+    }
+
+    for (SurfaceDescriptor &source : surfaceDescriptors) {
+        for (uint32_t at = 0; at < source.count; ++at) {
+            if (source.handles[at] != handle) {
+                continue;
+            }
+
+            source.handles[at] = source.handles[--source.count];
+            if (!source.count) {
+                source.memory->release();
+                source = {};
+            }
+            break;
+        }
+    }
+}
+
+static void profileNoteSurfaceWrites(NativeAdrenoVm *vm,
+    const NativeAdrenoSubmitResource *resources, size_t resourceCount,
+    const uint16_t *mappingResources, uint32_t fence, uint32_t submitSequence,
+    uint32_t fallback, uint64_t submitUs, uint64_t ringUs)
+{
+    for (size_t at = 0; at < resourceCount; ++at) {
+        const NativeAdrenoSubmitResource &resource = resources[at];
+        if (!resource.owns_reference) {
+            continue;
+        }
+
+        const NativeAdrenoMemory *backing = vm->resourceBacking(resource.handle);
+        if (!backing || !backing->imported() || !backing->spanCount()) {
+            continue;
+        }
+
+        const size_t slot = size_t(resource.handle & (NativeAdrenoVmMaxObjects - 1));
+        bool writes = false;
+        for (uint16_t item = mappingResources[slot]; item;) {
+            const NativeAdrenoSubmitResource &range = resources[item - 1];
+            writes |= (range.access & NativeAdrenoResourceWrite) != 0;
+            item = range.next_for_mapping;
+        }
+        if (!writes) {
+            continue;
+        }
+
+        SurfaceWriter &writer = surfaceWriters[slot];
+        if (writer.handle != resource.handle) {
+            writer = {};
+            writer.handle = resource.handle;
+            writer.firstPhysical = backing->spans()[0].physical;
+            writer.bytes = backing->bytes();
+            for (SurfaceDescriptor &source : surfaceDescriptors) {
+                if (source.memory && source.firstPhysical == writer.firstPhysical &&
+                    source.bytes == writer.bytes) {
+                    source.dirty = true;
+                }
+            }
+        }
+
+        const uint64_t sequence = ++surfaceWriteSequence;
+        SurfaceWrite &write = surfaceWrites[(sequence - 1) % ProfileSurfaceWrites];
+        write = {sequence, writer.latestWrite, resource.handle, submitUs, ringUs,
+            fence, submitSequence, fallback};
+        writer.latestWrite = sequence;
+    }
+}
 struct SubmitFailure {
     uint64_t sampled_us=0,handle=0,iova=0,bytes=0;
     uint32_t stage=0,status=0,index=0,ibs=0,resources=0;
@@ -170,10 +321,11 @@ extern "C" void native_adreno_profile_lock_wait(uint32_t method, uint64_t us)
         profileLeave();
     }
 }
-static void profileNoteSubmit(uint32_t fence, uint32_t ibCount,
+static uint32_t profileNoteSubmit(uint32_t fence, uint32_t ibCount,
     uint64_t t0, uint64_t t1, uint64_t t2, uint64_t t3, uint64_t t4, uint64_t t5,
     uint32_t resources=0,uint32_t imports=0,uint32_t fallback=0,uint64_t import_bytes=0,
-    uint32_t alias_us=0,uint64_t alias_queries=0,uint64_t alias_hits=0,uint32_t cache_us=UINT32_MAX)
+    uint32_t alias_us=0,uint64_t alias_queries=0,uint64_t alias_hits=0,uint32_t cache_us=UINT32_MAX,
+    uint64_t continuous_submit_us=0)
 {
     profileEnter();
     uint32_t intervalCalls[6] = {};
@@ -200,6 +352,8 @@ static void profileNoteSubmit(uint32_t fence, uint32_t ibCount,
     }
     sample.submitUs = t0;
     sample.completeUs = 0;
+    sample.continuousSubmitUs = continuous_submit_us;
+    sample.continuousCompleteObservedUs = 0;
     sample.latencyUs = 0;
     sample.retireUs = uint32_t(t1 - t0);
     sample.cacheUs = cache_us==UINT32_MAX?uint32_t(t2-t1):cache_us;
@@ -218,7 +372,9 @@ static void profileNoteSubmit(uint32_t fence, uint32_t ibCount,
     sample.allocUs = intervalUs[2];
     profileHead = (profileHead + 1) % ProfileSamples;
     profileSubmitted = profileSubmitted + 1;
+    const uint32_t sequence = sample.seq;
     profileLeave();
+    return sequence;
 }
 static void profileNoteComplete(uint32_t fence)
 {
@@ -226,6 +382,7 @@ static void profileNoteComplete(uint32_t fence)
         return;
     }
     const uint64_t now = profileNow();
+    const uint64_t continuousNow = profileContinuousNow();
     if (!now) {
         return;
     }
@@ -240,6 +397,7 @@ static void profileNoteComplete(uint32_t fence)
         }
         sample.complete = 1;
         sample.completeUs = now;
+        sample.continuousCompleteObservedUs = continuousNow;
         const uint64_t latency = now > sample.submitUs ? now - sample.submitUs : 0;
         sample.latencyUs = uint32_t(latency > 0xffffffffu ? 0xffffffffu : latency);
         profileCompleted = profileCompleted + 1;
@@ -253,6 +411,235 @@ static void profileNoteComplete(uint32_t fence)
         profileLatencyBuckets[bucket] = profileLatencyBuckets[bucket] + 1;
     }
     profileLeave();
+}
+
+static bool profileMatchSurface(IOMemoryDescriptor *source,
+    const NativeAdrenoMemory *backing, NativeAdrenoSurfaceProfile &result)
+{
+    if (!backing || !backing->imported() || backing->bytes() != source->getLength()) {
+        return false;
+    }
+
+    uint64_t offset = 0;
+    for (size_t at = 0; at < backing->spanCount(); ++at) {
+        const NativeAdrenoPhysicalSpan &span = backing->spans()[at];
+        if (span.offset != offset) {
+            return false;
+        }
+
+        uint64_t compared = 0;
+        while (compared < span.bytes) {
+            if (result.matchSegments == 65536) {
+                result.flags |= NativeAdrenoSurfaceProfileMatchLimit;
+                return false;
+            }
+            ++result.matchSegments;
+
+            IOByteCount available = 0;
+            const uint64_t physical = source->getPhysicalSegment(offset, &available, kIOMemoryMapperNone);
+            if (!physical || !available) {
+                result.flags |= NativeAdrenoSurfaceProfileSegmentsUnavailable;
+                return false;
+            }
+            if (physical != span.physical + compared) {
+                return false;
+            }
+
+            const uint64_t remaining = span.bytes - compared;
+            const uint64_t count = available < remaining ? available : remaining;
+            compared += count;
+            offset += count;
+        }
+    }
+    return offset == source->getLength();
+}
+
+void NativeAdrenoSubmit::captureSurfaceProfile(IOMemoryDescriptor *memory,
+    uint32_t capturedFence, uint64_t compositionStartUs, NativeAdrenoSurfaceProfile *output)
+{
+    NativeAdrenoSurfaceProfile &result = *output;
+    result = {};
+    result.compositionStartUs = compositionStartUs;
+    result.capturedFence = capturedFence;
+    result.capturedUs = profileContinuousNow();
+    if (!compositionStartUs) {
+        result.flags = NativeAdrenoSurfaceProfileMissingStart;
+        return;
+    }
+
+    SurfaceDescriptor *source = nullptr;
+    for (SurfaceDescriptor &candidate : surfaceDescriptors) {
+        if (candidate.memory == memory) {
+            source = &candidate;
+            break;
+        }
+    }
+
+    const uint64_t matchBegan = profileContinuousNow();
+    if (source && !source->dirty) {
+        result.matchCacheHit = 1;
+    } else {
+        if (!source) {
+            IOByteCount available = 0;
+            const uint64_t firstPhysical = memory->getPhysicalSegment(0, &available, kIOMemoryMapperNone);
+            if (!firstPhysical || !available) {
+                result.flags = NativeAdrenoSurfaceProfileSegmentsUnavailable |
+                    NativeAdrenoSurfaceProfileNoMatchingWrites;
+                return;
+            }
+
+            for (SurfaceDescriptor &candidate : surfaceDescriptors) {
+                if (!source || !candidate.memory || candidate.used < source->used) {
+                    source = &candidate;
+                }
+                if (!candidate.memory) {
+                    break;
+                }
+            }
+            if (source->memory) {
+                source->memory->release();
+            }
+            *source = {};
+            source->memory = memory;
+            source->memory->retain();
+            source->firstPhysical = firstPhysical;
+            source->bytes = memory->getLength();
+        }
+
+        source->dirty = false;
+        for (const SurfaceWriter &writer : surfaceWriters) {
+            if (!writer.handle || writer.firstPhysical != source->firstPhysical ||
+                writer.bytes != source->bytes) {
+                continue;
+            }
+
+            bool known = false;
+            for (uint32_t at = 0; at < source->count; ++at) {
+                known |= source->handles[at] == writer.handle;
+            }
+            if (known) {
+                continue;
+            }
+            if (source->count == ProfileSurfaceBackings) {
+                source->flags |= NativeAdrenoSurfaceProfileMatchLimit;
+                break;
+            }
+
+            const NativeAdrenoMemory *backing = vm_->resourceBacking(writer.handle);
+            if (profileMatchSurface(memory, backing, result)) {
+                source->handles[source->count++] = writer.handle;
+            }
+            if (result.flags & NativeAdrenoSurfaceProfileMatchLimit) {
+                source->flags |= NativeAdrenoSurfaceProfileMatchLimit;
+                break;
+            }
+        }
+    }
+    result.matchUs = profileContinuousNow() - matchBegan;
+    result.flags |= source->flags;
+    source->used = ++surfaceDescriptorSequence;
+    if (compositionStartUs <= releasedSurfaceHistoryExpiredUs) {
+        result.flags |= NativeAdrenoSurfaceProfileWriteHistoryExpired;
+    }
+    for (const ReleasedSurfaceWriter &released : releasedSurfaceWriters) {
+        if (released.releasedUs >= compositionStartUs &&
+            released.firstPhysical == source->firstPhysical && released.bytes == source->bytes) {
+            result.flags |= NativeAdrenoSurfaceProfileReleasedBacking;
+        }
+    }
+    if (!source->count) {
+        source->memory->release();
+        *source = {};
+        result.flags |= NativeAdrenoSurfaceProfileNoMatchingWrites;
+        return;
+    }
+
+    uint32_t seenFences[ProfileSamples]{};
+    uint32_t seenCount = 0;
+    uint32_t lastSubmitSequence = 0;
+    for (uint32_t backingAt = 0; backingAt < source->count; ++backingAt) {
+        const uint64_t handle = source->handles[backingAt];
+        const SurfaceWriter &writer = surfaceWriters[handle & (NativeAdrenoVmMaxObjects - 1)];
+        if (writer.handle != handle || !vm_->resourceBacking(handle)) {
+            result.flags |= NativeAdrenoSurfaceProfileReleasedBacking;
+            continue;
+        }
+
+        uint64_t sequence = writer.latestWrite;
+        for (unsigned visited = 0; sequence && visited < ProfileSurfaceWrites; ++visited) {
+            const SurfaceWrite &write = surfaceWrites[(sequence - 1) % ProfileSurfaceWrites];
+            if (write.sequence != sequence || write.handle != handle) {
+                result.flags |= NativeAdrenoSurfaceProfileWriteHistoryExpired;
+                break;
+            }
+            sequence = write.previous;
+            if (write.submitUs < compositionStartUs) {
+                break;
+            }
+            if (int32_t(write.fence - capturedFence) > 0) {
+                continue;
+            }
+
+            bool known = false;
+            for (uint32_t at = 0; at < seenCount; ++at) {
+                known |= seenFences[at] == write.fence;
+            }
+            if (known) {
+                continue;
+            }
+            if (seenCount == ProfileSamples) {
+                result.flags |= NativeAdrenoSurfaceProfileMatchLimit;
+                break;
+            }
+            seenFences[seenCount++] = write.fence;
+
+            ++result.submissions;
+            if (write.fallback) {
+                ++result.fallbackSubmissions;
+                result.flags |= NativeAdrenoSurfaceProfileFallbackAccess;
+            } else {
+                ++result.exactSubmissions;
+            }
+            if (!result.firstSubmitUs || write.submitUs < result.firstSubmitUs) {
+                result.firstSubmitUs = write.submitUs;
+            }
+            if (write.ringUs > result.lastSubmitUs) {
+                result.lastSubmitUs = write.ringUs;
+            }
+            if (!result.firstFence || int32_t(write.fence - result.firstFence) < 0) {
+                result.firstFence = write.fence;
+            }
+            if (!result.lastFence || int32_t(write.fence - result.lastFence) > 0) {
+                result.lastFence = write.fence;
+                lastSubmitSequence = write.submitSequence;
+            }
+
+            if (result.storedSubmissions < NativeAdrenoSurfaceProfileSubmissionCapacity) {
+                const uint32_t at = result.storedSubmissions++;
+                result.fences[at] = write.fence;
+                result.sequences[at] = write.submitSequence;
+            } else {
+                result.flags |= NativeAdrenoSurfaceProfileOutputTruncated;
+            }
+        }
+    }
+
+    if (!result.submissions) {
+        result.flags |= NativeAdrenoSurfaceProfileNoMatchingWrites;
+        return;
+    }
+
+    profileEnter();
+    const ProfileSample &last = profileSamples[(lastSubmitSequence - 1) % ProfileSamples];
+    if (last.seq != lastSubmitSequence || last.fence != result.lastFence) {
+        result.flags |= NativeAdrenoSurfaceProfileSubmitHistoryExpired;
+    } else if (last.complete) {
+        result.completeObservedUs = last.continuousCompleteObservedUs;
+    }
+    profileLeave();
+    if (!result.completeObservedUs) {
+        result.flags |= NativeAdrenoSurfaceProfileCompletionMissing;
+    }
 }
 /* Called by the gpu dump. Copy under the spinlock, then print without it. */
 extern "C" void native_adreno_profile_dump(void)
@@ -397,6 +784,13 @@ IOReturn NativeAdrenoSubmit::attach(NativeAdrenoVm *vm,NativeAdrenoRing *ring)
         return kIOReturnNoMemory;
     }
     vm_=vm;ring_=ring;attached_=true;stats_={};
+    memset(surfaceWriters,0,sizeof(surfaceWriters));
+    memset(surfaceWrites,0,sizeof(surfaceWrites));
+    memset(releasedSurfaceWriters,0,sizeof(releasedSurfaceWriters));
+    surfaceWriteSequence=0;
+    releasedSurfaceWriterNext=0;
+    releasedSurfaceHistoryExpiredUs=0;
+    vm_->setBackingReleaseObserver(profileForgetBacking);
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoSubmit::release(Job &job)
@@ -430,6 +824,13 @@ IOReturn NativeAdrenoSubmit::detach()
 {
     if(poisoned_ || outstanding())return kIOReturnBusy;
     if(!attached_)return kIOReturnNotReady;
+    vm_->setBackingReleaseObserver(nullptr);
+    for (SurfaceDescriptor &source : surfaceDescriptors) {
+        if (source.memory) {
+            source.memory->release();
+            source = {};
+        }
+    }
     IODeleteData(resource_storage_,NativeAdrenoSubmitResource,size_t(SubmitMaxJobs)*NativeAdrenoSubmitMaxResources);
     IODeleteData(mapping_resource_storage_,uint16_t,size_t(SubmitMaxJobs)*NativeAdrenoVmMaxObjects);
     mapping_resource_storage_=nullptr;
@@ -573,6 +974,7 @@ IOReturn NativeAdrenoSubmit::submitResources(const NativeAdrenoSubmitBuffer *buf
         return kIOReturnBadArgument;
     }
 
+    const uint64_t continuousBegan=profileContinuousNow();
     const uint64_t began=profileNow();
     IOReturn status=retireCompleted();
     const uint64_t retired=profileNow();
@@ -723,6 +1125,7 @@ IOReturn NativeAdrenoSubmit::submitResources(const NativeAdrenoSubmitBuffer *buf
     if(!status) {
         uint32_t value=0;
         status=ring_->submitFramed(command_words_,word_count,&value);
+        const uint64_t continuousPublished=profileContinuousNow();
         if(!status || ring_->poisoned()) {
             job->resources=held;
             job->resource_count=resource_count;
@@ -746,9 +1149,11 @@ IOReturn NativeAdrenoSubmit::submitResources(const NativeAdrenoSubmitBuffer *buf
             submitV2Counters[1]+=resource_count;
             submitV2Counters[2]+=fallback_reason!=0;
             profileLeave();
-            profileNoteSubmit(value,uint32_t(count),began,retired,retired,published,tlb,profileNow(),
+            const uint32_t submitSequence=profileNoteSubmit(value,uint32_t(count),began,retired,retired,published,tlb,profileNow(),
                 uint32_t(resource_count),import_count,fallback_reason,import_bytes,
-                alias_us,alias_queries,alias_hits,0);
+                alias_us,alias_queries,alias_hits,0,continuousBegan);
+            profileNoteSurfaceWrites(vm_,held,resource_count,mapping_resources,value,submitSequence,
+                fallback_reason,continuousBegan,continuousPublished);
             *fence=value;
             return kIOReturnSuccess;
         }

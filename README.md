@@ -29,6 +29,35 @@ transitions during allocation and release. BO allocation has no WC option.
 Imported Device or unrecognized page attributes are refused at import; RT pages
 are accepted as Normal NC only under the board's managed-RT boot policy.
 
+## Frame timing
+
+The existing `gpu` query also requests NativeMobileDisplay's bounded frame
+history. Display supplies the native composition-start timestamp and retains
+the IOSurface read fence through DPU scanout. GPU profiling matches the complete
+physical byte sequence of that prepared descriptor to imported BOs which declare
+write access, then selects their submissions between composition start and the
+captured shared-ring fence. The reported list names direct writers of the output
+surface. It does not assign intermediate render targets to the frame.
+
+Surface write records occupy a 4096-entry ring, with each BO linking its own
+records. Capture follows those links and returns up to 64 fence/sequence pairs.
+A 32-entry descriptor cache retains successful matches while their GPU BO
+generations remain mapped; the VM unmap callback releases the last matching
+descriptor reference. Repeated captures use those identities without another
+physical-page walk. New aliases invalidate only the matching source key.
+First-match work is bounded and reported by `matchCacheHit`, `matchSegments`
+and `matchUs`. No frame-path allocation, console output or CPU cache-line
+maintenance is added.
+
+Frame timestamps use continuous-clock microseconds, including the CPU's first
+observation that the last direct writer's GPU fence completed. That observation
+is an upper bound on GPU completion. The display's DPU timing supplies the
+presentation interval. Missing composition timestamps, overwritten history,
+released backing, conservative legacy resource access, missing completion and
+bounded match/list capacity are explicit profile flags. The global fence remains
+the readiness barrier; its full submission range is never reported as the
+surface's writer list.
+
 ## Board interface
 
 The device kit implements `native_adreno_a6xx_resources` from

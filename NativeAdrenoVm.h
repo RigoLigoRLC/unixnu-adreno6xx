@@ -150,6 +150,7 @@ class NativeAdrenoVm final {
     bool attached_=false,poisoned_=false;
     bool cached_coherent_imports_=false;
     bool map_busy_alias_=false,map_alias_limit_=false;
+    void (*backing_release_observer_)(uint64_t)=nullptr;
     NativeAdrenoVmResult result_{};
     ArmSmmu4KLiveRegion region(unsigned) const;
     ArmSmmu4KStatus observeEmptyTables() const;
@@ -187,6 +188,14 @@ public:
     IOReturn holdJob(uint64_t handle);
     bool resourceHasUncachedImport(uint64_t handle) const;
     bool resourceImported(uint64_t handle) const;
+    /* The borrowed backing remains valid while the service holds its GPU lock.
+     * Generation handles reject an unmapped or reused record. */
+    const NativeAdrenoMemory *resourceBacking(uint64_t handle) const;
+    /* The observer releases diagnostic descriptor references before a mapped
+     * backing loses its VM reference. The service serializes the callback. */
+    void setBackingReleaseObserver(void (*observer)(uint64_t)) {
+        backing_release_observer_=observer;
+    }
     /* The callback receives the same mapping and each static physical alias at
      * the translated BO interval. A conflict or exhausted query budget returns
      * Busy; the caller retries after active jobs retire. */

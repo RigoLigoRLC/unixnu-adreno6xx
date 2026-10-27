@@ -460,6 +460,9 @@ IOReturn NativeAdrenoVm::unmap(uint64_t handle)
     }
     native_adreno_trace_stage=14;
     clock.lap(1,4);
+    if(backing_release_observer_) {
+        backing_release_observer_(handle);
+    }
     if(record->memory->retireAfterQuiescence()!=kIOReturnSuccess)return fail(ArmSmmu4KStateMismatch);
     IODeleteData(record->ranges,ArmSmmu4KRange,spans);
     IODeleteData(record->physical_order,uint32_t,spans);
@@ -583,6 +586,12 @@ bool NativeAdrenoVm::resourceImported(uint64_t handle) const
 {
     const Mapping *record=find(handle);
     return record && record->memory->imported();
+}
+
+const NativeAdrenoMemory *NativeAdrenoVm::resourceBacking(uint64_t handle) const
+{
+    const Mapping *record=find(handle);
+    return record && record->mapped_spans==record->spans?record->memory:nullptr;
 }
 
 bool NativeAdrenoVm::collectPhysicalAliases(const PhysicalRange *range,uint64_t first,uint64_t end,
