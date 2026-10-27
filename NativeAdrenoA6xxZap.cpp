@@ -98,13 +98,7 @@ IOReturn NativeAdrenoA6xxZap::load(const NativeAdrenoA6xxWindow &window,void *re
     IOLog("NativeAdrenoZap: SCM convention=%u\n",convention_);
 
     const size_t metadataBytes=size_t((native_adreno_zap_metadata_image_size+4095)&~UINT64_C(4095));
-    IOReturn status=metadata_.allocate(metadataBytes,convention_==64?40:32,true,metadataBytes);
-    if(status) {
-        return status;
-    }
-    IOLog("NativeAdrenoZap: metadata noncacheable mapping begin bytes=%lx\n",metadataBytes);
-    status=metadata_.makeWriteCombined();
-    IOLog("NativeAdrenoZap: metadata noncacheable mapping completed status=%08x\n",status);
+    IOReturn status=metadata_.allocate(metadataBytes,convention_==64?40:32,true,metadataBytes,false,false,true);
     if(status) {
         return status;
     }

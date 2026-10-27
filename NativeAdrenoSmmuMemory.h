@@ -16,7 +16,8 @@
 IOReturn NativeAdrenoPrepareSmmuMemory(NativeAdrenoMemory *,unsigned input_bits,
     unsigned output_bits,uint64_t iova,uint64_t bytes,unsigned upper_region,
     size_t leaf_budget,ArmSmmu4KLiveArena *,ArmSmmu4KLiveState *,ArmSmmu4KLiveVisibility *);
-/* Bind only the native PoC publisher to an already retained contiguous table
- * allocation. No caller-supplied success callback or page-table copy. */
+/* The visibility callback orders stores to the retained WB table allocation.
+ * GPU and GMU SMMU contexts walk these tables coherently with Outer Shareable
+ * WB attributes. */
 IOReturn NativeAdrenoBindSmmuVisibility(NativeAdrenoMemory *,ArmSmmu4KLiveVisibility *);
 #endif

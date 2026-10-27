@@ -32,13 +32,7 @@ IOReturn NativeAdrenoGmuAllocator::allocate(const NativeAdrenoGmuSizes &sizes,un
         IOLog("NativeAdrenoGmuMemory: allocate iova=%llx bytes=%llx tables=%u\n",
             selection.at,selection.bytes,selection.memory==&tables_);
         IOReturn status=selection.memory->allocate(static_cast<size_t>(selection.bytes),
-            address_bits,true,static_cast<size_t>(selection.bytes));
-        if(!status && selection.memory!=&tables_) {
-            IOLog("NativeAdrenoGmuMemory: CPU cache conversion begin iova=%llx bytes=%llx\n",
-                selection.at,selection.bytes);
-            status=selection.memory->makeWriteCombined();
-            IOLog("NativeAdrenoGmuMemory: CPU cache conversion end iova=%llx status=%08x\n",selection.at,status);
-        }
+            address_bits,true,static_cast<size_t>(selection.bytes),false,false,selection.memory!=&tables_);
         if(status) {
             (void)releaseAll();
             return status;

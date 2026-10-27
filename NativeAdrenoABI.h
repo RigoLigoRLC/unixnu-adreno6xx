@@ -120,18 +120,21 @@ struct NativeAdrenoAbiBoProfile {
         NativeAdrenoAbiBoCacheBudget budget;
     } data;
 };
+enum {
+    NativeAdrenoBoAllocContiguous = 1
+};
 struct NativeAdrenoAbiBoAlloc {
     uint64_t bytes;               /* 4KiB multiple, <= max_bo_bytes */
     uint32_t align_log2;          /* 12..24 */
-    uint32_t contiguous;          /* 1 requires one raw physical span */
+    uint32_t allocation_flags;    /* NativeAdrenoBoAlloc flags; zero uses CPU WB and coherent GPU access. */
 };
 struct NativeAdrenoAbiBoAllocReply {
     uint64_t handle;              /* opaque to userspace, nonzero */
 };
 /* NativeAdrenoAbiBoImport pins the calling task's pages until BoFree while
- * preserving its CPU mapping and cache mode. A kernel advertising
- * NativeAdrenoSubmitKernelCacheMaintenance publishes the submitted import
- * ranges before GPU use and acquires GPU writes before reporting completion.
+ * preserving its CPU mapping and cache mode. Hardware-coherent submission
+ * uses cached GPU mappings for cached CPU pages and uncached GPU mappings for
+ * Normal uncached CPU pages, with ordering before submission and completion.
  * Producers finish CPU writes before submit and resume access after completion.
  * An imported BO has no CPU-map token. */
 struct NativeAdrenoAbiBoImport {
@@ -142,7 +145,7 @@ struct NativeAdrenoAbiBoMap {
     uint64_t handle;
     uint64_t iova;                /* 4KiB aligned, inside the mounted aperture */
     uint32_t permissions;         /* bit0 read, bit1 write; read required */
-    uint32_t writeback;           /* 0 normal non-coherent, 1 WB/WA */
+    uint32_t writeback;           /* 0 selects backing attributes, 1 requires cached coherent backing. */
     uint32_t shareability;        /* 2 outer, 3 inner */
     uint32_t reserved;            /* zero */
 };
@@ -181,6 +184,7 @@ enum {
     NativeAdrenoSubmitMaxResources = 4096,
     NativeAdrenoSubmitKernelCacheMaintenance = 1,
     NativeAdrenoSubmitCachedCoherentImports = 2,
+    NativeAdrenoSubmitHardwareCoherent = 4,
     NativeAdrenoSubmitAllMapped = 1,
     NativeAdrenoResourceRead = 1,
     NativeAdrenoResourceWrite = 2,

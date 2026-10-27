@@ -40,8 +40,10 @@ before the VM retires its memory reference.
 The original SMMU entry points remain available to callers supplying complete
 range lists. The BO path uses the incremental entry point. Its recurring work
 depends on the BO being mapped, with no periodic scan of the full aperture.
-The submission path retains its existing context TLB invalidation and cache
-maintenance policy.
+The GPU and GMU contexts enable coherent Outer Shareable table walks. Table
+publication uses a store barrier. Each data leaf takes the cached or Normal NC
+policy recorded for its physical span. Submissions retain GPU cache commands,
+fences and ordering barriers without CPU clean/invalidate passes.
 
 ## Backing allocation reuse
 
@@ -50,13 +52,27 @@ address, physical spans and cache attributes. NativeAdrenoMemory can transfer
 ordinary user storage into a cache after all device references and CPU views
 have been released. Imports, reserved-pool extents and quarantined objects are
 excluded. Matching requires exact bytes, physical address width and physical
-contiguity policy. Reuse reasserts WC attributes and clears the entire object
-before exposing it to a new owner.
+contiguity and CPU cache policy. Ordinary owned BOs retain CPU WB mappings and
+coherent GPU WB/WA mappings. Reuse clears the entire object before exposing it
+to a new owner while retaining the prepared descriptor and cache attributes.
 
 The cache holds at most 64 allocations and 64 MiB, with a 16 MiB per-object
 limit. Low available memory, allocation failure and client close drain it.
 Failed teardown retains the affected storage in quarantine. The reserved
-contiguous pool keeps its existing ownership and cache policy.
+contiguous pool uses CPU WB mappings.
+
+Imports query each pinned page's pmap attribute once. COPYBACK, INNERWBACK and
+WTHRU pages use coherent GPU WB/WA leaves; WCOMB uses Normal NC leaves. Managed
+RT pages use Normal NC only when `t733-managed-rt-normal=1`, matching the board's
+XNU page mapping policy. Adjacent physical pages with the same GPU policy form
+one span, so a mixed cached/NC import needs no submission-time attribute query.
+The page owner preserves its CPU cache attributes until GPU unmap. Device and
+unrecognized attributes return Unsupported from import instead of selecting a
+software cache-maintenance path.
+
+The existing active-job alias exclusion remains for imported NC/mixed ranges.
+Coherent resources bypass those overlap queries. Job references are released
+after the GPU fence and CPU ordering barrier.
 
 ## Measurements
 
@@ -68,9 +84,10 @@ synchronization and new leaf checks. These phase totals count successful
 transactions. Existing method counters also count failures.
 
 The memory-stage rows report allocation, prepare, physical-span discovery,
-zeroing, initial cleaning, attribute setup/reassertion/restoration, complete
-and descriptor release. Backing-cache rows report hits, misses, retained bytes,
-evictions, pressure drains and pages whose attributes required restoration.
+zeroing, complete and descriptor release. The diagnostic layout retains four
+zero-valued rows for removed cache maintenance and attribute operations.
+Backing-cache rows report hits, misses, retained bytes, evictions and pressure
+drains.
 All values accumulate in bounded memory; ordinary BO operations print no rows.
 
 ## Implementation references

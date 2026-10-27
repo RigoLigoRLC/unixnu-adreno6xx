@@ -2,7 +2,8 @@
 #include "NativeAdrenoUserClient.h"
 extern "C" volatile uint32_t native_adreno_trace_stage;
 /* 0 keeps user BOs cacheable and maintained before every submission (int-070..097); the board sets it from the sheng-gpu-wc boot argument. */
-extern "C" {volatile uint32_t native_adreno_wc_enabled=1;}
+/* The board diagnostic ABI retains its inactive WC control field. */
+extern "C" {volatile uint32_t native_adreno_wc_enabled;}
 /* BoImport record: [0] calls, [1] refused, [2..5] last refusal (status, stage, bytes, address), [6..9] first refusal. Stages 1..3 are this file's
  * checks, 10..19 NativeAdrenoMemory::importTask's. */
 extern "C" {volatile uint64_t native_adreno_import_diag[10];}
@@ -259,20 +260,15 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
     if(!open_)return kIOReturnNotReady;
     const uint64_t limit=UINT64_C(1)<<NativeAdrenoAbiMaxBoBytesShift;
     if(!request->bytes || (request->bytes&4095) || request->bytes>limit ||
-        request->align_log2<12 || request->align_log2>24 || request->contiguous>1)
+        request->align_log2<12 || request->align_log2>24 ||
+        (request->allocation_flags&~uint32_t(NativeAdrenoBoAllocContiguous)))
         return kIOReturnBadArgument;
     Entry *entry=takeEntry();
     if(!entry)return kIOReturnNoResources;
     /* The GPU VM maps scattered pages into the caller's contiguous IOVA range.
      * Physical contiguity is requested only when the ABI caller requires it. */
     IOReturn status = entry->memory.allocate(static_cast<size_t>(request->bytes), output_bits_,
-        request->contiguous != 0, static_cast<size_t>(request->bytes), true, native_adreno_wc_enabled!=0);
-    /* User BOs are write-combined for the CPU, as the GPU maps them non-cacheable: no per-submission cache maintenance.
-     * int-147 kept them cacheable under IO coherence and mapped the GPU side write-back: the first Turnip IB executed zeros and the GPU hung
-     * (the kernel's cacheable alias read zeros past the first line too). Turnip maps every BO asking kIOMapWriteCombineCache, the user's
-     * cache bits replace the kernel's (IOUserClient::mapClientMemory64), and XNU's view machinery changes the page attribute to match, so
-     * the aliases disagreed. A coherent own BO needs a client that asks for a write-back view. */
-    if(!status && native_adreno_wc_enabled)status=entry->memory.makeWriteCombined();
+        (request->allocation_flags&NativeAdrenoBoAllocContiguous)!=0,static_cast<size_t>(request->bytes),true,true);
     if(status) {
         /* A failed allocation can leave quarantine behind; never reuse it. */
         if(entry->memory.release()!=kIOReturnSuccess) {
@@ -356,7 +352,7 @@ IOReturn NativeAdrenoUserClient::mapBo(const NativeAdrenoAbiBoMap *request,
     }
     const uint64_t mapBegan=native_adreno_vm_now_us?native_adreno_vm_now_us():0;
     const IOReturn status=vm_->map(&entry->memory,0,request->iova,permissions,
-        coherent?1u:0u,2u,&handle);
+        0u,2u,&handle);
     if(mapBegan && native_adreno_vm_now_us) {
         const uint64_t mapEnded=native_adreno_vm_now_us();
         const uint64_t pages=(entry->memory.bytes()+4095)/4096;
@@ -470,7 +466,7 @@ IOReturn NativeAdrenoUserClient::submitCaps(NativeAdrenoAbiSubmitCaps *reply)
     }
     *reply={NativeAdrenoSubmitVersion,NativeAdrenoSubmitMaxPacketBytes,
         NativeAdrenoSubmitMaxIbs,NativeAdrenoSubmitMaxResources,
-        NativeAdrenoSubmitKernelCacheMaintenance,0,status_?status_->suspends()+1:1};
+        NativeAdrenoSubmitHardwareCoherent,0,status_?status_->suspends()+1:1};
     if(vm_->cachedCoherentImports()) {
         reply->flags|=NativeAdrenoSubmitCachedCoherentImports;
     }
@@ -937,10 +933,9 @@ IOReturn NativeAdrenoUserClient::cpuMap(const NativeAdrenoAbiBoCpuMap *request,
     if(!entry || entry->unreleasable)return kIOReturnBadArgument;
     /* An imported BO is the caller's own memory, already mapped where it came from. */
     if(entry->memory.imported())return kIOReturnUnsupported;
-    if(controlled && !entry->memory.descriptorWriteCombined())return kIOReturnUnsupported;
+    if(controlled && !entry->memory.descriptor())return kIOReturnUnsupported;
     uint32_t &leases=controlled?entry->controlled_mapping_leases:entry->mapping_leases;
     if(leases==UINT32_MAX)return kIOReturnNoResources;
-    if(!controlled)entry->memory.allowLegacyCpuView();
     ++leases;
     reply->token=entry->token;reply->bytes=entry->memory.bytes();
     return kIOReturnSuccess;

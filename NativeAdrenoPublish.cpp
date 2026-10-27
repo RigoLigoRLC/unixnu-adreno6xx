@@ -858,7 +858,7 @@ IOReturn AGXDeviceUserClient::mapCpu(const NativeAdrenoAbiBoCpuMapV2 &request,
     IOMemoryDescriptor *descriptor=backing?backing->descriptor():nullptr;
     IOMemoryMap *map=nullptr;
     if(descriptor && request.address<=UINT64_MAX-lease.bytes) {
-        /* Default cache flags preserve the WC mode stored in the memory entry.
+        /* Default cache flags preserve the allocation's mode in its memory entry.
          * A unique map gives each returned ID an independent unmap lifetime. */
         const IOOptionBits options=kIOMapUnique|(request.address?0:kIOMapAnywhere);
         map=descriptor->createMappingInTask(current_task(),request.address,options,0,lease.bytes);
@@ -1083,17 +1083,16 @@ IOReturn AGXDeviceUserClient::legacyMemoryForType(UInt32 type,IOOptionBits *opti
     if(!views_)views_=IONewZero(View,MaxViews);
     if(!views_) {IOLockUnlock(g.lock);return kIOReturnNoMemory;}
     for(size_t i=0;i<MaxViews;++i)if(views_[i].descriptor && views_[i].token==type) {
-        views_[i].descriptor->retain();*memory=views_[i].descriptor;*options=kIOMapAnywhere|kIOMapInhibitCache;
+        views_[i].descriptor->retain();*memory=views_[i].descriptor;*options=kIOMapAnywhere;
         native_adreno_view_diag[2]=native_adreno_view_diag[2]+1;
         IOLockUnlock(g.lock);
         return kIOReturnSuccess;
     }
     NativeAdrenoMemory *backing=live_?core_->memoryForToken(type):nullptr;
     if(backing) {
-        /* The descriptor describes the BO's physical spans without owning their
-         * allocation. XNU replaces the user-option bits below with the caller's
-         * map flags; Turnip supplies kIOMapWriteCombineCache for these RAM pages.
-         * dropViews removes every tracked user mapping before the BO releases them. */
+        /* The descriptor describes the BO's physical spans. The caller requests
+         * the allocation's cache mode; dropViews removes each mapping before
+         * the BO releases its pages. */
         /* A BO's pages can come scattered, one span per page (a 64 MiB BO is 16384 of them): the descriptor takes them all, as many as the GPU's
          * own table accepts. A fixed 64-entry array made every scattered BO above 256 KiB fail to map (VK_ERROR_MEMORY_MAP_FAILED, int-084),
          * only when memory happened to be fragmented. The descriptor copies the ranges. */
@@ -1118,7 +1117,7 @@ IOReturn AGXDeviceUserClient::legacyMemoryForType(UInt32 type,IOOptionBits *opti
                         status=kIOReturnNoResources;
                     } else {
                         *memory=descriptor;
-                        *options=kIOMapAnywhere|kIOMapInhibitCache;
+                        *options=kIOMapAnywhere|(backing->writeCombined()?kIOMapWriteCombineCache:kIOMapCopybackCache);
                         native_adreno_view_diag[1]=native_adreno_view_diag[1]+1;
                         status=kIOReturnSuccess;
                     }

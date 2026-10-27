@@ -5,7 +5,6 @@
 
 extern "C" volatile uint32_t native_adreno_pool_mib;
 extern "C" volatile uint32_t native_adreno_pool_stats[8],native_adreno_pool_status;
-extern "C" volatile uint32_t native_adreno_wc_enabled,native_adreno_pool_wc;
 static const uint64_t kIovas[GpuBufferCount]={GpuSqeIova,GpuRingIova,GpuMemptrsIova,GpuPwrupIova,GpuScratchIova};
 static const size_t kBytes[GpuBufferCount]={GpuSqeBytes,GpuRingBytes,GpuPageBytes,GpuPageBytes,GpuPageBytes};
 IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,const unsigned slots[2],
@@ -59,8 +58,6 @@ IOReturn NativeAdrenoGpuContext::initialize(const ArmSmmu4KIo *io,unsigned bank,
             native_adreno_pool_stats[0]=pooled==kIOReturnSuccess?mib:0;native_adreno_pool_status=(uint32_t)pooled;
             if(pooled==kIOReturnSuccess)break;
         }
-        /* Not fatal: without it each pooled BO changes its pages' attribute itself, as a scattered one does. */
-        if(native_adreno_wc_enabled && NativeAdrenoMemory::poolBytes())native_adreno_pool_wc=(uint32_t)NativeAdrenoMemory::writeCombinePool()|1u<<31;
     }
     if(!status) {
         report->allocation_bytes=TablePages*0x1000;
@@ -72,11 +69,6 @@ IOReturn NativeAdrenoGpuContext::initialize(const ArmSmmu4KIo *io,unsigned bank,
         report->allocation_bytes=kBytes[i];
         IOLog("NativeAdrenoGpuMemory: allocate index=%u iova=%llx bytes=%lx\n",i,kIovas[i],kBytes[i]);
         status=buffers_[i].allocate(kBytes[i],report->output_bits,true,kBytes[i]);
-        if(!status) {
-            IOLog("NativeAdrenoGpuMemory: CPU cache conversion begin index=%u\n",i);
-            status=buffers_[i].makeWriteCombined();
-            IOLog("NativeAdrenoGpuMemory: CPU cache conversion end index=%u status=%08x\n",i,status);
-        }
         report->allocation_status=status;
     }
     if(!status) {
@@ -114,6 +106,9 @@ IOReturn NativeAdrenoGpuContext::initialize(const ArmSmmu4KIo *io,unsigned bank,
         step(VmAttach);
         NativeAdrenoVmRegion lower={&tables_,smmu_.arenaHandle(),smmu_.stateHandle()};
         status=vm_.attach(io,smmu_.configHandle(),smmu_.streamsHandle(),&lower,nullptr,NativeAdrenoVmMaxObjects,262144);
+        if(!status) {
+            status=vm_.enableCachedCoherentImports(0x06030500);
+        }
     }
     if(!status) {
         step(Map);

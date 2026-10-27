@@ -6,41 +6,24 @@
 #include <stdint.h>
 class IOBufferMemoryDescriptor;
 class IOMemoryDescriptor;
-struct NativeAdrenoPhysicalSpan {uint64_t offset,physical,bytes;};
+struct NativeAdrenoPhysicalSpan {
+    uint64_t offset,physical,bytes;
+    unsigned writeback=1; // CPU cached pages use coherent GPU WB; Normal NC pages use GPU NC.
+};
 struct NativeAdrenoCpuState {
     uint64_t tcr,ttbr0,ttbr1,sctlr;
     uint64_t kernel_page_bytes,kernel_map_page_bytes;
 };
 IOReturn NativeAdrenoQueryCpu4K(NativeAdrenoCpuState *);
-/* The native-adreno-cache-trace boot argument enables per-BO and per-span cache logs. */
-bool NativeAdrenoCacheTraceEnabled();
-enum NativeAdrenoCacheOperation {NativeAdrenoClean,NativeAdrenoCleanInvalidate,NativeAdrenoInvalidate};
-size_t NativeAdrenoCpuCacheLineBytes();
-/* The byte interval is expanded only to intersecting CPU cache lines. The
- * caller excludes conflicting CPU and GPU access to those complete lines. */
-IOReturn NativeAdrenoMaintainOwnedPages(void *,size_t,NativeAdrenoCacheOperation);
-/* The same over whole physical pages of DRAM, through the kernel's physical aperture: data cache lines are physically tagged, so this
- * reaches lines another task's mapping left (an imported IOSurface). Apple's sys_dcache_flush is only a DSB, so user space cannot. */
-IOReturn NativeAdrenoMaintainPhysicalPages(uint64_t physical,size_t bytes,NativeAdrenoCacheOperation);
-/* The exact byte interval is maintained across ordered physical spans. Each
- * intersecting cache line is included, with at most 64 pages per preemption hold. */
-IOReturn NativeAdrenoMaintainPhysicalSpans(const NativeAdrenoPhysicalSpan *,size_t count,size_t offset,size_t bytes,
-    NativeAdrenoCacheOperation);
 enum class NativeAdrenoCpuCacheMode : unsigned {
     Unknown,
-    WriteBack,
-    NonWriteBack,
+    Cached,
+    NormalUncached,
     Mixed
 };
-/* The pinned physical pages supply their existing pmap cache attributes.
- * GPU users preserve the allocation's CPU cache mode until GPU unmap. */
-NativeAdrenoCpuCacheMode NativeAdrenoQueryPagesCacheMode(const NativeAdrenoPhysicalSpan *,size_t count);
-/* Every CPU mapping of the spans' pages becomes write-combined (true) or takes the default cacheable attribute again (false). */
-IOReturn NativeAdrenoSetPagesCacheMode(const NativeAdrenoPhysicalSpan *,size_t count,bool write_combined);
-/* int-100 found a write-combined BO's page back at the default (cacheable) attribute with dirty IB lines: XNU's view machinery sets a page's
- * attribute when it populates or tears down a device-pager view. Every page of the spans no longer write-combined is made so again (the pmap
- * then rewrites every mapping it tracks and writes the page's cache lines back); *reset counts them. */
-IOReturn NativeAdrenoReassertWriteCombined(const NativeAdrenoPhysicalSpan *,size_t count,uint32_t *reset);
+/* The pinned page supplies its actual pmap cache attributes. Import records
+ * adjacent pages with the same GPU cache policy in one physical span. */
+NativeAdrenoCpuCacheMode NativeAdrenoQueryPageCacheMode(uint64_t physical);
 
 enum : unsigned {
     NativeAdrenoMemorySizeBucketCount=18,
@@ -87,7 +70,7 @@ enum NativeAdrenoMemoryDiagnosticFlags : uint32_t {
 
 /* NativeAdrenoMemoryBucketStats counts accepted allocation requests whose CPU
  * page configuration was available. A lookup has one hit or one miss reason;
- * bypassed requests did not ask to reuse write-combined backing. */
+ * bypassed requests did not ask to reuse backing storage. */
 struct NativeAdrenoMemoryBucketStats {
     uint64_t upper_bound_bytes=0; // Zero denotes sizes above the preceding bucket.
     uint64_t requests=0,bytes=0,lookups=0,hits=0,misses=0,bypassed=0;
@@ -139,7 +122,6 @@ struct NativeAdrenoBackingStorage {
     size_t bytes=0,span_count=0,span_capacity=0;
     unsigned output_bits=0;
     bool contiguous=false,prepared=false,quarantined=false,write_combined=false;
-    bool descriptor_write_combined=false;   /* The persistent memory entry was created with WC. */
     NativeAdrenoMemorySource diagnostic_source=NativeAdrenoMemorySource::Unknown;
     NativeAdrenoMemoryCacheResult diagnostic_cache_result=NativeAdrenoMemoryCacheResult::NotRequested;
 };
@@ -154,11 +136,9 @@ class NativeAdrenoMemory final {
     IOMemoryDescriptor *imported_=nullptr;
     bool read_only_=false;
     NativeAdrenoCpuCacheMode cpu_cache_mode_=NativeAdrenoCpuCacheMode::Unknown;
-    bool controlled_cpu_views_=true;   /* A legacy physical view requires submit-time page repair. */
     uint32_t device_references_=0;
     bool pooled_=false;
     size_t pool_offset_=0;
-    IOReturn maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation);
 public:
     NativeAdrenoMemory()=default;
     ~NativeAdrenoMemory()=default;
@@ -169,15 +149,14 @@ public:
      * Caller always keeps this object and checks quarantined(), even on error.
      * CPU native4K state and kernel page ABI are checked before allocation.
      * prepare(), raw unmapped physical segments, span/PA bounds and optional
-     * physical contiguity are verified before zeroing/PoC publication. */
-    /* `pooled`: take the bytes from the BO pool when one is reserved and has room. Only user BOs do: the pool is write-combined for
-     * the CPU (writeCombinePool), and the kernel's own objects (SMMU tables, ring, fence and firmware pages) are walked or read by the
-     * CPU through their cacheable mapping (int-153: page tables from the write-combined pool made each map's table update 2.6x slower). */
+     * physical contiguity are checked before zeroing the allocation. */
+    /* User BOs may use the WB pool and reuse matching prepared storage.
+     * The write_combined argument is reserved for uncached device firmware. */
     IOReturn allocate(size_t bytes,unsigned output_bits,bool contiguous,size_t byte_budget,bool pooled=false,
-        bool reuse_write_combined=false);
+        bool reuse_backing=false,bool write_combined=false);
     /* The cache owns at most 64 allocations and 64 MiB. Matching allocations
-     * retain their prepared descriptors, spans and write-combined attributes;
-     * allocate() reasserts the attributes and clears every byte before reuse.
+     * retain their prepared descriptors, spans and CPU cache attributes;
+     * allocate() clears every byte before reuse.
      * Allocation failure and low available memory drain it. Client close also
      * drains it; failed teardown stays owned and quarantined in the cache. */
     static IOReturn trimBackingCache(NativeAdrenoBackingTrimReason reason=NativeAdrenoBackingTrimReason::ClientClose);
@@ -190,9 +169,6 @@ public:
      * allocate(..., pooled=true) uses the pool when one is reserved and has room, else the scattered path. Only the board calls this. */
     static IOReturn reservePool(unsigned output_bits,size_t bytes);
     static size_t poolBytes();
-    /* The whole pool write-combined once, for good: a pooled BO then takes no page-attribute change on allocation or release.
-     * Board only, after reservePool, when user BOs are write-combined. */
-    static IOReturn writeCombinePool();
     /* importTask pins the task's pages, records their existing CPU cache mode,
      * and checks spans and PA bounds as for allocate. The owner preserves that
      * allocation cache mode until GPU unmap; prepare() pins pages without
@@ -200,42 +176,23 @@ public:
     IOReturn importTask(void *task,uint64_t address,size_t bytes,unsigned output_bits,size_t byte_budget);
     bool imported() const {return imported_!=nullptr;}
     NativeAdrenoCpuCacheMode cpuCacheMode() const {return cpu_cache_mode_;}
-    bool cpuCacheCoherent() const {return cpu_cache_mode_==NativeAdrenoCpuCacheMode::WriteBack;}
+    bool cpuCacheCoherent() const {return cpu_cache_mode_==NativeAdrenoCpuCacheMode::Cached;}
     /* An import of memory the owner maps read-only (the kernel could pin it for reading only): the GPU may read it, never write it. */
     bool readOnly() const {return read_only_;}
-    /* After allocate(), before any device or client mapping: cleans and invalidates the pages and makes every CPU mapping of them
-     * write-combined. Cached storage already has this attribute. */
-    IOReturn makeWriteCombined();
     bool writeCombined() const {return storage_.write_combined;}
-    bool descriptorWriteCombined() const {return storage_.descriptor_write_combined;}
-    void allowLegacyCpuView() {controlled_cpu_views_=false;}
-    /* Legacy physical views can change scattered pages' attributes. Controlled
-     * views share the allocation's persistent WC memory entry, so their map and
-     * unmap operations preserve the cache mode without walking physical pages. */
-    IOReturn reassertWriteCombined(uint32_t *reset) const
-    {
-        return storage_.write_combined && storage_.span_count && !pooled_ &&
-            (!storage_.descriptor_write_combined || !controlled_cpu_views_)?
-            NativeAdrenoReassertWriteCombined(storage_.spans,storage_.span_count,reset):kIOReturnSuccess;
-    }
     bool backed() const {return storage_.descriptor || imported_ || pooled_;}
     /* cache_backing requires the caller to have removed every CPU mapping.
-     * A prepared, write-combined owned allocation can then enter the cache if
+     * A prepared owned allocation can then enter the cache if
      * device references are zero. Imports and quarantined storage cannot enter. */
     IOReturn release(bool cache_backing=false);
     IOReturn holdForDevice();
     IOReturn retireAfterQuiescence();
     void quarantine() {storage_.quarantined=true;}
-    /* Publication cleans CPU-written cache lines to PoC before GPU access.
-     * The caller retains the memory and excludes CPU stores to every complete
-     * cache line intersecting the interval until GPU completion and acquisition.
-     * A trusted WC allocation needs only a store barrier; include_write_combined
-     * also cleans its physical pages when a client has a cacheable view. */
-    IOReturn publishForDevice(size_t offset,size_t bytes,bool include_write_combined=false);
-    /* A submitted range was cleaned before its completed GPU job, so acquisition
-     * invalidates its intersecting lines. A legacy whole-import sweep also
-     * cleans because it can include CPU-written bytes outside that job's ranges. */
-    IOReturn acquireDeviceWrites(size_t offset,size_t bytes,bool submitted_range=false);
+    /* The device's coherent WB or Normal NC mapping observes CPU stores after
+     * publication. The caller excludes conflicting accesses until its fence. */
+    IOReturn publishForDevice(size_t offset,size_t bytes);
+    /* The caller observes the device fence before ordering subsequent CPU reads. */
+    IOReturn acquireDeviceWrites(size_t offset,size_t bytes);
     bool quarantined() const {return storage_.quarantined;}
     uint32_t deviceReferences() const {return device_references_;}
     size_t bytes() const {return storage_.bytes;}

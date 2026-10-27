@@ -18,17 +18,13 @@
   `build/adreno6xx/libAdreno6xx.a`; `bash scripts/build.sh TAG` in the device
   repository runs the complete build. Keep dependent compilation and packaging
   under the coordinating build owner.
-- Current delivery: `51o` completed build and FAT deployment; hardware results
-  are pending. Ordinary BOs now honor contiguous=0 directly; do not probe a
-  contiguous allocation first. In 51n2 that extra 64 MiB allocation repeatedly
-  scanned about one million pages before falling back. The build also runs
-  producer callbacks on their workloop thread, avoids CPU waits for already
-  submitted same-connection ring dependencies, and acquires imported memory
-  once per completed retirement batch. Single-fence waits retain acquisition.
-  DPU retains the original IOSurfaceFence until scanout replacement. Cache
-  operations cover the same ranges in batches of at most 64 pages; normal
-  per-page logs require native-adreno-cache-trace=1. Evidence: workspace
-  [GPU implementation](../../../../notes/GPU_IMPLEMENTATION.md).
+- Ordinary BOs use CPU WB and coherent GPU mappings, including reusable
+  allocations. Honor contiguous=0 directly. Imported page attributes are
+  recorded once and preserved until unmap; mixed WB/NC pages receive matching
+  GPU leaves. Submission and completion use barriers with no CPU cache-line
+  maintenance. GPU cache commands, fences and retained mapping lifetimes remain.
+  GMU payloads and ZAP metadata use direct NC allocations for their firmware
+  interfaces. See [BO memory management](BO_MEMORY_MANAGEMENT.md).
 - removeMappingForDescriptor returns a retained IOMemoryMap. Explicitly unmap
   and release that reference before releasing the BO's physical allocation;
   retain the backing memory if teardown fails. IOUserClient locking covers map

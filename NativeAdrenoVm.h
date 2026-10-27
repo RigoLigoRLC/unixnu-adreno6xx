@@ -56,7 +56,6 @@ class NativeAdrenoVm final {
         uint64_t handle=0,iova=0;
         size_t spans=0,mapped_spans=0;
         unsigned permissions=0,writeback=0,shareability=0,jobs=0;
-        bool io_coherent=false;
         size_t next_free=0;
         RB_ENTRY(Mapping) address_link;
         Mapping *previous=nullptr,*next=nullptr;
@@ -145,10 +144,10 @@ class NativeAdrenoVm final {
     size_t reserved_objects_=0;
     uint32_t clients_=0;
     uint64_t budget_generation_=1;
-    size_t class_objects_[16]{};
+    size_t class_objects_[32]{};
     unsigned budget_=0;
     uint64_t next_handle_=1;
-    bool attached_=false,poisoned_=false,distrust_write_combined_=false;
+    bool attached_=false,poisoned_=false;
     bool cached_coherent_imports_=false;
     bool map_busy_alias_=false,map_alias_limit_=false;
     NativeAdrenoVmResult result_{};
@@ -177,8 +176,8 @@ public:
     /* Frees CPU metadata only, with no BOs remaining. Never releases roots,
      * disables a bank or returns the platform lease; board lifecycle owns it. */
     IOReturn detach();
-    /* The initialized A642L platform permits cached imports to use coherent
-     * SMMU mappings. Each backing supplies its CPU cache qualification. */
+    /* A642L permits coherent cached mappings. Each backing records its CPU
+     * page attributes before the VM installs the corresponding GPU leaves. */
     IOReturn enableCachedCoherentImports(uint32_t chip_id);
     bool cachedCoherentImports() const {return cached_coherent_imports_;}
     IOReturn findAddress(unsigned upper,size_t bytes,uint64_t alignment,uint64_t *iova) const;
@@ -186,11 +185,7 @@ public:
         unsigned permissions,unsigned writeback,unsigned shareability,uint64_t *handle);
     IOReturn unmap(uint64_t handle);
     IOReturn holdJob(uint64_t handle);
-    /* A retained mapping stays installed until every job releases it. These
-     * operations maintain only the caller's submitted BO range. */
-    IOReturn publishResource(uint64_t handle,size_t offset,size_t bytes,unsigned access);
-    IOReturn acquireResource(uint64_t handle,size_t offset,size_t bytes,unsigned access);
-    bool resourceNeedsMaintenance(uint64_t handle) const;
+    bool resourceHasUncachedImport(uint64_t handle) const;
     bool resourceImported(uint64_t handle) const;
     /* The callback receives the same mapping and each static physical alias at
      * the translated BO interval. A conflict or exhausted query budget returns
@@ -201,29 +196,9 @@ public:
      * synchronizes by ASID; this is the stronger form the submit path uses before each submission (int-070: on sheng the CP read
      * zeros from an IB whose table entry and DRAM were both correct, after the address had been mapped to other pages before). */
     IOReturn invalidateTlb();
-    /* The legacy submission path cleans every mapped BO before GPU access.
-     * Imported BOs are cleaned through their physical pages, including lines
-     * dirtied through a user mapping. Completion acquires GPU-written imports. */
-    IOReturn publishMapped();
-    /* The submit path saw a CPU-cached word that DRAM did not hold yet in a client's BO: from now on write-combined BOs are maintained
-     * like any other (sticky; the safe behaviour of int-070..097). */
-    void distrustWriteCombined() {distrust_write_combined_=true;}
-    bool writeCombinedTrusted() const {return !distrust_write_combined_;}
-    /* After a submission completed: cleans and invalidates the CPU caches over every GPU-writable imported BO, so the owner's mapping
-     * (an IOSurface) reads what the GPU wrote, not a line prefetched while the GPU ran. Jobs name only their IBs, so every such BO
-     * is covered. int-071: an imported render target read back 672 of 4096 texels stale. */
-    IOReturn acquireImported();
     /* Diagnostic, never a proof of coherence: the 32-bit word at a mapped GPU address as the kernel's cacheable alias reads it
      * and, when the board installed native_adreno_dram_read32, as DRAM reads it through an uncached mapping (else ~0). */
     IOReturn sampleWord(uint64_t iova,uint32_t *cached,uint32_t *dram) const;
-    /* Every line of [iova, iova+bytes) that lies in a write-combined BO, through native_adreno_line_audit: *dirty counts lines a CPU
-     * cache held newer than DRAM (a client view that caches after all; each such line is written back by the audit), *stale clean
-     * copies, *lines the lines compared. kIOReturnUnsupported without a board hook. int-099 sampled one word and wrote its line back
-     * before reading DRAM, so it could never see a dirty line. */
-    /* Before a submission while write-combined BOs are trusted: every page of every mapped write-combined BO that XNU set back to the
-     * default attribute is write-combined again (and its lines written back); *reset counts the pages. */
-    IOReturn reassertWriteCombined(uint32_t *reset) const;
-    IOReturn auditRange(uint64_t iova,size_t bytes,uint32_t *lines,uint32_t *dirty,uint32_t *stale) const;
     /* Read-only description of a live mapping; never pins or extends it. */
     IOReturn describe(uint64_t handle,uint64_t *iova,size_t *bytes,unsigned *permissions) const;
     /* Up to `count` dwords of a mapped kernel-owned BO at a GPU address (through the kernel's own mapping), for the board log. */

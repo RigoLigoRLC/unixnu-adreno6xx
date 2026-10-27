@@ -12,12 +12,12 @@ struct NativeAdrenoSubmitBuffer {
 };
 /* NativeAdrenoSubmitResource names one exact BO range used by a job. Separate
  * ranges of one mapping remain separate; one of them owns the mapping's job
- * reference until every range has completed its cache acquisition. */
+ * reference until the GPU fence completes. */
 struct NativeAdrenoSubmitResource {
     uint64_t handle=0;
     size_t offset=0,bytes=0;
     unsigned access=0;
-    bool maintenance=false;
+    bool check_overlap=false;
     bool owns_reference=false;
     uint16_t next_for_mapping=0; /* One-based index of another interval of this mapping. */
 };
@@ -37,11 +37,8 @@ struct NativeAdrenoSubmitResourceFailure {
 extern "C" void native_adreno_submit_failure(uint32_t stage,uint32_t status,uint64_t handle,
     uint64_t iova,uint32_t index,uint32_t ibs,uint32_t resources,uint64_t bytes=0,
     const NativeAdrenoSubmitResourceFailure *resource=nullptr);
-/* Coherence samples (int-070): [0] submissions sampled; [1..3] the last one's first IB word through the kernel's cacheable alias,
- * through DRAM before and through DRAM after the CPU cache maintenance of every mapped BO (~0 when unreadable); [4] samples whose
- * three values differ and [5..7] the first such sample. */
+/* The board diagnostic ABI retains these zero-valued counters. */
 extern "C" volatile uint32_t native_adreno_coherence[8];
-/* The write-combine audit (int-100), see NativeAdrenoSubmit.cpp, and the submission (1-based) that ended the trust; 0 = never. */
 extern "C" volatile uint32_t native_adreno_wc_audit[6];
 extern "C" volatile uint32_t native_adreno_wc_distrusted;
 struct NativeAdrenoSubmitStats {
@@ -49,10 +46,9 @@ struct NativeAdrenoSubmitStats {
     size_t references_held,references_retired,peak_jobs;
 };
 /* NativeAdrenoSubmit owns eight jobs on the shared ring. A resource submission
- * retains every supplied mapping, publishes its used CPU ranges, and emits all
- * IB packets with one final fence. Cached aliases remain unavailable to a
- * conflicting job until the preceding GPU job completes and its CPU cache
- * acquisition finishes. WC memory shares one barrier for the whole submission.
+ * retains every supplied mapping and emits all IB packets with one final
+ * fence. Conflicting aliases wait for the preceding GPU fence. CPU stores and
+ * completed GPU writes use ordering barriers and hardware coherence.
  *
  * The IOKit service serializes calls and retries Busy outside its device lock.
  * A poisoned ring retains every job reference until hardware recovery proves
@@ -67,7 +63,7 @@ class NativeAdrenoSubmit final {
         bool active=false;
         NativeAdrenoSubmitResource *resources=nullptr;
         size_t resource_count=0;
-        size_t maintenance_count=0; /* Resources needing CPU maintenance occupy the first entries. */
+        size_t overlap_count=0; // Imported ranges checked for conflicting active jobs occupy the first entries.
         uint16_t *mapping_resources=nullptr;
         size_t cache_line=0;
     } jobs_[8];
@@ -75,7 +71,7 @@ class NativeAdrenoSubmit final {
         const NativeAdrenoSubmitResource *resources;
         const uint16_t *mapping_resources;
         size_t cache_line;
-        bool writes,skip_maintenance;
+        bool writes,skip_checked;
     };
     NativeAdrenoSubmitResource *resource_storage_=nullptr;
     uint16_t *mapping_resource_storage_=nullptr;
@@ -84,10 +80,9 @@ class NativeAdrenoSubmit final {
     NativeAdrenoRing *ring_=nullptr;
     NativeAdrenoSubmitStats stats_{};
     bool attached_=false,poisoned_=false;
-    uint32_t audit_tick_=0;   /* submissions since attach; every eighth one audits its IB lines */
     Job *find(uint32_t fence);
     Job *free();
-    IOReturn release(Job &, bool acquire_imported = true);
+    IOReturn release(Job &);
     IOReturn poison();
     static bool resourceConflict(void *,uint64_t,size_t,size_t);
 public:
@@ -110,8 +105,8 @@ public:
      * leaves other queues' jobs alone. Each client of the shared ring owns one such range. */
     bool rangeOutstanding(uint32_t first,uint32_t count) const;
     IOReturn waitRange(uint32_t first,uint32_t count,const NativeAdrenoRingClock *,uint32_t timeout_us);
-    /* Completed jobs are collected without waiting. Each job's written ranges are acquired before
-     * its mapping references and slot are retired. The caller serializes submissions, VM changes and retirement. */
+    /* Completed jobs release their mapping references after the fence read and
+     * CPU barrier. The caller serializes submissions, VM changes and retirement. */
     IOReturn retireCompleted();
     /* Waits for every outstanding job in submission order and retires its references. */
     IOReturn waitAll(const NativeAdrenoRingClock *,uint32_t timeout_us);

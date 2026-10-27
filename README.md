@@ -15,6 +15,20 @@ BO ownership, the GPU address tree, incremental page-table updates, reusable
 backing allocations and USB timing counters are described in
 [BO memory management](BO_MEMORY_MANAGEMENT.md).
 
+Ordinary BO allocations, the command ring, fences, SQE firmware and scratch
+memory use CPU write-back mappings and coherent GPU WB/WA mappings. Imports
+retain their CPU attributes: pinned cached pages use GPU WB/WA; Normal NC
+pages use GPU NC. Physical spans split where that policy changes. GPU and GMU
+SMMU tables use CPU WB and coherent Outer Shareable table walks. Submission,
+completion and table publication use ordering barriers without CPU cache-line
+clean or invalidate operations. GPU cache commands and fences remain intact.
+
+GMU payload/HFI buffers and ZAP SCM metadata are allocated directly with Normal
+NC CPU mappings for their firmware interfaces. XNU owns their cache-attribute
+transitions during allocation and release. BO allocation has no WC option.
+Imported Device or unrecognized page attributes are refused at import; RT pages
+are accepted as Normal NC only under the board's managed-RT boot policy.
+
 ## Board interface
 
 The device kit implements `native_adreno_a6xx_resources` from

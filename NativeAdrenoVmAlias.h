@@ -50,5 +50,22 @@ public:
         while(lo<hi) {size_t mid=lo+(hi-lo)/2;if(end(order_[mid])<=physical)lo=mid+1;else hi=mid;}
         return lo<count_ && ranges_[order_[lo]].physical<physical+bytes;
     }
+    bool conflictingCache(uint64_t physical,uint64_t bytes,unsigned writeback) const {
+        size_t lo=0,hi=count_;
+        while(lo<hi) {
+            const size_t mid=lo+(hi-lo)/2;
+            if(end(order_[mid])<=physical) {
+                lo=mid+1;
+            } else {
+                hi=mid;
+            }
+        }
+        for(size_t at=lo;at<count_ && ranges_[order_[at]].physical<physical+bytes;++at) {
+            if(ranges_[order_[at]].writeback!=writeback) {
+                return true;
+            }
+        }
+        return false;
+    }
 };
 #endif
