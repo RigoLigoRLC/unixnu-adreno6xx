@@ -540,12 +540,56 @@ IOReturn NativeAdrenoUserClient::submitV2(const void *input,size_t input_size,Na
         uint64_t iova=0;
         size_t bytes=0;
         unsigned permissions=0;
-        if(!entry || !entry->mapped_state || entry->unreleasable || resource.reserved ||
-            !resource.access || (resource.access&~3u) || !resource.bytes ||
-            vm_->describe(entry->mapped,&iova,&bytes,&permissions) || (resource.access&~permissions) ||
-            resource.offset>bytes || resource.bytes>bytes-resource.offset) {
+        IOReturn described=kIOReturnNotReady;
+        bool vm_queried=false;
+        NativeAdrenoResourceReject reason=NativeAdrenoResourceReject::None;
+        if(!entry) {
+            reason=NativeAdrenoResourceReject::HandleMissing;
+        } else if(!entry->mapped_state) {
+            reason=NativeAdrenoResourceReject::HandleUnmapped;
+        } else if(entry->unreleasable) {
+            reason=NativeAdrenoResourceReject::HandleUnreleasable;
+        } else if(resource.reserved || !resource.access || (resource.access&~3u)) {
+            reason=NativeAdrenoResourceReject::AccessFormat;
+        } else {
+            described=vm_->describe(entry->mapped,&iova,&bytes,&permissions);
+            vm_queried=true;
+            if(described) {
+                reason=NativeAdrenoResourceReject::VmDescribe;
+            } else if(resource.access&~permissions) {
+                reason=NativeAdrenoResourceReject::Permissions;
+            } else if(!resource.bytes || resource.offset>bytes || resource.bytes>bytes-resource.offset) {
+                reason=NativeAdrenoResourceReject::Range;
+            }
+        }
+        if(reason!=NativeAdrenoResourceReject::None) {
+            NativeAdrenoSubmitResourceFailure failure;
+            failure.reason=reason;
+            failure.access=resource.access;
+            failure.reserved=resource.reserved;
+            const uint64_t slot=resource.handle&HandleIndexMask;
+            const Entry *slot_entry=entries_ && slot && slot<=entry_count_?&entries_[slot-1]:nullptr;
+            if(slot_entry) {
+                failure.slot_present=1;
+                failure.used=slot_entry->used;
+                failure.mapped=slot_entry->mapped_state;
+                failure.unreleasable=slot_entry->unreleasable;
+                failure.entry_handle=slot_entry->handle;
+                failure.mapped_handle=slot_entry->mapped;
+                failure.memory_bytes=slot_entry->memory.bytes();
+                failure.read_only=slot_entry->memory.readOnly();
+            }
+            if(!vm_queried && entry && entry->mapped_state) {
+                described=vm_->describe(entry->mapped,&iova,&bytes,&permissions);
+                vm_queried=true;
+            }
+            failure.vm_queried=vm_queried;
+            failure.vm_status=described;
+            failure.permissions=permissions;
+            failure.vm_iova=iova;
+            failure.vm_bytes=bytes;
             native_adreno_submit_failure(2,kIOReturnBadArgument,resource.handle,resource.offset,at,
-                header.ib_count,header.resource_count,resource.bytes);
+                header.ib_count,header.resource_count,resource.bytes,&failure);
             return kIOReturnBadArgument;
         }
 

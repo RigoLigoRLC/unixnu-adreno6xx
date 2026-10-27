@@ -20,8 +20,22 @@ struct NativeAdrenoSubmitResource {
     bool maintenance=false;
     bool owns_reference=false;
 };
+enum class NativeAdrenoResourceReject : uint32_t {
+    None,HandleMissing,HandleUnmapped,HandleUnreleasable,AccessFormat,VmDescribe,Permissions,Range
+};
+/* NativeAdrenoSubmitResourceFailure retains the request and mapping state at
+ * a rejected resource. The profile keeps only the first stage 2 snapshot. */
+struct NativeAdrenoSubmitResourceFailure {
+    NativeAdrenoResourceReject reason=NativeAdrenoResourceReject::None;
+    uint32_t access=0,reserved=0;
+    uint32_t slot_present=0,used=0,mapped=0,unreleasable=0;
+    uint64_t entry_handle=0,mapped_handle=0,memory_bytes=0;
+    uint32_t read_only=0,vm_queried=0,vm_status=0,permissions=0;
+    uint64_t vm_iova=0,vm_bytes=0;
+};
 extern "C" void native_adreno_submit_failure(uint32_t stage,uint32_t status,uint64_t handle,
-    uint64_t iova,uint32_t index,uint32_t ibs,uint32_t resources,uint64_t bytes=0);
+    uint64_t iova,uint32_t index,uint32_t ibs,uint32_t resources,uint64_t bytes=0,
+    const NativeAdrenoSubmitResourceFailure *resource=nullptr);
 /* Coherence samples (int-070): [0] submissions sampled; [1..3] the last one's first IB word through the kernel's cacheable alias,
  * through DRAM before and through DRAM after the CPU cache maintenance of every mapped BO (~0 when unreadable); [4] samples whose
  * three values differ and [5..7] the first such sample. */

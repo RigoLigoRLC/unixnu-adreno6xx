@@ -74,8 +74,10 @@ struct SubmitFailure {
     uint64_t sampled_us=0,handle=0,iova=0,bytes=0;
     uint32_t stage=0,status=0,index=0,ibs=0,resources=0;
     char client[ProfileClientChars]{};
+    NativeAdrenoSubmitResourceFailure resource{};
 };
 static SubmitFailure firstSubmitFailure;
+static SubmitFailure firstResourceFailure;
 static uint64_t submitV2Counters[8]{}; /* Calls, resources, fallback, clean bytes, acquire bytes, busy, completed, failures. */
 /* Per-submission interval deltas of the ABI method totals, so the dump can
  * show the BO work between two submissions without sampling the clock. */
@@ -101,21 +103,33 @@ static void profileLeave()
     __atomic_clear(&profileLock, __ATOMIC_RELEASE);
 }
 extern "C" void native_adreno_submit_failure(uint32_t stage,uint32_t status,uint64_t handle,
-    uint64_t iova,uint32_t index,uint32_t ibs,uint32_t resources,uint64_t bytes)
+    uint64_t iova,uint32_t index,uint32_t ibs,uint32_t resources,uint64_t bytes,
+    const NativeAdrenoSubmitResourceFailure *resource)
 {
     profileEnter();
     ++submitV2Counters[7];
-    if(!firstSubmitFailure.stage) {
-        firstSubmitFailure.sampled_us=profileNow();
-        firstSubmitFailure.handle=handle;
-        firstSubmitFailure.iova=iova;
-        firstSubmitFailure.bytes=bytes;
-        firstSubmitFailure.stage=stage;
-        firstSubmitFailure.status=status;
-        firstSubmitFailure.index=index;
-        firstSubmitFailure.ibs=ibs;
-        firstSubmitFailure.resources=resources;
-        memcpy(firstSubmitFailure.client,profileClient,sizeof(profileClient));
+    const bool first_resource=stage==2 && resource && !firstResourceFailure.stage;
+    if(!firstSubmitFailure.stage || first_resource) {
+        SubmitFailure failure;
+        failure.sampled_us=profileNow();
+        failure.handle=handle;
+        failure.iova=iova;
+        failure.bytes=bytes;
+        failure.stage=stage;
+        failure.status=status;
+        failure.index=index;
+        failure.ibs=ibs;
+        failure.resources=resources;
+        memcpy(failure.client,profileClient,sizeof(profileClient));
+        if(resource) {
+            failure.resource=*resource;
+        }
+        if(!firstSubmitFailure.stage) {
+            firstSubmitFailure=failure;
+        }
+        if(first_resource) {
+            firstResourceFailure=failure;
+        }
     }
     profileLeave();
 }
@@ -250,10 +264,11 @@ extern "C" void native_adreno_profile_dump(void)
     static uint32_t lockCalls[NativeAdrenoMethodGetResourceBudget+1];
     static uint64_t lockUs[NativeAdrenoMethodGetResourceBudget+1];
     static uint64_t lockMax[NativeAdrenoMethodGetResourceBudget+1];
-    SubmitFailure failure;
+    SubmitFailure failure,resource_failure;
     uint64_t v2[8];
     profileEnter();
     failure=firstSubmitFailure;
+    resource_failure=firstResourceFailure;
     memcpy(v2,submitV2Counters,sizeof(v2));
     submitted = profileSubmitted;
     completed = profileCompleted;
@@ -282,6 +297,24 @@ extern "C" void native_adreno_profile_dump(void)
         IOLog("NativeAdrenoProfile: first_failure client=%s stage=%u status=%08x index=%u ib=%u resources=%u t=%llu handle=%llx iova=%llx bytes=%llu\n",
             failure.client,failure.stage,failure.status,failure.index,failure.ibs,failure.resources,
             failure.sampled_us,failure.handle,failure.iova,failure.bytes);
+    }
+    if(resource_failure.stage) {
+        const auto &resource=resource_failure.resource;
+        static const char *const reasons[]={"none","handle_missing","not_mapped","unreleasable",
+            "access_format","vm_query","permissions","range"};
+        const unsigned reason=static_cast<unsigned>(resource.reason);
+        IOLog("NativeAdrenoProfile: resource_failure client=%s index=%u reason=%s t=%llu handle=%llx\n",
+            resource_failure.client,resource_failure.index,
+            reason<sizeof(reasons)/sizeof(reasons[0])?reasons[reason]:"unknown",
+            resource_failure.sampled_us,resource_failure.handle);
+        IOLog("NativeAdrenoProfile: resource_request access=%x reserved=%x offset=%llx bytes=%llu\n",
+            resource.access,resource.reserved,resource_failure.iova,resource_failure.bytes);
+        IOLog("NativeAdrenoProfile: resource_entry slot_present=%u used=%u mapped=%u unreleasable=%u handle=%llx\n",
+            resource.slot_present,resource.used,resource.mapped,resource.unreleasable,resource.entry_handle);
+        IOLog("NativeAdrenoProfile: resource_memory mapped_handle=%llx bytes=%llu read_only=%u\n",
+            resource.mapped_handle,resource.memory_bytes,resource.read_only);
+        IOLog("NativeAdrenoProfile: resource_vm queried=%u status=%08x permissions=%x iova=%llx bytes=%llu\n",
+            resource.vm_queried,resource.vm_status,resource.permissions,resource.vm_iova,resource.vm_bytes);
     }
     IOLog("NativeAdrenoProfile: summary submitted=%u completed=%u lat_total=%llu lat_max=%llu buckets=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
         submitted, completed, (unsigned long long)latencyTotal, (unsigned long long)latencyMax,
