@@ -305,14 +305,16 @@ extern "C" void native_adreno_profile_dump(void)
         if (!sample.seq) {
             continue;
         }
-        IOLog("NativeAdrenoProfile: S seq=%u fence=%u client=%s ib=%u complete=%u t=%llu c=%llu lat=%u submit_cpu=%u retire=%u cache=%u publish=%u tlb=%u ring=%u map=%u/%llu free=%u/%llu alloc=%u/%llu resources=%u imports=%u import_bytes=%llu fallback=%u\n",
+        IOLog("NativeAdrenoProfile: S seq=%u fence=%u client=%s ib=%u complete=%u t=%llu c=%llu lat=%u submit_cpu=%u retire=%u cache=%u publish=%u tlb=%u ring=%u map=%u/%llu free=%u/%llu alloc=%u/%llu\n",
             sample.seq, sample.fence, sample.client, sample.ibCount, sample.complete,
             (unsigned long long)sample.submitUs, (unsigned long long)sample.completeUs,
             sample.latencyUs, sample.submitCpuUs, sample.retireUs, sample.cacheUs,
             sample.publishUs, sample.tlbUs, sample.ringUs,
             sample.mapCalls, (unsigned long long)sample.mapUs,
             sample.freeCalls, (unsigned long long)sample.freeUs,
-            sample.allocCalls, (unsigned long long)sample.allocUs,
+            sample.allocCalls, (unsigned long long)sample.allocUs);
+        IOLog("NativeAdrenoProfile: R seq=%u fence=%u resources=%u imports=%u import_bytes=%llu fallback=%u\n",
+            sample.seq,sample.fence,
             sample.resourceCount,sample.importCount,(unsigned long long)sample.importBytes,sample.fallbackReason);
     }
 }
