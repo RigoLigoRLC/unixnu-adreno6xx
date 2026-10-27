@@ -6,16 +6,66 @@ extern "C" {int (*native_adreno_dram_read32)(uint64_t,uint32_t *);int (*native_a
     int (*native_adreno_line_audit)(uint64_t,size_t,uint32_t *,uint32_t *);}
 #include <string.h>
 #include <IOKit/IOLib.h>
-/* 1 once the board proved the GPU's cacheable inner-shareable accesses coherent with the CPU's caches in both directions (the A740's
- * ADRENO_QUIRK_HAS_CACHED_COHERENT behind the dma-coherent GPU SMMU, which Linux maps with IOMMU_CACHE): a mapping with write-back
- * attributes then needs no CPU cache maintenance. 0 keeps every mapping maintained as before. Counters: maintenance passes skipped for
- * coherent mappings at map, unmap, submission and completion. */
-extern "C" {volatile uint32_t native_adreno_io_coherent;volatile uint32_t native_adreno_coherent_skips[4];}
-static bool coherentMapping(unsigned writeback) {return writeback && native_adreno_io_coherent;}
-/* GPU-written imports (render targets) are mapped non-coherent (the GPU stopped inside its end-of-pass clean writing them through
- * write-back mappings), and the CPU never touches their pixels while the GPU owns them: they were cleaned when mapped and need no
- * maintenance per submission, which cost about 60 ms per frame. */
-static bool importedUntouched(const NativeAdrenoMemory *memory) {return memory->imported() && native_adreno_io_coherent;}
+namespace {
+struct CoherenceStats {
+    uint64_t maps=0,mapped_bytes=0,live_maps=0,live_bytes=0;
+    uint64_t clean_skipped_bytes=0,acquire_skipped_bytes=0;
+    uint64_t fallback_owned=0,fallback_platform=0,fallback_unknown=0;
+    uint64_t fallback_non_writeback=0,fallback_mixed=0;
+};
+CoherenceStats coherence_stats;
+
+void coherentPublish(size_t bytes)
+{
+    __asm__ volatile("dsb st" ::: "memory");
+    __atomic_fetch_add(&coherence_stats.clean_skipped_bytes,bytes,__ATOMIC_RELAXED);
+}
+
+void coherentAcquire(size_t bytes)
+{
+    __asm__ volatile("dsb sy" ::: "memory");
+    __atomic_fetch_add(&coherence_stats.acquire_skipped_bytes,bytes,__ATOMIC_RELAXED);
+}
+
+void noteCoherenceMap(const NativeAdrenoMemory &memory,bool coherent,bool platform)
+{
+    if(coherent) {
+        __atomic_fetch_add(&coherence_stats.maps,1,__ATOMIC_RELAXED);
+        __atomic_fetch_add(&coherence_stats.mapped_bytes,memory.bytes(),__ATOMIC_RELAXED);
+        __atomic_fetch_add(&coherence_stats.live_maps,1,__ATOMIC_RELAXED);
+        __atomic_fetch_add(&coherence_stats.live_bytes,memory.bytes(),__ATOMIC_RELAXED);
+        return;
+    }
+    uint64_t *reason=&coherence_stats.fallback_unknown;
+    if(!memory.imported()) {
+        reason=&coherence_stats.fallback_owned;
+    } else if(!platform) {
+        reason=&coherence_stats.fallback_platform;
+    } else if(memory.cpuCacheMode()==NativeAdrenoCpuCacheMode::NonWriteBack) {
+        reason=&coherence_stats.fallback_non_writeback;
+    } else if(memory.cpuCacheMode()==NativeAdrenoCpuCacheMode::Mixed) {
+        reason=&coherence_stats.fallback_mixed;
+    }
+    __atomic_fetch_add(reason,1,__ATOMIC_RELAXED);
+}
+}
+
+extern "C" void native_adreno_coherence_profile_dump(void)
+{
+    IOLog("NativeAdrenoProfile: coherence maps=%llu mapped_bytes=%llu live_maps=%llu live_bytes=%llu clean_skipped_bytes=%llu acquire_skipped_bytes=%llu\n",
+        __atomic_load_n(&coherence_stats.maps,__ATOMIC_RELAXED),
+        __atomic_load_n(&coherence_stats.mapped_bytes,__ATOMIC_RELAXED),
+        __atomic_load_n(&coherence_stats.live_maps,__ATOMIC_RELAXED),
+        __atomic_load_n(&coherence_stats.live_bytes,__ATOMIC_RELAXED),
+        __atomic_load_n(&coherence_stats.clean_skipped_bytes,__ATOMIC_RELAXED),
+        __atomic_load_n(&coherence_stats.acquire_skipped_bytes,__ATOMIC_RELAXED));
+    IOLog("NativeAdrenoProfile: coherence_fallback owned=%llu platform=%llu unknown=%llu non_writeback=%llu mixed=%llu\n",
+        __atomic_load_n(&coherence_stats.fallback_owned,__ATOMIC_RELAXED),
+        __atomic_load_n(&coherence_stats.fallback_platform,__ATOMIC_RELAXED),
+        __atomic_load_n(&coherence_stats.fallback_unknown,__ATOMIC_RELAXED),
+        __atomic_load_n(&coherence_stats.fallback_non_writeback,__ATOMIC_RELAXED),
+        __atomic_load_n(&coherence_stats.fallback_mixed,__ATOMIC_RELAXED));
+}
 static bool overlap(uint64_t a,uint64_t ab,uint64_t b,uint64_t bb)
 {return a<b+bb && b<a+ab;}
 /* Mappings of one cache/shareability/privilege class may share pages; only pages shared across classes refuse. */
@@ -128,7 +178,23 @@ IOReturn NativeAdrenoVm::detach()
     mappings_=nullptr;
     alias_merge_=nullptr;
     mapping_capacity_=0;
+    cached_coherent_imports_=false;
     attached_=false;regions_[0]={};regions_[1]={};context_=nullptr;streams_=nullptr;
+    return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoVm::enableCachedCoherentImports(uint32_t chip_id)
+{
+    if(!attached_ || poisoned_) {
+        return kIOReturnNotReady;
+    }
+    if(chip_id!=0x06030500) {
+        return kIOReturnUnsupported;
+    }
+    const ArmSmmu4KStatus status=observe();
+    if(status) {
+        return fail(status);
+    }
+    cached_coherent_imports_=true;
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoVm::findAddress(unsigned upper,size_t bytes,uint64_t alignment,uint64_t *out) const
@@ -156,6 +222,10 @@ IOReturn NativeAdrenoVm::preflight(const NativeAdrenoMemory *memory,unsigned upp
     if(!memory || upper>1 || !regions_[upper].arena || !memory->backed() || memory->quarantined() ||
         !memory->bytes() || !memory->spanCount() || !(permissions&ArmSmmu4KRead) || (permissions&~15u) ||
         writeback>1 || (shareability!=2 && shareability!=3))return kIOReturnBadArgument;
+    if(writeback && (!cached_coherent_imports_ || !memory->imported() ||
+        !memory->cpuCacheCoherent() || shareability!=2)) {
+        return kIOReturnUnsupported;
+    }
     const ArmSmmu4KLiveArena *a=regions_[upper].arena;
     if((iova&4095) || iova<a->iova || iova-a->iova>=a->bytes || memory->bytes()>a->bytes-(iova-a->iova))
         return kIOReturnBadArgument;
@@ -384,10 +454,12 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
     record->permissions=permissions;
     record->writeback=writeback;
     record->shareability=shareability;
+    record->io_coherent=writeback && cached_coherent_imports_ && memory->cpuCacheCoherent();
     clock.lap(0,1);
-    if(coherentMapping(writeback))native_adreno_coherent_skips[0]=native_adreno_coherent_skips[0]+1;
-    else {
-        checked=memory->publishForDevice(0,memory->bytes(),permissions&ArmSmmu4KWrite,distrust_write_combined_);
+    if(record->io_coherent) {
+        coherentPublish(memory->bytes());
+    } else {
+        checked=memory->publishForDevice(0,memory->bytes(),distrust_write_combined_);
         if(checked)return fail(ArmSmmu4KIoError);
     }
     clock.lap(0,2);
@@ -413,6 +485,7 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
         linkMappingAlias(aliases[at]);
     }
     --reserved_objects_;
+    noteCoherenceMap(*memory,record->io_coherent,cached_coherent_imports_);
     clock.lap(0,4);clock.done(0,memory->bytes());
     *handle=record->handle;result_.complete=true;return kIOReturnSuccess;
 }
@@ -427,10 +500,12 @@ IOReturn NativeAdrenoVm::unmap(uint64_t handle)
     PhaseClock clock;
     native_adreno_trace_stage=11;
     unsigned upper=regions_[1].arena && record->iova>=regions_[1].arena->iova;
-    if(coherentMapping(record->writeback))native_adreno_coherent_skips[1]=native_adreno_coherent_skips[1]+1;
-    else if(record->permissions&ArmSmmu4KWrite) {
-        if(record->memory->acquireDeviceWrites(0,record->memory->bytes())!=kIOReturnSuccess)
+    if(record->permissions&ArmSmmu4KWrite) {
+        if(record->io_coherent) {
+            coherentAcquire(record->memory->bytes());
+        } else if(record->memory->acquireDeviceWrites(0,record->memory->bytes())!=kIOReturnSuccess) {
             return fail(ArmSmmu4KIoError);
+        }
     }
     clock.lap(1,2);
     /* The record retains exactly the ranges installed by map(). */
@@ -461,6 +536,10 @@ IOReturn NativeAdrenoVm::unmap(uint64_t handle)
         alias_storage_count_-=record->alias_count;
     }
     clock.lap(1,5);clock.done(1,record->memory->bytes());
+    if(record->io_coherent) {
+        __atomic_fetch_sub(&coherence_stats.live_maps,1,__ATOMIC_RELAXED);
+        __atomic_fetch_sub(&coherence_stats.live_bytes,record->memory->bytes(),__ATOMIC_RELAXED);
+    }
     *record={};
     record->next_free=free_head_;
     free_head_=size_t(record-mappings_);
@@ -498,8 +577,11 @@ IOReturn NativeAdrenoVm::publishMapped()
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     for(const Mapping *record=first_;record;record=record->next) {
         const Mapping &m=*record;
-        if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;continue;}
-        if(m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_))return fail(ArmSmmu4KIoError);
+        if(m.io_coherent) {
+            coherentPublish(m.memory->bytes());
+            continue;
+        }
+        if(m.memory->publishForDevice(0,m.memory->bytes(),distrust_write_combined_))return fail(ArmSmmu4KIoError);
     }
     return kIOReturnSuccess;
 }
@@ -509,7 +591,10 @@ IOReturn NativeAdrenoVm::acquireImported()
     for(const Mapping *record=first_;record;record=record->next) {
         const Mapping &m=*record;
         if(!m.memory->imported() || !(m.permissions&ArmSmmu4KWrite))continue;
-        if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+1;continue;}
+        if(m.io_coherent) {
+            coherentAcquire(m.memory->bytes());
+            continue;
+        }
         if(m.memory->acquireDeviceWrites(0,m.memory->bytes()))return fail(ArmSmmu4KIoError);
     }
     return kIOReturnSuccess;
@@ -629,7 +714,7 @@ void NativeAdrenoVm::removeClient()
 bool NativeAdrenoVm::resourceNeedsMaintenance(uint64_t handle) const
 {
     const Mapping *record=find(handle);
-    return record && !coherentMapping(record->writeback) &&
+    return record && !record->io_coherent &&
         (record->memory->imported() || !record->memory->writeCombined() || distrust_write_combined_);
 }
 
@@ -851,6 +936,10 @@ IOReturn NativeAdrenoVm::publishResource(uint64_t handle,size_t offset,size_t by
         return kIOReturnBadArgument;
     }
 
+    if(record->io_coherent) {
+        coherentPublish(bytes);
+        return kIOReturnSuccess;
+    }
     uint32_t restored=0;
     IOReturn status=record->memory->reassertWriteCombined(&restored);
     if(status) {
@@ -859,7 +948,7 @@ IOReturn NativeAdrenoVm::publishResource(uint64_t handle,size_t offset,size_t by
     if(!resourceNeedsMaintenance(handle)) {
         return kIOReturnSuccess;
     }
-    return record->memory->publishForDevice(offset,bytes,access&ArmSmmu4KWrite,distrust_write_combined_);
+    return record->memory->publishForDevice(offset,bytes,distrust_write_combined_);
 }
 
 IOReturn NativeAdrenoVm::acquireResource(uint64_t handle,size_t offset,size_t bytes,unsigned access)
@@ -868,7 +957,18 @@ IOReturn NativeAdrenoVm::acquireResource(uint64_t handle,size_t offset,size_t by
     if(!attached_ || poisoned_ || !record || !record->jobs) {
         return kIOReturnNotReady;
     }
-    if(!(access&ArmSmmu4KWrite) || !resourceNeedsMaintenance(handle)) {
+    if(!access || (access&~3u) || (access&~record->permissions) || !bytes ||
+        offset>record->memory->bytes() || bytes>record->memory->bytes()-offset) {
+        return kIOReturnBadArgument;
+    }
+    if(!(access&ArmSmmu4KWrite)) {
+        return kIOReturnSuccess;
+    }
+    if(record->io_coherent) {
+        coherentAcquire(bytes);
+        return kIOReturnSuccess;
+    }
+    if(!resourceNeedsMaintenance(handle)) {
         return kIOReturnSuccess;
     }
     return record->memory->acquireDeviceWrites(offset,bytes,true);

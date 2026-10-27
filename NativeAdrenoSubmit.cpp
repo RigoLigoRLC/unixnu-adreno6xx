@@ -259,6 +259,7 @@ static void profileNoteComplete(uint32_t fence)
     profileLeave();
 }
 /* Called by the gpu dump. Copy under the spinlock, then print without it. */
+extern "C" void native_adreno_coherence_profile_dump(void);
 extern "C" void native_adreno_profile_dump(void)
 {
     static ProfileSample samples[ProfileSamples];
@@ -300,6 +301,7 @@ extern "C" void native_adreno_profile_dump(void)
         lockMax[at] = profileLockMax[at];
     }
     profileLeave();
+    native_adreno_coherence_profile_dump();
     IOLog("NativeAdrenoProfile: resources calls=%llu objects=%llu fallback=%llu clean_bytes=%llu acquire_bytes=%llu busy=%llu completed=%llu failures=%llu\n",
         v2[0],v2[1],v2[2],v2[3],v2[4],v2[5],v2[6],v2[7]);
     IOLog("NativeAdrenoProfile: aliases version=2 us=%llu queries=%llu hits=%llu limit_busy=%llu\n",

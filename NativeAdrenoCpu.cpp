@@ -202,6 +202,40 @@ IOReturn NativeAdrenoMaintainPhysicalSpans(const NativeAdrenoPhysicalSpan *spans
     noteMaintenance(began,bytes);
     return kIOReturnSuccess;
 }
+NativeAdrenoCpuCacheMode NativeAdrenoQueryPagesCacheMode(const NativeAdrenoPhysicalSpan *spans,size_t count)
+{
+    if(!spans || !count) {
+        return NativeAdrenoCpuCacheMode::Unknown;
+    }
+    unsigned first_attribute=0;
+    bool have_attribute=false;
+    bool mixed=false;
+    for(size_t at=0;at<count;++at) {
+        const NativeAdrenoPhysicalSpan &span=spans[at];
+        if(!span.bytes || ((span.physical|span.bytes)&4095) || span.physical>UINT64_MAX-span.bytes ||
+            span.physical<gPhysBase || span.physical+span.bytes-gPhysBase>gPhysSize) {
+            return NativeAdrenoCpuCacheMode::Unknown;
+        }
+        for(uint64_t offset=0;offset<span.bytes;offset+=4096) {
+            const ppnum_t page=(ppnum_t)((span.physical+offset)>>12);
+            const unsigned attribute=pmap_cache_attributes(page)&VM_WIMG_MASK;
+            if(!have_attribute) {
+                first_attribute=attribute;
+                have_attribute=true;
+            } else if(attribute!=first_attribute) {
+                mixed=true;
+            }
+        }
+    }
+    if(mixed) {
+        return NativeAdrenoCpuCacheMode::Mixed;
+    }
+    /* ARM pmap returns COPYBACK for ordinary managed pages. USE_DEFAULT is
+     * an attribute-change request, not a cached mode returned by this query. */
+    return first_attribute==VM_WIMG_COPYBACK?NativeAdrenoCpuCacheMode::WriteBack:
+        NativeAdrenoCpuCacheMode::NonWriteBack;
+}
+
 /* A user BO's pages become Normal non-cacheable (write-combined) for every CPU mapping the pmap tracks: the kernel's own mapping and each
  * client view. The views did not get the cache mode their mapping asked for (int-070: Turnip's write-combine view left IB words in a CPU
  * cache line), but they do take the page's own attribute. That is the Linux msm model for its WC BOs: CPU writes reach DRAM, the GPU's

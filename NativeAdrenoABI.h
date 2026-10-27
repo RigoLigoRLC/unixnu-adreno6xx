@@ -180,6 +180,7 @@ enum {
     NativeAdrenoSubmitMaxIbs = 512,
     NativeAdrenoSubmitMaxResources = 4096,
     NativeAdrenoSubmitKernelCacheMaintenance = 1,
+    NativeAdrenoSubmitCachedCoherentImports = 2,
     NativeAdrenoSubmitAllMapped = 1,
     NativeAdrenoResourceRead = 1,
     NativeAdrenoResourceWrite = 2,
@@ -199,7 +200,7 @@ enum {
 };
 struct NativeAdrenoAbiSubmitCaps {
     uint32_t version,max_packet_bytes,max_ibs,max_resources;
-    uint32_t flags,reserved;      /* NativeAdrenoSubmitKernelCacheMaintenance. */
+    uint32_t flags,reserved;      /* NativeAdrenoSubmit capability flags. */
     uint64_t epoch;
 };
 /* NativeAdrenoAbiSubmitV2 contains offsets into one copied packet. Its arrays
@@ -288,7 +289,8 @@ struct NativeAdrenoAbiStatus {
  * them from the pinned sources (a6xx catalog, UBWC config, the programmed UCHE ranges), never from a guess. */
 enum {
     NativeAdrenoDeviceClientIova = 1,     /* flags: the client chooses BO addresses (BoMap iova) */
-    NativeAdrenoDeviceCachedCoherent = 2  /* flags: unused until IO-coherent BO memory exists */
+    NativeAdrenoDeviceCachedCoherent = 2, /* Cached coherent BO allocation is supported. */
+    NativeAdrenoDeviceCachedCoherentImports = 4 /* Qualified cached imports use coherent SMMU mappings. */
 };
 struct NativeAdrenoAbiDeviceInfo {
     uint32_t chip_id;             /* ADRENO_CHIPID, e.g. 0x43050a01 */

@@ -753,6 +753,7 @@ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes
             storage_.spans[storage_.span_count++]={offset,physical,4096};
         }
     }
+    cpu_cache_mode_=NativeAdrenoQueryPagesCacheMode(storage_.spans,storage_.span_count);
     native_adreno_import_stage=19;
     native_adreno_pool_stats[7]=native_adreno_pool_stats[7]+(uint32_t)storage_.span_count;
     return kIOReturnSuccess;
@@ -862,6 +863,7 @@ IOReturn NativeAdrenoMemory::release(bool cache_backing)
             imported_->release();
         }
         imported_=nullptr;
+        cpu_cache_mode_=NativeAdrenoCpuCacheMode::Unknown;
     }
     if(pooled_) {
         poolGive(pool_offset_,storage_.bytes);
@@ -887,21 +889,20 @@ IOReturn NativeAdrenoMemory::retireAfterQuiescence()
     if(storage_.quarantined)return kIOReturnNotReady;
     --device_references_;return kIOReturnSuccess;
 }
-IOReturn NativeAdrenoMemory::publishForDevice(size_t offset,size_t bytes,bool writes,bool include_write_combined)
+IOReturn NativeAdrenoMemory::publishForDevice(size_t offset,size_t bytes,bool include_write_combined)
 {
     if(!backed() || !storage_.prepared || storage_.quarantined)return kIOReturnNotReady;
     if(!bytes || offset>storage_.bytes || bytes>storage_.bytes-offset)return kIOReturnBadArgument;
-    if(imported_)return maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);
+    if(imported_)return maintainImported(offset,bytes,NativeAdrenoClean);
     if(storage_.write_combined) {
         if(include_write_combined) {
-            return maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);
+            return maintainImported(offset,bytes,NativeAdrenoClean);
         }
 
         __asm__ volatile("dsb st" ::: "memory");
         return kIOReturnSuccess;
     }
-    return NativeAdrenoMaintainOwnedPages(static_cast<unsigned char *>(storage_.mapping)+offset,bytes,
-        writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);
+    return NativeAdrenoMaintainOwnedPages(static_cast<unsigned char *>(storage_.mapping)+offset,bytes,NativeAdrenoClean);
 }
 IOReturn NativeAdrenoMemory::acquireDeviceWrites(size_t offset,size_t bytes,bool submitted_range)
 {

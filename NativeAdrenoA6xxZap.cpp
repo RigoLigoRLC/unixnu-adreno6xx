@@ -110,7 +110,7 @@ IOReturn NativeAdrenoA6xxZap::load(const NativeAdrenoA6xxWindow &window,void *re
     }
     memcpy(metadata_.mapping(),image,size_t(native_adreno_zap_metadata_image_size));
     IOLog("NativeAdrenoZap: metadata publication begin physical=%llx bytes=%lx\n",metadata_.spans()[0].physical,metadataBytes);
-    status=metadata_.publishForDevice(0,metadataBytes,false);
+    status=metadata_.publishForDevice(0,metadataBytes);
     IOLog("NativeAdrenoZap: metadata publication completed status=%08x\n",status);
     if(status) {
         return status;

@@ -56,6 +56,7 @@ class NativeAdrenoVm final {
         uint64_t handle=0,iova=0;
         size_t spans=0,mapped_spans=0;
         unsigned permissions=0,writeback=0,shareability=0,jobs=0;
+        bool io_coherent=false;
         size_t next_free=0;
         RB_ENTRY(Mapping) address_link;
         Mapping *previous=nullptr,*next=nullptr;
@@ -148,6 +149,7 @@ class NativeAdrenoVm final {
     unsigned budget_=0;
     uint64_t next_handle_=1;
     bool attached_=false,poisoned_=false,distrust_write_combined_=false;
+    bool cached_coherent_imports_=false;
     bool map_busy_alias_=false,map_alias_limit_=false;
     NativeAdrenoVmResult result_{};
     ArmSmmu4KLiveRegion region(unsigned) const;
@@ -175,6 +177,10 @@ public:
     /* Frees CPU metadata only, with no BOs remaining. Never releases roots,
      * disables a bank or returns the platform lease; board lifecycle owns it. */
     IOReturn detach();
+    /* The initialized A642L platform permits cached imports to use coherent
+     * SMMU mappings. Each backing still supplies its CPU cache qualification. */
+    IOReturn enableCachedCoherentImports(uint32_t chip_id);
+    bool cachedCoherentImports() const {return cached_coherent_imports_;}
     IOReturn findAddress(unsigned upper,size_t bytes,uint64_t alignment,uint64_t *iova) const;
     IOReturn map(NativeAdrenoMemory *,unsigned upper,uint64_t iova,
         unsigned permissions,unsigned writeback,unsigned shareability,uint64_t *handle);
@@ -195,9 +201,9 @@ public:
      * synchronizes by ASID; this is the stronger form the submit path uses before each submission (int-070: on sheng the CP read
      * zeros from an IB whose table entry and DRAM were both correct, after the address had been mapped to other pages before). */
     IOReturn invalidateTlb();
-    /* Cleans and invalidates the CPU caches over every mapped BO (whole objects; imported ones through their physical pages), so
-     * no CPU cache line can hold data the GPU should see or hide what it wrote. Lines are physically tagged, so this also reaches
-     * lines a user mapping of the same pages left behind. int-070 runs it before every submission. */
+    /* The legacy submission path cleans every mapped BO before GPU access.
+     * Imported BOs are cleaned through their physical pages, including lines
+     * dirtied through a user mapping. Completion acquires GPU-written imports. */
     IOReturn publishMapped();
     /* The submit path saw a CPU-cached word that DRAM did not hold yet in a client's BO: from now on write-combined BOs are maintained
      * like any other (sticky; the safe behaviour of int-070..097). */

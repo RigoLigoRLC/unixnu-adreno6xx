@@ -7,7 +7,7 @@ static int publishTable(void *cookie,volatile uint64_t *page,size_t bytes)
         (uintptr_t)page<(uintptr_t)memory->mapping())return 1;
     uintptr_t offset=(uintptr_t)page-(uintptr_t)memory->mapping();
     if(offset>memory->bytes() || bytes>memory->bytes()-offset)return 1;
-    return memory->publishForDevice(offset,bytes,false)==kIOReturnSuccess?0:1;
+    return memory->publishForDevice(offset,bytes)==kIOReturnSuccess?0:1;
 }
 IOReturn NativeAdrenoBindSmmuVisibility(NativeAdrenoMemory *memory,ArmSmmu4KLiveVisibility *visibility)
 {
@@ -35,7 +35,7 @@ IOReturn NativeAdrenoPrepareSmmuMemory(NativeAdrenoMemory *memory,unsigned input
     ArmSmmu4KLiveResult audit;
     status=ArmSmmu4KLiveAudit(arena,state,nullptr,0,&audit);
     if(status!=ArmSmmu4KSuccess) {state->poisoned=1;return kIOReturnIOError;}
-    IOReturn result=memory->publishForDevice(0,state->tables.table_pages*4096,false);
+    IOReturn result=memory->publishForDevice(0,state->tables.table_pages*4096);
     if(result==kIOReturnSuccess)result=memory->holdForDevice();
     if(result!=kIOReturnSuccess) {state->poisoned=1;return result;}
     return NativeAdrenoBindSmmuVisibility(memory,visibility);

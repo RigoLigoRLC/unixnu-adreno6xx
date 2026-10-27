@@ -45,10 +45,10 @@ static unsigned successes()
         CHECK(bytes==16384 && fixture.cache_calls==1 && fixture.cache_operations[0]==NativeAdrenoClean);
         CHECK(memory.holdForDevice()==kIOReturnSuccess && memory.holdForDevice()==kIOReturnSuccess);
         CHECK(memory.deviceReferences()==2 && memory.release()==kIOReturnBusy && !fixture.completed);
-        CHECK(memory.publishForDevice(4096,4096,false)==kIOReturnSuccess);
+        CHECK(memory.publishForDevice(4096,4096)==kIOReturnSuccess);
         CHECK(fixture.cache_operations.back()==NativeAdrenoClean);
-        CHECK(memory.publishForDevice(0,16384,true)==kIOReturnSuccess);
-        CHECK(fixture.cache_operations.back()==NativeAdrenoCleanInvalidate);
+        CHECK(memory.publishForDevice(0,16384)==kIOReturnSuccess);
+        CHECK(fixture.cache_operations.back()==NativeAdrenoClean);
         CHECK(memory.acquireDeviceWrites(0,16384)==kIOReturnSuccess);
         CHECK(fixture.cache_operations.back()==NativeAdrenoInvalidate);
         CHECK(memory.retireAfterQuiescence()==kIOReturnSuccess);
@@ -94,7 +94,7 @@ static unsigned failures()
         unsigned completed=fixture.completed;
         CHECK(memory.release()==kIOReturnBusy && fixture.completed==completed && !fixture.released);
         CHECK(memory.holdForDevice()==kIOReturnNotReady);
-        CHECK(memory.publishForDevice(0,4096,false)==kIOReturnNotReady);
+        CHECK(memory.publishForDevice(0,4096)==kIOReturnNotReady);
         discardFixtureAfterQuarantine();++controls;
     }
     reset();NativeAdrenoMemory memory;
@@ -122,7 +122,7 @@ static unsigned arguments()
     CHECK(memory.allocate(16384,32,false,16384)==kIOReturnSuccess);
     CHECK(memory.allocate(16384,32,false,16384)==kIOReturnBusy);++controls;
     for(auto range:std::vector<std::pair<size_t,size_t>>{{0,0},{1,4096},{0,4097},{16384,4096},{SIZE_MAX-4095,4096},{4096,SIZE_MAX-4095}}) {
-        CHECK(memory.publishForDevice(range.first,range.second,false)==kIOReturnBadArgument);
+        CHECK(memory.publishForDevice(range.first,range.second)==kIOReturnBadArgument);
         CHECK(memory.acquireDeviceWrites(range.first,range.second)==kIOReturnBadArgument);controls+=2;
     }
     CHECK(fixture.cache_calls==1);CHECK(memory.release()==kIOReturnSuccess);

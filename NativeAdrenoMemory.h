@@ -26,6 +26,15 @@ IOReturn NativeAdrenoMaintainPhysicalPages(uint64_t physical,size_t bytes,Native
  * intersecting cache line is included, with at most 64 pages per preemption hold. */
 IOReturn NativeAdrenoMaintainPhysicalSpans(const NativeAdrenoPhysicalSpan *,size_t count,size_t offset,size_t bytes,
     NativeAdrenoCacheOperation);
+enum class NativeAdrenoCpuCacheMode : unsigned {
+    Unknown,
+    WriteBack,
+    NonWriteBack,
+    Mixed
+};
+/* The pinned physical pages supply their existing pmap cache attributes.
+ * GPU users preserve the allocation's CPU cache mode until GPU unmap. */
+NativeAdrenoCpuCacheMode NativeAdrenoQueryPagesCacheMode(const NativeAdrenoPhysicalSpan *,size_t count);
 /* Every CPU mapping of the spans' pages becomes write-combined (true) or takes the default cacheable attribute again (false). */
 IOReturn NativeAdrenoSetPagesCacheMode(const NativeAdrenoPhysicalSpan *,size_t count,bool write_combined);
 /* int-100 found a write-combined BO's page back at the default (cacheable) attribute with dirty IB lines: XNU's view machinery sets a page's
@@ -144,6 +153,7 @@ class NativeAdrenoMemory final {
     NativeAdrenoBackingStorage storage_;
     IOMemoryDescriptor *imported_=nullptr;
     bool read_only_=false;
+    NativeAdrenoCpuCacheMode cpu_cache_mode_=NativeAdrenoCpuCacheMode::Unknown;
     bool controlled_cpu_views_=true;   /* A legacy physical view requires submit-time page repair. */
     uint32_t device_references_=0;
     bool pooled_=false;
@@ -183,11 +193,14 @@ public:
     /* The whole pool write-combined once, for good: a pooled BO then takes no page-attribute change on allocation or release.
      * Board only, after reservePool, when user BOs are write-combined. */
     static IOReturn writeCombinePool();
-    /* importTask pins the task's pages and retains their existing CPU cache mode.
-     * publishForDevice and acquireDeviceWrites maintain their physical ranges
-     * around GPU use. Spans and PA bounds are checked as for allocate. */
+    /* importTask pins the task's pages, records their existing CPU cache mode,
+     * and checks spans and PA bounds as for allocate. The owner preserves that
+     * allocation cache mode until GPU unmap; prepare() pins pages without
+     * preventing a separate CPU request from changing their cache attributes. */
     IOReturn importTask(void *task,uint64_t address,size_t bytes,unsigned output_bits,size_t byte_budget);
     bool imported() const {return imported_!=nullptr;}
+    NativeAdrenoCpuCacheMode cpuCacheMode() const {return cpu_cache_mode_;}
+    bool cpuCacheCoherent() const {return cpu_cache_mode_==NativeAdrenoCpuCacheMode::WriteBack;}
     /* An import of memory the owner maps read-only (the kernel could pin it for reading only): the GPU may read it, never write it. */
     bool readOnly() const {return read_only_;}
     /* After allocate(), before any device or client mapping: cleans and invalidates the pages and makes every CPU mapping of them
@@ -213,12 +226,15 @@ public:
     IOReturn holdForDevice();
     IOReturn retireAfterQuiescence();
     void quarantine() {storage_.quarantined=true;}
-    /* Requires real CPU/device exclusion and retained ownership. Before GPU
-     * writes, clean+invalidate; after genuine completion, invalidate only.
-     * CPU must not dirty intersecting cache lines while the device owns access. */
-    /* A write-combined object is skipped unless include_write_combined: then its pages are maintained through the physical aperture,
-     * for a client whose view turned out to be cacheable after all (NativeAdrenoVm::distrustWriteCombined). */
-    IOReturn publishForDevice(size_t offset,size_t bytes,bool device_writes,bool include_write_combined=false);
+    /* Publication cleans CPU-written cache lines to PoC before GPU access.
+     * The caller retains the memory and excludes CPU stores to every complete
+     * cache line intersecting the interval until GPU completion and acquisition.
+     * A trusted WC allocation needs only a store barrier; include_write_combined
+     * also cleans its physical pages when a client has a cacheable view. */
+    IOReturn publishForDevice(size_t offset,size_t bytes,bool include_write_combined=false);
+    /* A submitted range was cleaned before its completed GPU job, so acquisition
+     * invalidates its intersecting lines. A legacy whole-import sweep also
+     * cleans because it can include CPU-written bytes outside that job's ranges. */
     IOReturn acquireDeviceWrites(size_t offset,size_t bytes,bool submitted_range=false);
     bool quarantined() const {return storage_.quarantined;}
     uint32_t deviceReferences() const {return device_references_;}

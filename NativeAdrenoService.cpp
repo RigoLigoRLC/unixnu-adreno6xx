@@ -227,7 +227,7 @@ int A642LState::publishRing(void *cookie,const volatile uint32_t *,size_t bytes)
     if(self->cpTrace_) {
         IOLog("NativeAdrenoCp: ring publication begin bytes=%lx\n",bytes);
     }
-    const IOReturn status=self->gpuContext_.buffer(1).publishForDevice(0,bytes,false);
+    const IOReturn status=self->gpuContext_.buffer(1).publishForDevice(0,bytes);
     if(self->cpTrace_) {
         IOLog("NativeAdrenoCp: ring publication end status=%08x\n",status);
     }
@@ -680,7 +680,7 @@ IOReturn A642LState::startCp()
     memset(gpuContext_.buffer(3).mapping(),0,GpuPageBytes);
     memset(gpuContext_.buffer(4).mapping(),0,GpuPageBytes);
     IOLog("NativeAdrenoCp: SQE publication begin\n");
-    status=gpuContext_.buffer(0).publishForDevice(0,gpuContext_.buffer(0).bytes(),false);
+    status=gpuContext_.buffer(0).publishForDevice(0,gpuContext_.buffer(0).bytes());
     IOLog("NativeAdrenoCp: SQE publication completed status=%08x\n",status);
     if(status) {
         return status;
@@ -808,7 +808,11 @@ IOReturn A642LState::startCp()
     info_.ubwc_swizzle = 6;
     info_.macrotile_mode = 0;
     info_.ubwc_version = 3;
-    info_.flags = NativeAdrenoDeviceClientIova;
+    status=gpuContext_.vm()->enableCachedCoherentImports(resources_.chipId);
+    if(status) {
+        return status;
+    }
+    info_.flags = NativeAdrenoDeviceClientIova|NativeAdrenoDeviceCachedCoherentImports;
 
     return native_adreno_publish(gpuContext_.vm(),&submit_,&ring_,&clock_,&timer_,&info_,32,40);
 }

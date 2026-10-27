@@ -17,7 +17,6 @@ static void noteImportState(uint64_t handle,uint64_t state)
 {
     for(unsigned i=0;i<8;++i)if(native_adreno_import_live[3+i*4+2]==handle) {native_adreno_import_live[3+i*4+3]=state;return;}
 }
-extern "C" volatile uint32_t native_adreno_io_coherent;
 /* Per kernel method: [method][0] calls, [1] calls that returned non-zero, [2] last status, [3] total time (us, 32-bit). Method numbers are the ABI's (1..16). */
 extern "C" {extern uint64_t (*native_adreno_vm_now_us)(void);volatile uint32_t native_adreno_method_stats[20][4];volatile uint32_t native_adreno_map_fail[7][2];}
 extern "C" void native_adreno_profile_map(uint32_t pages,uint64_t us);
@@ -345,19 +344,19 @@ IOReturn NativeAdrenoUserClient::mapBo(const NativeAdrenoAbiBoMap *request,
     uint64_t handle=0;
     /* Memory the owner maps read-only could only be pinned for reading: the GPU gets the read half of what was asked. */
     const unsigned permissions=entry->memory.readOnly()?(request->permissions&~2u):request->permissions;
-    /* Imported memory is the owner's cacheable memory (IOSurfaces, no-copy buffers): once the board proved IO coherence, the GPU maps it
-     * write-back inner-shareable (Linux's IOMMU_CACHE PTE) and the CPU caches over it need no maintenance. The GPU's own BOs stay
-     * non-cacheable: their CPU view is write-combined, and a snoop could find a stale line of the kernel's cacheable alias. */
-    /* Only memory the GPU never writes is mapped coherent: sysmem passes written through write-back inner-shareable mappings stopped
-     * the GPU inside its end-of-pass cache clean (BR and BV idle at the clean events), while non-coherent mappings never did. */
-    const bool coherent=entry->memory.imported() && native_adreno_io_coherent && !(permissions&2u);
+    /* The platform and backing choose coherence. KGSL's A642L IOMMU_CACHE
+     * mapping uses Normal WB/WA and Outer Shareable for reads and writes. */
+    const bool coherent=vm_->cachedCoherentImports() && entry->memory.cpuCacheCoherent();
+    if(request->writeback && !coherent) {
+        return kIOReturnUnsupported;
+    }
     const IOReturn completed=submit_->retireCompleted();
     if(completed) {
         return completed;
     }
     const uint64_t mapBegan=native_adreno_vm_now_us?native_adreno_vm_now_us():0;
     const IOReturn status=vm_->map(&entry->memory,0,request->iova,permissions,
-        coherent?1u:request->writeback,coherent?3u:request->shareability,&handle);
+        coherent?1u:0u,2u,&handle);
     if(mapBegan && native_adreno_vm_now_us) {
         const uint64_t mapEnded=native_adreno_vm_now_us();
         const uint64_t pages=(entry->memory.bytes()+4095)/4096;
@@ -472,6 +471,9 @@ IOReturn NativeAdrenoUserClient::submitCaps(NativeAdrenoAbiSubmitCaps *reply)
     *reply={NativeAdrenoSubmitVersion,NativeAdrenoSubmitMaxPacketBytes,
         NativeAdrenoSubmitMaxIbs,NativeAdrenoSubmitMaxResources,
         NativeAdrenoSubmitKernelCacheMaintenance,0,status_?status_->suspends()+1:1};
+    if(vm_->cachedCoherentImports()) {
+        reply->flags|=NativeAdrenoSubmitCachedCoherentImports;
+    }
     return kIOReturnSuccess;
 }
 
