@@ -1411,7 +1411,8 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
     } owned;
     IOExternalMethodArguments copied{};
     if(arguments && arguments->structureInputDescriptor) {
-        const uint64_t length=arguments->structureInputDescriptor->getLength();
+        IOMemoryDescriptor *descriptor=arguments->structureInputDescriptor;
+        const uint64_t length=descriptor->getLength();
         if(!length || length>NativeAdrenoSubmitMaxPacketBytes+8) {
             return kIOReturnBadArgument;
         }
@@ -1420,9 +1421,22 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
         if(!owned.bytes) {
             return kIOReturnNoMemory;
         }
-        if(arguments->structureInputDescriptor->readBytes(0,owned.bytes,owned.count)!=owned.count) {
+
+        /* The IOKit input descriptor owns pageable user memory. Its pages must
+         * stay wired while readBytes copies them into the bounded packet. */
+        const IOReturn prepare_status=descriptor->prepare(kIODirectionOut);
+        if(prepare_status) {
+            return prepare_status;
+        }
+        const IOByteCount copied_bytes=descriptor->readBytes(0,owned.bytes,owned.count);
+        const IOReturn complete_status=descriptor->complete(kIODirectionOut);
+        if(complete_status) {
+            return complete_status;
+        }
+        if(copied_bytes!=owned.count) {
             return kIOReturnBadArgument;
         }
+
         copied=*arguments;
         copied.structureInput=owned.bytes;
         copied.structureInputSize=uint32_t(owned.count);
