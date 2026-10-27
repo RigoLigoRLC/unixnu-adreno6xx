@@ -59,17 +59,18 @@ IOReturn NativeAdrenoQueryCpu4K(NativeAdrenoCpuState *out)
 }
 static IOReturn maintainOwnedPages(void *mapping,size_t bytes,NativeAdrenoCacheOperation op)
 {
-    /* Whole owned pages avoid IVAC corruption of a neighbour's dirty line.
-     * No Apple coherent-I/O shortcut is used for these noncoherent DMA paths.
-     * Pin this CPU while reading its CTR and issuing all cache operations. */
-    if(!mapping || !bytes || (((uintptr_t)mapping|bytes)&4095) ||
+    /* The caller owns every cache line intersecting this byte interval. CPU
+     * selection stays fixed while CTR supplies the line size and the cache
+     * instructions publish or acquire that interval. */
+    if(!mapping || !bytes ||
         bytes>UINTPTR_MAX-(uintptr_t)mapping || op>NativeAdrenoInvalidate || op<NativeAdrenoClean)
         return kIOReturnBadArgument;
     disable_preemption();
     uint64_t ctr;__asm__ volatile("mrs %0, ctr_el0":"=r"(ctr));
     size_t line=(size_t)4<<((ctr>>16)&15);
     if(line>4096) {enable_preemption();return kIOReturnUnsupported;}
-    uintptr_t address=(uintptr_t)mapping,end=address+bytes;
+    const uintptr_t end=(uintptr_t)mapping+bytes;
+    uintptr_t address=(uintptr_t)mapping&~uintptr_t(line-1);
     __asm__ volatile("dsb sy":::"memory");
     for(;address<end;address+=line) {
         if(op==NativeAdrenoClean)__asm__ volatile("dc cvac, %0"::"r"(address):"memory");
@@ -97,7 +98,7 @@ IOReturn NativeAdrenoMaintainPhysicalPages(uint64_t physical,size_t bytes,Native
 IOReturn NativeAdrenoMaintainPhysicalSpans(const NativeAdrenoPhysicalSpan *spans,size_t count,size_t offset,size_t bytes,
     NativeAdrenoCacheOperation op)
 {
-    if(!spans || !count || !bytes || ((offset|bytes)&4095) || offset>SIZE_MAX-bytes ||
+    if(!spans || !count || !bytes || offset>SIZE_MAX-bytes ||
         op>NativeAdrenoInvalidate || op<NativeAdrenoClean) {
         return kIOReturnBadArgument;
     }
@@ -137,7 +138,9 @@ IOReturn NativeAdrenoMaintainPhysicalSpans(const NativeAdrenoPhysicalSpan *spans
         if(begin>=end) {
             continue;
         }
-        for(uint64_t page=span.physical+(begin-span.offset),endPhysical=page+(end-begin);page<endPhysical;page+=4096) {
+        const uint64_t beginPhysical=span.physical+(begin-span.offset);
+        const uint64_t endPhysical=beginPhysical+(end-begin);
+        for(uint64_t page=beginPhysical&~UINT64_C(4095);page<endPhysical;page+=4096) {
             if(!run) {
                 disable_preemption();
                 uint64_t ctr;__asm__ volatile("mrs %0, ctr_el0":"=r"(ctr));
@@ -158,7 +161,10 @@ IOReturn NativeAdrenoMaintainPhysicalSpans(const NativeAdrenoPhysicalSpan *spans
                     enable_preemption();
                     return kIOReturnUnsupported;
                 }
-                for(uintptr_t address=alias,endAddress=alias+4096;address<endAddress;address+=line) {
+                const size_t firstByte=beginPhysical>page?size_t(beginPhysical-page):0;
+                const size_t endByte=endPhysical-page<4096?size_t(endPhysical-page):4096;
+                const uintptr_t endAddress=alias+endByte;
+                for(uintptr_t address=(alias+firstByte)&~uintptr_t(line-1);address<endAddress;address+=line) {
                     if(op==NativeAdrenoClean)__asm__ volatile("dc cvac, %0"::"r"(address):"memory");
                     else if(op==NativeAdrenoCleanInvalidate)__asm__ volatile("dc civac, %0"::"r"(address):"memory");
                     else __asm__ volatile("dc ivac, %0"::"r"(address):"memory");

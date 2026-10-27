@@ -890,7 +890,7 @@ IOReturn NativeAdrenoMemory::retireAfterQuiescence()
 IOReturn NativeAdrenoMemory::publishForDevice(size_t offset,size_t bytes,bool writes,bool include_write_combined)
 {
     if(!backed() || !storage_.prepared || storage_.quarantined)return kIOReturnNotReady;
-    if(!bytes || ((offset|bytes)&4095) || offset>storage_.bytes || bytes>storage_.bytes-offset)return kIOReturnBadArgument;
+    if(!bytes || offset>storage_.bytes || bytes>storage_.bytes-offset)return kIOReturnBadArgument;
     if(imported_)return maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);
     if(storage_.write_combined) {
         if(include_write_combined) {
@@ -906,7 +906,7 @@ IOReturn NativeAdrenoMemory::publishForDevice(size_t offset,size_t bytes,bool wr
 IOReturn NativeAdrenoMemory::acquireDeviceWrites(size_t offset,size_t bytes,bool submitted_range)
 {
     if(!backed() || !storage_.prepared || storage_.quarantined)return kIOReturnNotReady;
-    if(!bytes || ((offset|bytes)&4095) || offset>storage_.bytes || bytes>storage_.bytes-offset)return kIOReturnBadArgument;
+    if(!bytes || offset>storage_.bytes || bytes>storage_.bytes-offset)return kIOReturnBadArgument;
     if(imported_) {
         return maintainImported(offset,bytes,submitted_range?NativeAdrenoInvalidate:NativeAdrenoCleanInvalidate);
     }

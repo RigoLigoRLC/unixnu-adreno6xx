@@ -15,11 +15,14 @@ IOReturn NativeAdrenoQueryCpu4K(NativeAdrenoCpuState *);
 /* The native-adreno-cache-trace boot argument enables per-BO and per-span cache logs. */
 bool NativeAdrenoCacheTraceEnabled();
 enum NativeAdrenoCacheOperation {NativeAdrenoClean,NativeAdrenoCleanInvalidate,NativeAdrenoInvalidate};
+/* The byte interval is expanded only to intersecting CPU cache lines. The
+ * caller excludes conflicting CPU and GPU access to those complete lines. */
 IOReturn NativeAdrenoMaintainOwnedPages(void *,size_t,NativeAdrenoCacheOperation);
 /* The same over whole physical pages of DRAM, through the kernel's physical aperture: data cache lines are physically tagged, so this
  * reaches lines another task's mapping left (an imported IOSurface). Apple's sys_dcache_flush is only a DSB, so user space cannot. */
 IOReturn NativeAdrenoMaintainPhysicalPages(uint64_t physical,size_t bytes,NativeAdrenoCacheOperation);
-/* The requested page-aligned interval is maintained across its ordered physical spans, with at most 64 pages per preemption hold. */
+/* The exact byte interval is maintained across ordered physical spans. Each
+ * intersecting cache line is included, with at most 64 pages per preemption hold. */
 IOReturn NativeAdrenoMaintainPhysicalSpans(const NativeAdrenoPhysicalSpan *,size_t count,size_t offset,size_t bytes,
     NativeAdrenoCacheOperation);
 /* Every CPU mapping of the spans' pages becomes write-combined (true) or takes the default cacheable attribute again (false). */
@@ -211,7 +214,7 @@ public:
     void quarantine() {storage_.quarantined=true;}
     /* Requires real CPU/device exclusion and retained ownership. Before GPU
      * writes, clean+invalidate; after genuine completion, invalidate only.
-     * CPU must not dirty these pages while the device owns access. */
+     * CPU must not dirty intersecting cache lines while the device owns access. */
     /* A write-combined object is skipped unless include_write_combined: then its pages are maintained through the physical aperture,
      * for a client whose view turned out to be cacheable after all (NativeAdrenoVm::distrustWriteCombined). */
     IOReturn publishForDevice(size_t offset,size_t bytes,bool device_writes,bool include_write_combined=false);

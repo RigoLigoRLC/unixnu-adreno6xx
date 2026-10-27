@@ -605,7 +605,7 @@ IOReturn NativeAdrenoVm::publishResource(uint64_t handle,size_t offset,size_t by
 {
     Mapping *record=find(handle);
     if(!attached_ || poisoned_ || !record || !record->jobs || !access || (access&~3u) ||
-        (access&~record->permissions) || !bytes || ((offset|bytes)&4095) ||
+        (access&~record->permissions) || !bytes ||
         offset>record->memory->bytes() || bytes>record->memory->bytes()-offset) {
         return kIOReturnBadArgument;
     }

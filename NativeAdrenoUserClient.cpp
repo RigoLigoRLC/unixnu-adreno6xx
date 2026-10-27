@@ -533,7 +533,7 @@ IOReturn NativeAdrenoUserClient::submitV2(const void *input,size_t input_size,Na
     const auto *packet=static_cast<const uint8_t *>(input);
     const auto *resources=reinterpret_cast<const NativeAdrenoAbiSubmitResourceV2 *>(packet+header.resource_offset);
     const auto *ibs=reinterpret_cast<const NativeAdrenoAbiSubmitIbV2 *>(packet+header.ib_offset);
-    memset(submit_resources_,0,sizeof(*submit_resources_)*NativeAdrenoSubmitMaxResources);
+    size_t resource_count=0;
     for(uint32_t at=0;at<header.resource_count;++at) {
         const auto &resource=resources[at];
         Entry *entry=find(resource.handle);
@@ -549,18 +549,24 @@ IOReturn NativeAdrenoUserClient::submitV2(const void *input,size_t input_size,Na
             return kIOReturnBadArgument;
         }
 
-        const size_t first=size_t(resource.offset)&~size_t(4095);
-        const size_t end=(size_t(resource.offset+resource.bytes)+4095)&~size_t(4095);
-        NativeAdrenoSubmitResource &merged=submit_resources_[entry-entries_];
-        if(!merged.handle) {
-            merged={entry->mapped,first,end-first,resource.access,false};
-        } else {
-            const size_t merged_first=merged.offset<first?merged.offset:first;
-            const size_t merged_end=merged.offset+merged.bytes>end?merged.offset+merged.bytes:end;
-            merged.offset=merged_first;
-            merged.bytes=merged_end-merged_first;
-            merged.access|=resource.access;
+        const size_t first=size_t(resource.offset);
+        const size_t end=first+size_t(resource.bytes);
+        if(resource_count) {
+            NativeAdrenoSubmitResource &previous=submit_resources_[resource_count-1];
+            const size_t previous_end=previous.offset+previous.bytes;
+            if(previous.handle==entry->mapped && previous.access==resource.access &&
+                first<=previous_end && previous.offset<=end) {
+                const size_t merged_first=previous.offset<first?previous.offset:first;
+                const size_t merged_end=previous_end>end?previous_end:end;
+                previous.offset=merged_first;
+                previous.bytes=merged_end-merged_first;
+                continue;
+            }
         }
+        if(resource_count==NativeAdrenoSubmitMaxResources) {
+            return kIOReturnNoResources;
+        }
+        submit_resources_[resource_count++]={entry->mapped,first,size_t(resource.bytes),resource.access,false};
     }
 
     for(uint32_t at=0;at<header.ib_count;++at) {
@@ -581,10 +587,13 @@ IOReturn NativeAdrenoUserClient::submitV2(const void *input,size_t input_size,Na
         submit_buffers_[at]={entry->mapped,entry->iova+ib.offset,size_t(ib.bytes)};
     }
 
-    size_t resource_count=0;
-    for(size_t at=0;at<entry_count_;++at) {
-        const Entry &entry=entries_[at];
-        if((header.flags&NativeAdrenoSubmitAllMapped) && entry.used && entry.mapped_state) {
+    if(header.flags&NativeAdrenoSubmitAllMapped) {
+        resource_count=0;
+        for(size_t at=0;at<entry_count_;++at) {
+            const Entry &entry=entries_[at];
+            if(!entry.used || !entry.mapped_state) {
+                continue;
+            }
             uint64_t iova=0;
             size_t bytes=0;
             unsigned permissions=0;
@@ -592,10 +601,10 @@ IOReturn NativeAdrenoUserClient::submitV2(const void *input,size_t input_size,Na
             if(described) {
                 return described;
             }
-            submit_resources_[at]={entry.mapped,0,bytes,permissions&3u,false};
-        }
-        if(submit_resources_[at].handle) {
-            submit_resources_[resource_count++]=submit_resources_[at];
+            if(resource_count==NativeAdrenoSubmitMaxResources) {
+                return kIOReturnNoResources;
+            }
+            submit_resources_[resource_count++]={entry.mapped,0,bytes,permissions&3u,false};
         }
     }
     uint32_t fence=0;

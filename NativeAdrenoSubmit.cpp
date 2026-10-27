@@ -368,6 +368,9 @@ IOReturn NativeAdrenoSubmit::release(Job &job, bool acquire_imported)
         }
         __asm__ volatile("dsb ld" ::: "memory");
         for(size_t at=0;at<job.resource_count;++at) {
+            if(!job.resources[at].owns_reference) {
+                continue;
+            }
             if(vm_->retireJobAfterCompletion(job.resources[at].handle)) {
                 return poison();
             }
@@ -640,18 +643,31 @@ IOReturn NativeAdrenoSubmit::submitResources(const NativeAdrenoSubmitBuffer *buf
             maintenance_count=copied;
         }
     }
+    uint64_t referenced_slots[(NativeAdrenoVmMaxObjects+63)/64]{};
     size_t held_count=0;
     for(;held_count<resource_count;++held_count) {
+        NativeAdrenoSubmitResource &resource=held[held_count];
+        resource.owns_reference=false;
+        const size_t slot=size_t(resource.handle&4095);
+        const uint64_t bit=UINT64_C(1)<<(slot&63);
+        if(referenced_slots[slot/64]&bit) {
+            continue;
+        }
         status=vm_->holdJob(held[held_count].handle);
         if(status) {
             break;
         }
+        referenced_slots[slot/64]|=bit;
+        resource.owns_reference=true;
         ++stats_.references_held;
     }
     if(status) {
         while(held_count) {
-            vm_->retireJobAfterCompletion(held[--held_count].handle);
-            ++stats_.references_retired;
+            const NativeAdrenoSubmitResource &resource=held[--held_count];
+            if(resource.owns_reference) {
+                vm_->retireJobAfterCompletion(resource.handle);
+                ++stats_.references_retired;
+            }
         }
         return status;
     }
@@ -669,7 +685,7 @@ IOReturn NativeAdrenoSubmit::submitResources(const NativeAdrenoSubmitBuffer *buf
         if(resource.maintenance) {
             published_bytes+=resource.bytes;
             if(vm_->resourceImported(resource.handle)) {
-                ++import_count;
+                import_count+=resource.owns_reference;
                 import_bytes+=resource.bytes;
             }
         }
@@ -715,8 +731,11 @@ IOReturn NativeAdrenoSubmit::submitResources(const NativeAdrenoSubmitBuffer *buf
     }
 
     while(held_count) {
-        vm_->retireJobAfterCompletion(held[--held_count].handle);
-        ++stats_.references_retired;
+        const NativeAdrenoSubmitResource &resource=held[--held_count];
+        if(resource.owns_reference) {
+            vm_->retireJobAfterCompletion(resource.handle);
+            ++stats_.references_retired;
+        }
     }
     return status;
 }

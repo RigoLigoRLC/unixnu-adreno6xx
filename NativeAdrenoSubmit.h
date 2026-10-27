@@ -10,13 +10,15 @@ struct NativeAdrenoSubmitBuffer {
     uint64_t iova;
     size_t bytes;      /* Complete indirect-buffer range in bytes. */
 };
-/* NativeAdrenoSubmitResource names one retained GPU mapping and the complete
- * range used by a job. The caller merges duplicate mappings before submission. */
+/* NativeAdrenoSubmitResource names one exact BO range used by a job. Separate
+ * ranges of one mapping remain separate; one of them owns the mapping's job
+ * reference until every range has completed its cache acquisition. */
 struct NativeAdrenoSubmitResource {
     uint64_t handle=0;
     size_t offset=0,bytes=0;
     unsigned access=0;
     bool maintenance=false;
+    bool owns_reference=false;
 };
 extern "C" void native_adreno_submit_failure(uint32_t stage,uint32_t status,uint64_t handle,
     uint64_t iova,uint32_t index,uint32_t ibs,uint32_t resources,uint64_t bytes=0);
@@ -83,8 +85,8 @@ public:
      * leaves other queues' jobs alone. Each client of the shared ring owns one such range. */
     bool rangeOutstanding(uint32_t first,uint32_t count) const;
     IOReturn waitRange(uint32_t first,uint32_t count,const NativeAdrenoRingClock *,uint32_t timeout_us);
-    /* Completed jobs are collected without waiting. One imported-memory acquisition covers the whole completed batch before
-     * its references and job slots are retired. The caller serializes submissions, VM changes and retirement. */
+    /* Completed jobs are collected without waiting. Each job's written ranges are acquired before
+     * its mapping references and slot are retired. The caller serializes submissions, VM changes and retirement. */
     IOReturn retireCompleted();
     /* Waits for every outstanding job in submission order and retires its references. */
     IOReturn waitAll(const NativeAdrenoRingClock *,uint32_t timeout_us);
