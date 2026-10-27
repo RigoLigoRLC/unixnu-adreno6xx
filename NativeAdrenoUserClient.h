@@ -39,6 +39,10 @@ class NativeAdrenoUserClient final {
     Entry *entries_=nullptr;
     size_t entry_count_=0;
     size_t live_count_=0;
+    size_t mapped_count_=0;
+    NativeAdrenoSubmitResource *submit_resources_=nullptr;
+    NativeAdrenoSubmitBuffer *submit_buffers_=nullptr;
+    NativeAdrenoAbiResourceBudget map_failure_{};
     uint32_t free_head_=NativeAdrenoClientMaxObjects;
     Queue queues_[NativeAdrenoAbiMaxQueues]{};
     NativeAdrenoVm *vm_=nullptr;
@@ -102,6 +106,9 @@ public:
     IOReturn freeBo(const NativeAdrenoAbiBoFree *);
     IOReturn submit(const NativeAdrenoAbiSubmit *,NativeAdrenoAbiSubmitReply *,
         const NativeAdrenoRingClock *);
+    IOReturn submitV2(const void *,size_t,NativeAdrenoAbiSubmitV2Reply *);
+    IOReturn submitCaps(NativeAdrenoAbiSubmitCaps *);
+    IOReturn resourceBudget(NativeAdrenoAbiResourceBudget *) const;
     IOReturn cpuMap(const NativeAdrenoAbiBoCpuMap *,NativeAdrenoAbiBoCpuMapReply *,bool controlled=false);
     IOReturn cpuUnmap(const NativeAdrenoAbiBoCpuUnmap *,bool controlled=false);
     IOReturn createQueue(NativeAdrenoAbiQueueReply *);

@@ -143,8 +143,8 @@ IOReturn NativeAdrenoVm::preflight(const NativeAdrenoMemory *memory,unsigned upp
     const ArmSmmu4KLiveArena *a=regions_[upper].arena;
     if((iova&4095) || iova<a->iova || iova-a->iova>=a->bytes || memory->bytes()>a->bytes-(iova-a->iova))
         return kIOReturnBadArgument;
-    if(objects_>=mapping_capacity_) {
-        return kIOReturnNoResources;
+    if(objects_+reserved_objects_>=mapping_capacity_) {
+        return kIOReturnNoSpace;
     }
     const Mapping *next=lowerBound(iova);
     const Mapping *previous=next?next->previous:last_;
@@ -292,9 +292,14 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
     unsigned permissions,unsigned writeback,unsigned shareability,uint64_t *handle)
 {
     if(!handle)return kIOReturnBadArgument;*handle=0;result_={};
+    map_busy_alias_=false;
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     PhaseClock clock;
     IOReturn checked=preflight(memory,upper,iova,permissions,writeback,shareability);if(checked)return checked;
+    if(activeAlias(memory,0)) {
+        map_busy_alias_=true;
+        return kIOReturnBusy;
+    }
     if(next_handle_>(UINT64_MAX>>12) || free_head_>=mapping_capacity_) {
         return kIOReturnNoResources;
     }
@@ -327,6 +332,8 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
 
     Mapping *record=&mappings_[free_head_];
     free_head_=record->next_free;
+    ++reserved_objects_;
+    ++budget_generation_;
     *record={};
     record->memory=memory;
     record->ranges=changes;
@@ -352,6 +359,7 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
     if(status)return fail(status);
     clock.lap(0,3);
     insert(record,upper);record->mapped_spans=spans;result_.completed_spans=spans;
+    --reserved_objects_;
     clock.lap(0,4);clock.done(0,memory->bytes());
     *handle=record->handle;result_.complete=true;return kIOReturnSuccess;
 }
@@ -360,7 +368,9 @@ IOReturn NativeAdrenoVm::unmap(uint64_t handle)
     native_adreno_trace_stage=10;
     result_={};if(!attached_ || poisoned_)return kIOReturnNotReady;
     Mapping *record=find(handle);if(!record)return kIOReturnBadArgument;
-    if(record->jobs)return kIOReturnBusy;
+    if(record->jobs || activeAlias(record->memory,record->handle)) {
+        return kIOReturnBusy;
+    }
     PhaseClock clock;
     native_adreno_trace_stage=11;
     unsigned upper=regions_[1].arena && record->iova>=regions_[1].arena->iova;
@@ -390,6 +400,7 @@ IOReturn NativeAdrenoVm::unmap(uint64_t handle)
     *record={};
     record->next_free=free_head_;
     free_head_=size_t(record-mappings_);
+    ++budget_generation_;
     result_.complete=true;return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoVm::describe(uint64_t handle,uint64_t *iova,size_t *bytes,
@@ -519,6 +530,109 @@ IOReturn NativeAdrenoVm::peekWords(uint64_t iova,uint32_t *out,size_t count) con
     }
     return kIOReturnBadArgument;
 }
+bool NativeAdrenoVm::activeAlias(const NativeAdrenoMemory *memory,uint64_t excluded) const
+{
+    for(const Mapping *record=first_;record;record=record->next) {
+        if(!record->jobs || record->handle==excluded ||
+            (!memory->imported() && !record->memory->imported())) {
+            continue;
+        }
+        NativeAdrenoPhysicalIndex index(record->memory->spans(),record->physical_order,record->physical_count,true);
+        for(size_t at=0;at<memory->spanCount();++at) {
+            const NativeAdrenoPhysicalSpan &span=memory->spans()[at];
+            if(index.overlaps(span.physical,span.bytes)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void NativeAdrenoVm::addClient()
+{
+    ++clients_;
+    ++budget_generation_;
+}
+
+void NativeAdrenoVm::removeClient()
+{
+    if(clients_) {
+        --clients_;
+        ++budget_generation_;
+    }
+}
+
+bool NativeAdrenoVm::resourceNeedsMaintenance(uint64_t handle) const
+{
+    const Mapping *record=find(handle);
+    return record && !coherentMapping(record->writeback) &&
+        (record->memory->imported() || !record->memory->writeCombined() || distrust_write_combined_);
+}
+
+bool NativeAdrenoVm::resourceImported(uint64_t handle) const
+{
+    const Mapping *record=find(handle);
+    return record && record->memory->imported();
+}
+
+bool NativeAdrenoVm::resourcesAlias(uint64_t first,uint64_t second) const
+{
+    const Mapping *left=find(first);
+    const Mapping *right=find(second);
+    if(!left || !right) {
+        return false;
+    }
+    if(left->memory==right->memory) {
+        return true;
+    }
+    if(left->spans>right->spans) {
+        const Mapping *temporary=left;
+        left=right;
+        right=temporary;
+    }
+
+    NativeAdrenoPhysicalIndex index(right->memory->spans(),right->physical_order,right->physical_count,true);
+    for(size_t at=0;at<left->spans;++at) {
+        const NativeAdrenoPhysicalSpan &span=left->memory->spans()[at];
+        if(index.overlaps(span.physical,span.bytes)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+IOReturn NativeAdrenoVm::publishResource(uint64_t handle,size_t offset,size_t bytes,unsigned access)
+{
+    Mapping *record=find(handle);
+    if(!attached_ || poisoned_ || !record || !record->jobs || !access || (access&~3u) ||
+        (access&~record->permissions) || !bytes || ((offset|bytes)&4095) ||
+        offset>record->memory->bytes() || bytes>record->memory->bytes()-offset) {
+        return kIOReturnBadArgument;
+    }
+
+    uint32_t restored=0;
+    IOReturn status=record->memory->reassertWriteCombined(&restored);
+    if(status) {
+        return status;
+    }
+    if(!resourceNeedsMaintenance(handle)) {
+        return kIOReturnSuccess;
+    }
+    return record->memory->publishForDevice(offset,bytes,access&ArmSmmu4KWrite,distrust_write_combined_);
+}
+
+IOReturn NativeAdrenoVm::acquireResource(uint64_t handle,size_t offset,size_t bytes,unsigned access)
+{
+    Mapping *record=find(handle);
+    if(!attached_ || poisoned_ || !record || !record->jobs) {
+        return kIOReturnNotReady;
+    }
+    if(!(access&ArmSmmu4KWrite) || !resourceNeedsMaintenance(handle)) {
+        return kIOReturnSuccess;
+    }
+    return record->memory->acquireDeviceWrites(offset,bytes,true);
+}
+
 IOReturn NativeAdrenoVm::holdJob(uint64_t handle)
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;

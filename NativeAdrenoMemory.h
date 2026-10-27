@@ -215,7 +215,7 @@ public:
     /* A write-combined object is skipped unless include_write_combined: then its pages are maintained through the physical aperture,
      * for a client whose view turned out to be cacheable after all (NativeAdrenoVm::distrustWriteCombined). */
     IOReturn publishForDevice(size_t offset,size_t bytes,bool device_writes,bool include_write_combined=false);
-    IOReturn acquireDeviceWrites(size_t offset,size_t bytes);
+    IOReturn acquireDeviceWrites(size_t offset,size_t bytes,bool submitted_range=false);
     bool quarantined() const {return storage_.quarantined;}
     uint32_t deviceReferences() const {return device_references_;}
     size_t bytes() const {return storage_.bytes;}

@@ -57,6 +57,8 @@ struct ProfileSample {
     uint64_t mapUs;
     uint64_t freeUs;
     uint64_t allocUs;
+    uint32_t resourceCount,importCount,fallbackReason;
+    uint64_t importBytes;
 };
 static ProfileSample profileSamples[ProfileSamples];
 static uint32_t profileHead;
@@ -68,6 +70,13 @@ static uint64_t profileLatencyMax;
 static uint64_t profileLatencyBuckets[ProfileBuckets];
 static char profileClient[ProfileClientChars];
 static uint32_t profileLock;
+struct SubmitFailure {
+    uint64_t sampled_us=0,handle=0,iova=0,bytes=0;
+    uint32_t stage=0,status=0,index=0,ibs=0,resources=0;
+    char client[ProfileClientChars]{};
+};
+static SubmitFailure firstSubmitFailure;
+static uint64_t submitV2Counters[8]{}; /* Calls, resources, fallback, clean bytes, acquire bytes, busy, completed, failures. */
 /* Per-submission interval deltas of the ABI method totals, so the dump can
  * show the BO work between two submissions without sampling the clock. */
 static uint32_t profileLastCalls[6];
@@ -75,9 +84,9 @@ static uint32_t profileLastUs[6];
 static uint32_t profileMapCalls[5];
 static uint64_t profileMapUs[5];
 static uint64_t profileMapMax[5];
-static uint32_t profileLockCalls[20];
-static uint64_t profileLockUs[20];
-static uint64_t profileLockMax[20];
+static uint32_t profileLockCalls[NativeAdrenoMethodGetResourceBudget+1];
+static uint64_t profileLockUs[NativeAdrenoMethodGetResourceBudget+1];
+static uint64_t profileLockMax[NativeAdrenoMethodGetResourceBudget+1];
 static uint64_t profileNow()
 {
     return native_adreno_vm_now_us ? native_adreno_vm_now_us() : 0;
@@ -90,6 +99,25 @@ static void profileEnter()
 static void profileLeave()
 {
     __atomic_clear(&profileLock, __ATOMIC_RELEASE);
+}
+extern "C" void native_adreno_submit_failure(uint32_t stage,uint32_t status,uint64_t handle,
+    uint64_t iova,uint32_t index,uint32_t ibs,uint32_t resources,uint64_t bytes)
+{
+    profileEnter();
+    ++submitV2Counters[7];
+    if(!firstSubmitFailure.stage) {
+        firstSubmitFailure.sampled_us=profileNow();
+        firstSubmitFailure.handle=handle;
+        firstSubmitFailure.iova=iova;
+        firstSubmitFailure.bytes=bytes;
+        firstSubmitFailure.stage=stage;
+        firstSubmitFailure.status=status;
+        firstSubmitFailure.index=index;
+        firstSubmitFailure.ibs=ibs;
+        firstSubmitFailure.resources=resources;
+        memcpy(firstSubmitFailure.client,profileClient,sizeof(profileClient));
+    }
+    profileLeave();
 }
 extern "C" void native_adreno_profile_set_client(const char *name)
 {
@@ -119,7 +147,7 @@ extern "C" void native_adreno_profile_map(uint32_t pages, uint64_t us)
 }
 extern "C" void native_adreno_profile_lock_wait(uint32_t method, uint64_t us)
 {
-    if (method < 20) {
+    if (method <= NativeAdrenoMethodGetResourceBudget) {
         profileEnter();
         profileLockCalls[method] = profileLockCalls[method] + 1;
         profileLockUs[method] += us;
@@ -130,7 +158,8 @@ extern "C" void native_adreno_profile_lock_wait(uint32_t method, uint64_t us)
     }
 }
 static void profileNoteSubmit(uint32_t fence, uint32_t ibCount,
-    uint64_t t0, uint64_t t1, uint64_t t2, uint64_t t3, uint64_t t4, uint64_t t5)
+    uint64_t t0, uint64_t t1, uint64_t t2, uint64_t t3, uint64_t t4, uint64_t t5,
+    uint32_t resources=0,uint32_t imports=0,uint32_t fallback=0,uint64_t import_bytes=0)
 {
     profileEnter();
     uint32_t intervalCalls[6] = {};
@@ -147,6 +176,10 @@ static void profileNoteSubmit(uint32_t fence, uint32_t ibCount,
     sample.seq = ++profileSeq;
     sample.fence = fence;
     sample.ibCount = ibCount;
+    sample.resourceCount=resources;
+    sample.importCount=imports;
+    sample.fallbackReason=fallback;
+    sample.importBytes=import_bytes;
     sample.complete = 0;
     for (unsigned at = 0; at < sizeof(sample.client); ++at) {
         sample.client[at] = profileClient[at];
@@ -214,10 +247,14 @@ extern "C" void native_adreno_profile_dump(void)
     static uint32_t mapCalls[5];
     static uint64_t mapUs[5];
     static uint64_t mapMax[5];
-    static uint32_t lockCalls[20];
-    static uint64_t lockUs[20];
-    static uint64_t lockMax[20];
+    static uint32_t lockCalls[NativeAdrenoMethodGetResourceBudget+1];
+    static uint64_t lockUs[NativeAdrenoMethodGetResourceBudget+1];
+    static uint64_t lockMax[NativeAdrenoMethodGetResourceBudget+1];
+    SubmitFailure failure;
+    uint64_t v2[8];
     profileEnter();
+    failure=firstSubmitFailure;
+    memcpy(v2,submitV2Counters,sizeof(v2));
     submitted = profileSubmitted;
     completed = profileCompleted;
     latencyTotal = profileLatencyTotal;
@@ -233,22 +270,30 @@ extern "C" void native_adreno_profile_dump(void)
         mapUs[at] = profileMapUs[at];
         mapMax[at] = profileMapMax[at];
     }
-    for (unsigned at = 0; at < 20; ++at) {
+    for (unsigned at = 0; at <= NativeAdrenoMethodGetResourceBudget; ++at) {
         lockCalls[at] = profileLockCalls[at];
         lockUs[at] = profileLockUs[at];
         lockMax[at] = profileLockMax[at];
     }
     profileLeave();
+    IOLog("NativeAdrenoProfile: resources calls=%llu objects=%llu fallback=%llu clean_bytes=%llu acquire_bytes=%llu busy=%llu completed=%llu failures=%llu\n",
+        v2[0],v2[1],v2[2],v2[3],v2[4],v2[5],v2[6],v2[7]);
+    if(failure.stage) {
+        IOLog("NativeAdrenoProfile: first_failure client=%s stage=%u status=%08x index=%u ib=%u resources=%u t=%llu handle=%llx iova=%llx bytes=%llu\n",
+            failure.client,failure.stage,failure.status,failure.index,failure.ibs,failure.resources,
+            failure.sampled_us,failure.handle,failure.iova,failure.bytes);
+    }
     IOLog("NativeAdrenoProfile: summary submitted=%u completed=%u lat_total=%llu lat_max=%llu buckets=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
         submitted, completed, (unsigned long long)latencyTotal, (unsigned long long)latencyMax,
         (unsigned long long)buckets[0], (unsigned long long)buckets[1], (unsigned long long)buckets[2],
         (unsigned long long)buckets[3], (unsigned long long)buckets[4], (unsigned long long)buckets[5],
         (unsigned long long)buckets[6], (unsigned long long)buckets[7]);
-    IOLog("NativeAdrenoProfile: lock_wait m2=%u/%llu/%llu m3=%u/%llu/%llu m4=%u/%llu/%llu m5=%u/%llu/%llu\n",
+    IOLog("NativeAdrenoProfile: lock_wait m2=%u/%llu/%llu m3=%u/%llu/%llu m4=%u/%llu/%llu m5=%u/%llu/%llu m21=%u/%llu/%llu\n",
         lockCalls[2], (unsigned long long)lockUs[2], (unsigned long long)lockMax[2],
         lockCalls[3], (unsigned long long)lockUs[3], (unsigned long long)lockMax[3],
         lockCalls[4], (unsigned long long)lockUs[4], (unsigned long long)lockMax[4],
-        lockCalls[5], (unsigned long long)lockUs[5], (unsigned long long)lockMax[5]);
+        lockCalls[5], (unsigned long long)lockUs[5], (unsigned long long)lockMax[5],
+        lockCalls[21], (unsigned long long)lockUs[21], (unsigned long long)lockMax[21]);
     IOLog("NativeAdrenoProfile: map_pages one=%u/%llu/%llu small=%u/%llu/%llu medium=%u/%llu/%llu large=%u/%llu/%llu huge=%u/%llu/%llu\n",
         mapCalls[4], (unsigned long long)mapUs[4], (unsigned long long)mapMax[4],
         mapCalls[0], (unsigned long long)mapUs[0], (unsigned long long)mapMax[0],
@@ -260,14 +305,15 @@ extern "C" void native_adreno_profile_dump(void)
         if (!sample.seq) {
             continue;
         }
-        IOLog("NativeAdrenoProfile: S seq=%u fence=%u client=%s ib=%u complete=%u t=%llu c=%llu lat=%u submit_cpu=%u retire=%u cache=%u publish=%u tlb=%u ring=%u map=%u/%llu free=%u/%llu alloc=%u/%llu\n",
+        IOLog("NativeAdrenoProfile: S seq=%u fence=%u client=%s ib=%u complete=%u t=%llu c=%llu lat=%u submit_cpu=%u retire=%u cache=%u publish=%u tlb=%u ring=%u map=%u/%llu free=%u/%llu alloc=%u/%llu resources=%u imports=%u import_bytes=%llu fallback=%u\n",
             sample.seq, sample.fence, sample.client, sample.ibCount, sample.complete,
             (unsigned long long)sample.submitUs, (unsigned long long)sample.completeUs,
             sample.latencyUs, sample.submitCpuUs, sample.retireUs, sample.cacheUs,
             sample.publishUs, sample.tlbUs, sample.ringUs,
             sample.mapCalls, (unsigned long long)sample.mapUs,
             sample.freeCalls, (unsigned long long)sample.freeUs,
-            sample.allocCalls, (unsigned long long)sample.allocUs);
+            sample.allocCalls, (unsigned long long)sample.allocUs,
+            sample.resourceCount,sample.importCount,(unsigned long long)sample.importBytes,sample.fallbackReason);
     }
 }
 IOReturn NativeAdrenoSubmit::poison()
@@ -288,11 +334,49 @@ IOReturn NativeAdrenoSubmit::attach(NativeAdrenoVm *vm,NativeAdrenoRing *ring)
 {
     if(attached_ || poisoned_ || vm_ || ring_)return kIOReturnBusy;
     if(!vm || !ring || vm->poisoned() || ring->poisoned())return kIOReturnBadArgument;
+    resource_storage_=IONewData(NativeAdrenoSubmitResource,SubmitMaxJobs*NativeAdrenoSubmitMaxResources);
+    command_words_=IONewData(uint32_t,NativeAdrenoSubmitMaxIbs*4);
+    if(!resource_storage_ || !command_words_) {
+        if(resource_storage_) {
+            IODeleteData(resource_storage_,NativeAdrenoSubmitResource,SubmitMaxJobs*NativeAdrenoSubmitMaxResources);
+            resource_storage_=nullptr;
+        }
+        if(command_words_) {
+            IODeleteData(command_words_,uint32_t,NativeAdrenoSubmitMaxIbs*4);
+            command_words_=nullptr;
+        }
+        return kIOReturnNoMemory;
+    }
     vm_=vm;ring_=ring;attached_=true;stats_={};
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoSubmit::release(Job &job, bool acquire_imported)
 {
+    if(job.resources) {
+        for(size_t at=0;at<job.resource_count;++at) {
+            const NativeAdrenoSubmitResource &resource=job.resources[at];
+            if(vm_->acquireResource(resource.handle,resource.offset,resource.bytes,resource.access)) {
+                return poison();
+            }
+            if(resource.maintenance && (resource.access&NativeAdrenoResourceWrite)) {
+                profileEnter();
+                submitV2Counters[4]+=resource.bytes;
+                profileLeave();
+            }
+        }
+        __asm__ volatile("dsb ld" ::: "memory");
+        for(size_t at=0;at<job.resource_count;++at) {
+            if(vm_->retireJobAfterCompletion(job.resources[at].handle)) {
+                return poison();
+            }
+            ++stats_.references_retired;
+        }
+        profileEnter();
+        ++submitV2Counters[6];
+        profileLeave();
+        job={};
+        return kIOReturnSuccess;
+    }
     IOReturn status=kIOReturnSuccess;
     for(size_t i=0;i<job.count;++i) {
         IOReturn retired=vm_->retireJobAfterCompletion(job.handles[i]);
@@ -306,6 +390,10 @@ IOReturn NativeAdrenoSubmit::detach()
 {
     if(poisoned_ || outstanding())return kIOReturnBusy;
     if(!attached_)return kIOReturnNotReady;
+    IODeleteData(resource_storage_,NativeAdrenoSubmitResource,SubmitMaxJobs*NativeAdrenoSubmitMaxResources);
+    IODeleteData(command_words_,uint32_t,NativeAdrenoSubmitMaxIbs*4);
+    resource_storage_=nullptr;
+    command_words_=nullptr;
     attached_=false;vm_=nullptr;ring_=nullptr;return kIOReturnSuccess;
 }
 bool NativeAdrenoSubmit::queueOutstanding(uint32_t queue) const
@@ -455,6 +543,182 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
     *fence=value;
     return kIOReturnSuccess;
 }
+IOReturn NativeAdrenoSubmit::submitResources(const NativeAdrenoSubmitBuffer *buffers,size_t count,
+    const NativeAdrenoSubmitResource *resources,size_t resource_count,uint32_t queue,
+    uint32_t fallback_reason,uint32_t *fence)
+{
+    if(!fence) {
+        return kIOReturnBadArgument;
+    }
+    *fence=0;
+    if(!attached_ || poisoned_) {
+        return kIOReturnNotReady;
+    }
+    if(!buffers || !count || count>NativeAdrenoSubmitMaxIbs || !resources ||
+        !resource_count || resource_count>NativeAdrenoSubmitMaxResources) {
+        return kIOReturnBadArgument;
+    }
+
+    const uint64_t began=profileNow();
+    IOReturn status=retireCompleted();
+    const uint64_t retired=profileNow();
+    if(status) {
+        return status;
+    }
+    Job *job=free();
+    if(!job) {
+        return kIOReturnBusy;
+    }
+
+    /* Cached ranges require a CPU ownership transition. Every preceding GPU
+     * writer finishes its acquisition before another job can publish an alias.
+     * Read-only users can overlap, and WC-only jobs retain ordinary ring order. */
+    for(size_t at=0;at<resource_count;++at) {
+        const NativeAdrenoSubmitResource &resource=resources[at];
+        const bool maintenance=vm_->resourceNeedsMaintenance(resource.handle);
+        for(const Job &previous:jobs_) {
+            if(!previous.active) {
+                continue;
+            }
+            if(!previous.resources) {
+                return kIOReturnBusy;
+            }
+            const size_t previous_count=maintenance?previous.resource_count:previous.maintenance_count;
+            for(size_t old=0;old<previous_count;++old) {
+                const NativeAdrenoSubmitResource &prior=previous.resources[old];
+                if((maintenance || prior.maintenance) &&
+                    ((resource.access|prior.access)&NativeAdrenoResourceWrite) &&
+                    vm_->resourcesAlias(resource.handle,prior.handle)) {
+                    profileEnter();
+                    ++submitV2Counters[5];
+                    profileLeave();
+                    return kIOReturnBusy;
+                }
+            }
+        }
+    }
+
+    size_t word_count=0;
+    for(size_t at=0;at<count;++at) {
+        const NativeAdrenoSubmitBuffer &buffer=buffers[at];
+        uint64_t iova=0;
+        size_t bytes=0;
+        unsigned permissions=0;
+        status=vm_->describe(buffer.handle,&iova,&bytes,&permissions);
+        if(status || !buffer.bytes || (buffer.bytes&3) || buffer.bytes>SubmitMaxIbBytes ||
+            !(permissions&ArmSmmu4KRead) || buffer.iova<iova || buffer.iova-iova>bytes ||
+            buffer.bytes>bytes-(buffer.iova-iova)) {
+            native_adreno_submit_failure(4,kIOReturnBadArgument,buffer.handle,buffer.iova,
+                uint32_t(at),uint32_t(count),uint32_t(resource_count));
+            return kIOReturnBadArgument;
+        }
+        uint32_t header=0;
+        if(AdrenoPM4Type7(SubmitIndirectBuffer,SubmitIbWords,&header)!=AdrenoPM4Success) {
+            return poison();
+        }
+        command_words_[word_count++]=header;
+        command_words_[word_count++]=uint32_t(buffer.iova);
+        command_words_[word_count++]=uint32_t(buffer.iova>>32);
+        command_words_[word_count++]=uint32_t(buffer.bytes/4);
+    }
+
+    NativeAdrenoSubmitResource *held=resource_storage_+(job-jobs_)*NativeAdrenoSubmitMaxResources;
+    size_t maintenance_count=0;
+    size_t copied=0;
+    for(unsigned pass=0;pass<2;++pass) {
+        for(size_t at=0;at<resource_count;++at) {
+            const bool maintenance=vm_->resourceNeedsMaintenance(resources[at].handle);
+            if(maintenance!=(pass==0)) {
+                continue;
+            }
+            held[copied]=resources[at];
+            held[copied++].maintenance=maintenance;
+        }
+        if(!pass) {
+            maintenance_count=copied;
+        }
+    }
+    size_t held_count=0;
+    for(;held_count<resource_count;++held_count) {
+        status=vm_->holdJob(held[held_count].handle);
+        if(status) {
+            break;
+        }
+        ++stats_.references_held;
+    }
+    if(status) {
+        while(held_count) {
+            vm_->retireJobAfterCompletion(held[--held_count].handle);
+            ++stats_.references_retired;
+        }
+        return status;
+    }
+
+    uint64_t published_bytes=0;
+    uint64_t import_bytes=0;
+    uint32_t import_count=0;
+    for(size_t at=0;at<resource_count;++at) {
+        const NativeAdrenoSubmitResource &resource=held[at];
+        status=vm_->publishResource(resource.handle,resource.offset,resource.bytes,resource.access);
+        if(status) {
+            native_adreno_submit_failure(5,status,resource.handle,0,uint32_t(at),uint32_t(count),uint32_t(resource_count));
+            break;
+        }
+        if(resource.maintenance) {
+            published_bytes+=resource.bytes;
+            if(vm_->resourceImported(resource.handle)) {
+                ++import_count;
+                import_bytes+=resource.bytes;
+            }
+        }
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+    const uint64_t published=profileNow();
+    /* Mapping fills invalid leaves, and unmapping synchronizes its removed
+     * translations before returning. Submission preserves those translations. */
+    const uint64_t tlb=profileNow();
+    if(!status) {
+        uint32_t value=0;
+        status=ring_->submitFramed(command_words_,word_count,&value);
+        if(!status || ring_->poisoned()) {
+            job->resources=held;
+            job->resource_count=resource_count;
+            job->maintenance_count=maintenance_count;
+            job->queue=queue;
+            job->fence=value;
+            job->active=true;
+            if(status) {
+                ++stats_.poisoned_jobs;
+                native_adreno_submit_failure(6,status,0,0,0,uint32_t(count),uint32_t(resource_count));
+                return poison();
+            }
+            ++stats_.submissions;
+            if(outstanding()>stats_.peak_jobs) {
+                stats_.peak_jobs=outstanding();
+            }
+            profileEnter();
+            ++submitV2Counters[0];
+            submitV2Counters[1]+=resource_count;
+            submitV2Counters[2]+=fallback_reason!=0;
+            submitV2Counters[3]+=published_bytes;
+            profileLeave();
+            profileNoteSubmit(value,uint32_t(count),began,retired,retired,published,tlb,profileNow(),
+                uint32_t(resource_count),import_count,fallback_reason,import_bytes);
+            *fence=value;
+            return kIOReturnSuccess;
+        }
+        if(status==kIOReturnNoResources) {
+            status=kIOReturnBusy;
+        }
+    }
+
+    while(held_count) {
+        vm_->retireJobAfterCompletion(held[--held_count].handle);
+        ++stats_.references_retired;
+    }
+    return status;
+}
+
 IOReturn NativeAdrenoSubmit::observeFence(uint32_t fence,const NativeAdrenoRingClock *clock,
     uint32_t timeout_us)
 {
@@ -486,7 +750,7 @@ IOReturn NativeAdrenoSubmit::wait(uint32_t fence,const NativeAdrenoRingClock *cl
             return kIOReturnTimeout;
         }
         profileNoteComplete(fence);
-        return kIOReturnSuccess;
+        return retireCompleted();
     }
     const NativeAdrenoRingFence result=ring_->wait(fence,clock,timeout_us,&observed);
     if(result==NativeAdrenoRingFencePoisoned)return poison();
@@ -498,10 +762,7 @@ IOReturn NativeAdrenoSubmit::wait(uint32_t fence,const NativeAdrenoRingClock *cl
         return kIOReturnTimeout;
     }
     profileNoteComplete(fence);
-    IOReturn status=release(*job);
-    if(status)return status;
-    ++stats_.completed;
-    return kIOReturnSuccess;
+    return retireCompleted();
 }
 IOReturn NativeAdrenoSubmit::waitAll(const NativeAdrenoRingClock *clock,uint32_t timeout_us)
 {
@@ -553,7 +814,11 @@ IOReturn NativeAdrenoSubmit::retireCompleted()
         return kIOReturnSuccess;
     }
 
-    if (vm_->acquireImported()) {
+    bool legacy=false;
+    for(size_t at=0;at<count;++at) {
+        legacy|=!completed[at]->resources;
+    }
+    if(legacy && vm_->acquireImported()) {
         return poison();
     }
 

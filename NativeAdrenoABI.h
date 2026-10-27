@@ -3,13 +3,10 @@
 #define NATIVE_ADRENO_ABI_H
 #include <stdint.h>
 
-/* Versioned kernel/user-client wire ABI for the native Adreno driver. This is
- * NOT the Metal, IOKit or Turnip ABI and it does not describe an ioctl. The
- * IOKit service will copy exactly these fixed-size records across its external
- * methods. All fields are little endian; both participants are ARM64. Every
- * array is inside one fixed record so a caller cannot pass a length that
- * disagrees with the storage. Unknown versions, methods and flags are refused
- * rather than ignored. */
+/* NativeAdreno wire records carry BO, mapping and submission requests through
+ * IOKit external methods. Fixed records have exact lengths; SubmitV2 carries
+ * bounded arrays at checked offsets in one copied packet. Both participants
+ * use ARM64 little-endian fields. Unknown versions, methods and flags fail. */
 enum {
     NativeAdrenoAbiVersion = 1,
     NativeAdrenoAbiMaxBuffers = 16,
@@ -33,6 +30,9 @@ enum {
     NativeAdrenoMethodReportBoProfile = 17,
     NativeAdrenoMethodBoCpuMapV2 = 18,
     NativeAdrenoMethodBoCpuUnmapV2 = 19,
+    NativeAdrenoMethodQuerySubmitV2 = 20,
+    NativeAdrenoMethodSubmitV2 = 21,
+    NativeAdrenoMethodGetResourceBudget = 22,
     NativeAdrenoAbiMetadataBytes = 64,
     NativeAdrenoAbiMaxQueues = 8
 };
@@ -48,6 +48,8 @@ enum {
     NativeAdrenoParamsBoProfile = 2,
     NativeAdrenoParamsCpuMapV2 = 4,
     NativeAdrenoParamsBoProfileBudget = 8,
+    NativeAdrenoParamsSubmitV2 = 16,
+    NativeAdrenoParamsResourceBudget = 32,
     NativeAdrenoCpuMapVersion = 1
 };
 
@@ -126,9 +128,12 @@ struct NativeAdrenoAbiBoAlloc {
 struct NativeAdrenoAbiBoAllocReply {
     uint64_t handle;              /* opaque to userspace, nonzero */
 };
-/* Pins [address, address + bytes) of the CALLING task and makes it a BO (reply: NativeAdrenoAbiBoAllocReply). The pages stay wired
- * until BoFree; they keep the caller's own CPU mapping and cache mode, so the caller cleans its caches before GPU use and invalidates
- * them after GPU writes (the GPU maps them non-cacheable). An imported BO has no CPU-map token. */
+/* NativeAdrenoAbiBoImport pins the calling task's pages until BoFree while
+ * preserving its CPU mapping and cache mode. A kernel advertising
+ * NativeAdrenoSubmitKernelCacheMaintenance publishes the submitted import
+ * ranges before GPU use and acquires GPU writes before reporting completion.
+ * Producers finish CPU writes before submit and resume access after completion.
+ * An imported BO has no CPU-map token. */
 struct NativeAdrenoAbiBoImport {
     uint64_t address;             /* 4KiB aligned */
     uint64_t bytes;               /* 4KiB multiple, <= max_bo_bytes */
@@ -168,6 +173,67 @@ struct NativeAdrenoAbiMetadata {
 };
 struct NativeAdrenoAbiSubmitReply {
     uint64_t fence;               /* nonzero CP timestamp value */
+};
+enum {
+    NativeAdrenoSubmitVersion = 1,
+    NativeAdrenoSubmitMaxPacketBytes = 262144,
+    NativeAdrenoSubmitMaxIbs = 512,
+    NativeAdrenoSubmitMaxResources = 4096,
+    NativeAdrenoSubmitKernelCacheMaintenance = 1,
+    NativeAdrenoSubmitAllMapped = 1,
+    NativeAdrenoResourceRead = 1,
+    NativeAdrenoResourceWrite = 2,
+    NativeAdrenoFallbackNone = 0,
+    NativeAdrenoFallbackIncompleteTracking = 1,
+    NativeAdrenoFallbackDeviceAddress = 2,
+    NativeAdrenoFallbackDescriptorBuffer = 4,
+    NativeAdrenoFallbackLegacySubmit = 8,
+    NativeAdrenoResourceBudgetVersion = 1,
+    NativeAdrenoBudgetMapNoSpace = 1,
+    NativeAdrenoMapFailureNone = 0,
+    NativeAdrenoMapFailureCapacity = 1,
+    NativeAdrenoMapFailureAddress = 2,
+    NativeAdrenoMapFailureTables = 3,
+    NativeAdrenoMapFailureOther = 4,
+    NativeAdrenoMapFailureActiveAlias = 5
+};
+struct NativeAdrenoAbiSubmitCaps {
+    uint32_t version,max_packet_bytes,max_ibs,max_resources;
+    uint32_t flags,reserved;      /* NativeAdrenoSubmitKernelCacheMaintenance. */
+    uint64_t epoch;
+};
+/* NativeAdrenoAbiSubmitV2 contains offsets into one copied packet. Its arrays
+ * contain NativeAdrenoAbiSubmitIbV2 and NativeAdrenoAbiSubmitResourceV2 records.
+ * Each resource handle already includes the BO generation. The connection
+ * keeps its GPU mapping unchanged until BoFree, so an additional mapping ID
+ * is unnecessary. AllMapped retains every mapped BO in this connection while
+ * the explicit resource array still supplies the IB indices. */
+struct NativeAdrenoAbiSubmitV2 {
+    uint32_t version,header_bytes,total_bytes,flags;
+    uint32_t ib_count,resource_count,ib_offset,resource_offset;
+    uint64_t queue,epoch;
+    uint32_t fallback_reason,reserved;
+    uint64_t reserved2;
+};
+struct NativeAdrenoAbiSubmitResourceV2 {
+    uint64_t handle,offset,bytes;
+    uint32_t access,reserved;
+};
+struct NativeAdrenoAbiSubmitIbV2 {
+    uint32_t resource_index,reserved;
+    uint64_t offset,bytes;        /* BO-relative range, contained in its resource. */
+};
+struct NativeAdrenoAbiSubmitV2Reply {
+    uint64_t fence,epoch;
+};
+/* NativeAdrenoAbiResourceBudget reports the shared mapping table and this
+ * connection's share. connection_target is a fair cache target, not an
+ * allocation refusal threshold. BoMap returns NoSpace only when no shared
+ * mapping entry is available; page-table failures retain their own status. */
+struct NativeAdrenoAbiResourceBudget {
+    uint32_t version,flags,capacity,used,reserved,connection_used,connection_target,active_connections;
+    uint64_t generation,last_failure_handle,last_failure_iova;
+    uint32_t last_failure_reason,last_failure_status;
 };
 struct NativeAdrenoAbiWaitFence {
     uint64_t fence;
@@ -246,6 +312,12 @@ static_assert(sizeof(NativeAdrenoAbiBoMap) == 32, "ABI map layout");
 static_assert(sizeof(NativeAdrenoAbiBoImport) == 16, "ABI import layout");
 static_assert(sizeof(NativeAdrenoAbiSubmitBuffer) == 24, "ABI buffer layout");
 static_assert(sizeof(NativeAdrenoAbiSubmit) == 416, "ABI submit layout");
+static_assert(sizeof(NativeAdrenoAbiSubmitCaps) == 32, "ABI submit caps layout");
+static_assert(sizeof(NativeAdrenoAbiSubmitV2) == 64, "ABI submit v2 layout");
+static_assert(sizeof(NativeAdrenoAbiSubmitResourceV2) == 32, "ABI submit resource layout");
+static_assert(sizeof(NativeAdrenoAbiSubmitIbV2) == 24, "ABI submit ib layout");
+static_assert(sizeof(NativeAdrenoAbiSubmitV2Reply) == 16, "ABI submit v2 reply layout");
+static_assert(sizeof(NativeAdrenoAbiResourceBudget) == 64, "ABI resource budget layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuMap) == 8, "ABI cpu map layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuMapReply) == 16, "ABI cpu map reply layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuUnmap) == 16, "ABI cpu unmap layout");

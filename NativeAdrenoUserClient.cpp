@@ -114,7 +114,23 @@ IOReturn NativeAdrenoUserClient::open(uint32_t abi_version,NativeAdrenoVm *vm,
         output_bits<32 || output_bits>48 || vm->poisoned() || submit->poisoned() ||
         ring->poisoned())return kIOReturnBadArgument;
     entries_=IONewData(Entry,NativeAdrenoClientMaxObjects);
-    if(!entries_)return kIOReturnNoMemory;
+    submit_resources_=IONewData(NativeAdrenoSubmitResource,NativeAdrenoSubmitMaxResources);
+    submit_buffers_=IONewData(NativeAdrenoSubmitBuffer,NativeAdrenoSubmitMaxIbs);
+    if(!entries_ || !submit_resources_ || !submit_buffers_) {
+        if(entries_) {
+            IODeleteData(entries_,Entry,NativeAdrenoClientMaxObjects);
+            entries_=nullptr;
+        }
+        if(submit_resources_) {
+            IODeleteData(submit_resources_,NativeAdrenoSubmitResource,NativeAdrenoSubmitMaxResources);
+            submit_resources_=nullptr;
+        }
+        if(submit_buffers_) {
+            IODeleteData(submit_buffers_,NativeAdrenoSubmitBuffer,NativeAdrenoSubmitMaxIbs);
+            submit_buffers_=nullptr;
+        }
+        return kIOReturnNoMemory;
+    }
     memset(entries_,0,sizeof(Entry)*NativeAdrenoClientMaxObjects);
     entry_count_=NativeAdrenoClientMaxObjects;
     for(size_t index=0;index<entry_count_;++index) {
@@ -123,6 +139,7 @@ IOReturn NativeAdrenoUserClient::open(uint32_t abi_version,NativeAdrenoVm *vm,
     free_head_=0;
     live_count_=0;
     vm_=vm;submit_=submit;ring_=ring;input_bits_=input_bits;output_bits_=output_bits;
+    vm_->addClient();
     open_=true;
     queues_[0]={0,true};
     /* Each client is a new GPU context for the CP: its first submission clears the BR/BV synchronization state. */
@@ -152,6 +169,11 @@ IOReturn NativeAdrenoUserClient::close()
     for(size_t i=1;i<NativeAdrenoAbiMaxQueues;++i)if(queues_[i].active)return kIOReturnBusy;
     (void)NativeAdrenoMemory::trimBackingCache();
     IODeleteData(entries_,Entry,entry_count_);
+    IODeleteData(submit_resources_,NativeAdrenoSubmitResource,NativeAdrenoSubmitMaxResources);
+    IODeleteData(submit_buffers_,NativeAdrenoSubmitBuffer,NativeAdrenoSubmitMaxIbs);
+    submit_resources_=nullptr;
+    submit_buffers_=nullptr;
+    vm_->removeClient();
     entries_=nullptr;
     entry_count_=0;
     live_count_=0;
@@ -203,7 +225,8 @@ IOReturn NativeAdrenoUserClient::query(NativeAdrenoAbiParams *params)
     params->abi_version=NativeAdrenoAbiVersion;
     params->input_bits=input_bits_;params->output_bits=output_bits_;
     params->flags=NativeAdrenoParamsHostImport|NativeAdrenoParamsBoProfile|
-        NativeAdrenoParamsCpuMapV2|NativeAdrenoParamsBoProfileBudget;
+        NativeAdrenoParamsCpuMapV2|NativeAdrenoParamsBoProfileBudget|
+        NativeAdrenoParamsSubmitV2|NativeAdrenoParamsResourceBudget;
     params->max_bo_bytes=UINT64_C(1)<<NativeAdrenoAbiMaxBoBytesShift;
     return kIOReturnSuccess;
 }
@@ -328,6 +351,10 @@ IOReturn NativeAdrenoUserClient::mapBo(const NativeAdrenoAbiBoMap *request,
     /* Only memory the GPU never writes is mapped coherent: sysmem passes written through write-back inner-shareable mappings stopped
      * the GPU inside its end-of-pass cache clean (BR and BV idle at the clean events), while non-coherent mappings never did. */
     const bool coherent=entry->memory.imported() && native_adreno_io_coherent && !(permissions&2u);
+    const IOReturn completed=submit_->retireCompleted();
+    if(completed) {
+        return completed;
+    }
     const uint64_t mapBegan=native_adreno_vm_now_us?native_adreno_vm_now_us():0;
     const IOReturn status=vm_->map(&entry->memory,0,request->iova,permissions,
         coherent?1u:request->writeback,coherent?3u:request->shareability,&handle);
@@ -336,8 +363,18 @@ IOReturn NativeAdrenoUserClient::mapBo(const NativeAdrenoAbiBoMap *request,
         const uint64_t pages=(entry->memory.bytes()+4095)/4096;
         native_adreno_profile_map(uint32_t(pages>0xffffffffu?0xffffffffu:pages),mapEnded>mapBegan?mapEnded-mapBegan:0);
     }
-    if(status)return status;
+    if(status) {
+        map_failure_.last_failure_handle=request->handle;
+        map_failure_.last_failure_iova=request->iova;
+        map_failure_.last_failure_status=status;
+        map_failure_.last_failure_reason=status==kIOReturnNoSpace?NativeAdrenoMapFailureCapacity:
+            status==kIOReturnBusy && vm_->mapBusyAlias()?NativeAdrenoMapFailureActiveAlias:
+            status==kIOReturnBadArgument || status==kIOReturnBusy?NativeAdrenoMapFailureAddress:
+            status==kIOReturnNoResources?NativeAdrenoMapFailureTables:NativeAdrenoMapFailureOther;
+        return status;
+    }
     entry->mapped=handle;entry->iova=request->iova;entry->mapped_state=true;
+    ++mapped_count_;
     if(end>window_peak_)window_peak_=end;
     if(window_bytes_ && window_peak_>window_start_)clientStats(queue_base_,window_bytes_)[5]=(uint32_t)((window_peak_-window_start_)>>20);
     reply->iova=request->iova;
@@ -369,6 +406,7 @@ IOReturn NativeAdrenoUserClient::freeBo(const NativeAdrenoAbiBoFree *request)
         native_adreno_trace_stage=4;
         if(unmap) {noteFreeRefused(entry->imported,entry->handle,unmap);return unmap;}
         entry->mapped_state=false;entry->mapped=0;entry->iova=0;
+        --mapped_count_;
     }
     const IOReturn release=entry->memory.release(true);
     if(release) {noteFreeRefused(entry->imported,entry->handle,release);return release;}
@@ -401,13 +439,174 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
         if(!entry || !entry->mapped_state)return kIOReturnBadArgument;
         buffers[i]={entry->mapped,wire.iova,(size_t)wire.bytes};
     }
+    size_t resource_count=0;
+    for(size_t at=0;at<entry_count_;++at) {
+        const Entry &entry=entries_[at];
+        if(!entry.used || !entry.mapped_state) {
+            continue;
+        }
+        uint64_t iova=0;
+        size_t bytes=0;
+        unsigned permissions=0;
+        const IOReturn described=vm_->describe(entry.mapped,&iova,&bytes,&permissions);
+        if(described) {
+            return described;
+        }
+        submit_resources_[resource_count++]={entry.mapped,0,bytes,permissions&3u,false};
+    }
     uint32_t fence=0;
     used_=true;
-    const IOReturn status=submit_->submit(buffers,request->buffer_count,
-        queue_base_+static_cast<uint32_t>(request->queue),&fence);
+    const IOReturn status=submit_->submitResources(buffers,request->buffer_count,
+        submit_resources_,resource_count,queue_base_+static_cast<uint32_t>(request->queue),
+        NativeAdrenoFallbackLegacySubmit,&fence);
     if(status)return status;
     reply->fence=fence;
     return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoUserClient::submitCaps(NativeAdrenoAbiSubmitCaps *reply)
+{
+    if(!reply || !open_) {
+        return kIOReturnNotReady;
+    }
+    *reply={NativeAdrenoSubmitVersion,NativeAdrenoSubmitMaxPacketBytes,
+        NativeAdrenoSubmitMaxIbs,NativeAdrenoSubmitMaxResources,
+        NativeAdrenoSubmitKernelCacheMaintenance,0,status_?status_->suspends()+1:1};
+    return kIOReturnSuccess;
+}
+
+IOReturn NativeAdrenoUserClient::resourceBudget(NativeAdrenoAbiResourceBudget *reply) const
+{
+    if(!reply || !open_) {
+        return kIOReturnNotReady;
+    }
+    *reply=map_failure_;
+    reply->version=NativeAdrenoResourceBudgetVersion;
+    reply->flags=NativeAdrenoBudgetMapNoSpace;
+    reply->capacity=uint32_t(vm_->objectCapacity());
+    reply->used=uint32_t(vm_->objectCount());
+    reply->reserved=uint32_t(vm_->reservedObjects());
+    reply->connection_used=uint32_t(mapped_count_);
+    reply->active_connections=vm_->clientCount();
+    reply->connection_target=reply->capacity/(reply->active_connections?reply->active_connections:1);
+    reply->generation=vm_->budgetGeneration();
+    return kIOReturnSuccess;
+}
+
+IOReturn NativeAdrenoUserClient::submitV2(const void *input,size_t input_size,NativeAdrenoAbiSubmitV2Reply *reply)
+{
+    if(!open_ || !reply) {
+        return kIOReturnNotReady;
+    }
+    *reply={};
+    if(!input || input_size<sizeof(NativeAdrenoAbiSubmitV2) || input_size>NativeAdrenoSubmitMaxPacketBytes) {
+        native_adreno_submit_failure(1,kIOReturnBadArgument,0,0,0,0,0);
+        return kIOReturnBadArgument;
+    }
+    const auto &header=*static_cast<const NativeAdrenoAbiSubmitV2 *>(input);
+    const uint32_t allowed_reasons=NativeAdrenoFallbackIncompleteTracking|NativeAdrenoFallbackDeviceAddress|
+        NativeAdrenoFallbackDescriptorBuffer|NativeAdrenoFallbackLegacySubmit;
+    const uint64_t epoch=status_?status_->suspends()+1:1;
+    if(header.version!=NativeAdrenoSubmitVersion || header.header_bytes!=sizeof(header) ||
+        header.total_bytes!=input_size || (header.flags&~NativeAdrenoSubmitAllMapped) ||
+        header.reserved || header.reserved2 || !header.ib_count || header.ib_count>NativeAdrenoSubmitMaxIbs ||
+        !header.resource_count || header.resource_count>NativeAdrenoSubmitMaxResources ||
+        (header.fallback_reason&~allowed_reasons) ||
+        bool(header.flags&NativeAdrenoSubmitAllMapped)!=bool(header.fallback_reason) ||
+        header.queue>=NativeAdrenoAbiMaxQueues || !queues_[header.queue].active) {
+        native_adreno_submit_failure(1,kIOReturnBadArgument,0,0,0,header.ib_count,header.resource_count);
+        return kIOReturnBadArgument;
+    }
+    if(header.epoch!=epoch) {
+        return kIOReturnNotReady;
+    }
+    const size_t ib_bytes=size_t(header.ib_count)*sizeof(NativeAdrenoAbiSubmitIbV2);
+    const size_t resource_bytes=size_t(header.resource_count)*sizeof(NativeAdrenoAbiSubmitResourceV2);
+    if((header.ib_offset&7) || (header.resource_offset&7) ||
+        header.ib_offset<sizeof(header) || header.ib_offset>input_size || ib_bytes>input_size-header.ib_offset ||
+        header.resource_offset<sizeof(header) || header.resource_offset>input_size ||
+        resource_bytes>input_size-header.resource_offset ||
+        (header.ib_offset<header.resource_offset+resource_bytes && header.resource_offset<header.ib_offset+ib_bytes)) {
+        native_adreno_submit_failure(1,kIOReturnBadArgument,0,0,0,header.ib_count,header.resource_count);
+        return kIOReturnBadArgument;
+    }
+
+    const auto *packet=static_cast<const uint8_t *>(input);
+    const auto *resources=reinterpret_cast<const NativeAdrenoAbiSubmitResourceV2 *>(packet+header.resource_offset);
+    const auto *ibs=reinterpret_cast<const NativeAdrenoAbiSubmitIbV2 *>(packet+header.ib_offset);
+    memset(submit_resources_,0,sizeof(*submit_resources_)*NativeAdrenoSubmitMaxResources);
+    for(uint32_t at=0;at<header.resource_count;++at) {
+        const auto &resource=resources[at];
+        Entry *entry=find(resource.handle);
+        uint64_t iova=0;
+        size_t bytes=0;
+        unsigned permissions=0;
+        if(!entry || !entry->mapped_state || entry->unreleasable || resource.reserved ||
+            !resource.access || (resource.access&~3u) || !resource.bytes ||
+            vm_->describe(entry->mapped,&iova,&bytes,&permissions) || (resource.access&~permissions) ||
+            resource.offset>bytes || resource.bytes>bytes-resource.offset) {
+            native_adreno_submit_failure(2,kIOReturnBadArgument,resource.handle,resource.offset,at,
+                header.ib_count,header.resource_count,resource.bytes);
+            return kIOReturnBadArgument;
+        }
+
+        const size_t first=size_t(resource.offset)&~size_t(4095);
+        const size_t end=(size_t(resource.offset+resource.bytes)+4095)&~size_t(4095);
+        NativeAdrenoSubmitResource &merged=submit_resources_[entry-entries_];
+        if(!merged.handle) {
+            merged={entry->mapped,first,end-first,resource.access,false};
+        } else {
+            const size_t merged_first=merged.offset<first?merged.offset:first;
+            const size_t merged_end=merged.offset+merged.bytes>end?merged.offset+merged.bytes:end;
+            merged.offset=merged_first;
+            merged.bytes=merged_end-merged_first;
+            merged.access|=resource.access;
+        }
+    }
+
+    for(uint32_t at=0;at<header.ib_count;++at) {
+        const auto &ib=ibs[at];
+        if(ib.reserved || ib.resource_index>=header.resource_count) {
+            native_adreno_submit_failure(3,kIOReturnBadArgument,0,ib.offset,at,header.ib_count,header.resource_count);
+            return kIOReturnBadArgument;
+        }
+        const auto &resource=resources[ib.resource_index];
+        Entry *entry=find(resource.handle);
+        if(!(resource.access&NativeAdrenoResourceRead) || !ib.bytes || ((ib.offset|ib.bytes)&3) ||
+            ib.offset<resource.offset || ib.offset-resource.offset>resource.bytes ||
+            ib.bytes>resource.bytes-(ib.offset-resource.offset)) {
+            native_adreno_submit_failure(3,kIOReturnBadArgument,resource.handle,ib.offset,at,
+                header.ib_count,header.resource_count,ib.bytes);
+            return kIOReturnBadArgument;
+        }
+        submit_buffers_[at]={entry->mapped,entry->iova+ib.offset,size_t(ib.bytes)};
+    }
+
+    size_t resource_count=0;
+    for(size_t at=0;at<entry_count_;++at) {
+        const Entry &entry=entries_[at];
+        if((header.flags&NativeAdrenoSubmitAllMapped) && entry.used && entry.mapped_state) {
+            uint64_t iova=0;
+            size_t bytes=0;
+            unsigned permissions=0;
+            const IOReturn described=vm_->describe(entry.mapped,&iova,&bytes,&permissions);
+            if(described) {
+                return described;
+            }
+            submit_resources_[at]={entry.mapped,0,bytes,permissions&3u,false};
+        }
+        if(submit_resources_[at].handle) {
+            submit_resources_[resource_count++]=submit_resources_[at];
+        }
+    }
+    uint32_t fence=0;
+    used_=true;
+    const IOReturn result=submit_->submitResources(submit_buffers_,header.ib_count,submit_resources_,resource_count,
+        queue_base_+uint32_t(header.queue),header.fallback_reason,&fence);
+    if(!result) {
+        reply->fence=fence;
+        reply->epoch=epoch;
+    }
+    return result;
 }
 IOReturn NativeAdrenoUserClient::attachTimer(const NativeAdrenoTimer *timer)
 {
@@ -459,6 +658,8 @@ size_t NativeAdrenoUserClient::inputSize(uint32_t method)
 {
     switch(method) {
     case NativeAdrenoMethodQuery:
+    case NativeAdrenoMethodQuerySubmitV2:
+    case NativeAdrenoMethodGetResourceBudget:
     case NativeAdrenoMethodGetTimestamp:
     case NativeAdrenoMethodGetStatus:
     case NativeAdrenoMethodGetDeviceInfo:return 0;
@@ -481,6 +682,8 @@ size_t NativeAdrenoUserClient::outputSize(uint32_t method)
 {
     switch(method) {
     case NativeAdrenoMethodQuery:return sizeof(NativeAdrenoAbiParams);
+    case NativeAdrenoMethodQuerySubmitV2:return sizeof(NativeAdrenoAbiSubmitCaps);
+    case NativeAdrenoMethodGetResourceBudget:return sizeof(NativeAdrenoAbiResourceBudget);
     case NativeAdrenoMethodBoAlloc:return sizeof(NativeAdrenoAbiBoAllocReply);
     case NativeAdrenoMethodBoMap:return sizeof(NativeAdrenoAbiBoMapReply);
     case NativeAdrenoMethodBoFree:return 0;
@@ -520,12 +723,39 @@ IOReturn NativeAdrenoUserClient::dispatch(uint32_t method,const void *input,
     native_adreno_vm_now_us=[]()->uint64_t{return vm_clock && vm_clock->now_us?vm_clock->now_us(vm_clock->cookie):0;};
     IOReturn tally_result=kIOReturnSuccess;
     Tally tally(method,&tally_result,clock);
+    if(method==NativeAdrenoMethodSubmitV2) {
+        if(!output || output_size!=sizeof(NativeAdrenoAbiSubmitV2Reply)) {
+            return kIOReturnBadArgument;
+        }
+        NativeAdrenoAbiSubmitV2Reply reply{};
+        const IOReturn result=submitV2(input,input_size,&reply);
+        if(!result) {
+            memcpy(output,&reply,sizeof(reply));
+        }
+        return result;
+    }
     const size_t expected_in=inputSize(method),expected_out=outputSize(method);
     if(expected_in==SIZE_MAX || expected_out==SIZE_MAX)return kIOReturnUnsupported;
     if(input_size!=expected_in || output_size!=expected_out)return kIOReturnBadArgument;
     if((expected_in && !input) || (expected_out && !output))return kIOReturnBadArgument;
     IOReturn status=kIOReturnSuccess;
     switch(method) {
+    case NativeAdrenoMethodQuerySubmitV2: {
+        NativeAdrenoAbiSubmitCaps reply{};
+        status=submitCaps(&reply);
+        if(!status) {
+            memcpy(output,&reply,sizeof(reply));
+        }
+        break;
+    }
+    case NativeAdrenoMethodGetResourceBudget: {
+        NativeAdrenoAbiResourceBudget reply{};
+        status=resourceBudget(&reply);
+        if(!status) {
+            memcpy(output,&reply,sizeof(reply));
+        }
+        break;
+    }
     case NativeAdrenoMethodQuery: {
         NativeAdrenoAbiParams reply{};
         status=query(&reply);

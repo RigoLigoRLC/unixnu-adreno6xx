@@ -3,12 +3,23 @@
 #define NATIVE_ADRENO_SUBMIT_H
 #include "NativeAdrenoRing.h"
 #include "NativeAdrenoVm.h"
+#include "NativeAdrenoABI.h"
 
 struct NativeAdrenoSubmitBuffer {
     uint64_t handle;
     uint64_t iova;
     size_t bytes;      /* Complete indirect-buffer range in bytes. */
 };
+/* NativeAdrenoSubmitResource names one retained GPU mapping and the complete
+ * range used by a job. The caller merges duplicate mappings before submission. */
+struct NativeAdrenoSubmitResource {
+    uint64_t handle=0;
+    size_t offset=0,bytes=0;
+    unsigned access=0;
+    bool maintenance=false;
+};
+extern "C" void native_adreno_submit_failure(uint32_t stage,uint32_t status,uint64_t handle,
+    uint64_t iova,uint32_t index,uint32_t ibs,uint32_t resources,uint64_t bytes=0);
 /* Coherence samples (int-070): [0] submissions sampled; [1..3] the last one's first IB word through the kernel's cacheable alias,
  * through DRAM before and through DRAM after the CPU cache maintenance of every mapped BO (~0 when unreadable); [4] samples whose
  * three values differ and [5..7] the first such sample. */
@@ -20,15 +31,16 @@ struct NativeAdrenoSubmitStats {
     uint32_t submissions,completed,timeouts,poisoned_jobs;
     size_t references_held,references_retired,peak_jobs;
 };
-/* Kernel-side execbuf: turns validated indirect buffers into one ring
- * submission and owns a device reference per distinct buffer until the
- * timestamp fence is actually observed. This is not a userspace ABI and not a
- * scheduler: at most eight jobs are outstanding, callers serialize every
- * method, and the ring/VM must already be attached to the same live context.
- * Buffers may be sub-ranges of a live VM mapping but never a different IOVA,
- * unmapped handle, table pool or a range that includes unreadable bytes.
- * A failed ring commit that poisons the ring keeps every reference and the
- * submit object unusable; only an independent reset may reclaim them. */
+/* NativeAdrenoSubmit owns eight jobs on the shared ring. A resource submission
+ * retains every supplied mapping, publishes its used CPU ranges, and emits all
+ * IB packets with one final fence. Cached aliases remain unavailable to a
+ * conflicting job until the preceding GPU job completes and its CPU cache
+ * acquisition finishes. WC memory shares one barrier for the whole submission.
+ *
+ * The IOKit service serializes calls and retries Busy outside its device lock.
+ * A poisoned ring retains every job reference until hardware recovery proves
+ * that GPU access stopped. The small submit method serves kernel diagnostics;
+ * user connections use submitResources for both ABI versions. */
 class NativeAdrenoSubmit final {
     struct Job {
         uint32_t fence=0;
@@ -36,7 +48,12 @@ class NativeAdrenoSubmit final {
         uint64_t handles[16]{};
         uint32_t queue=0;
         bool active=false;
+        NativeAdrenoSubmitResource *resources=nullptr;
+        size_t resource_count=0;
+        size_t maintenance_count=0; /* Resources needing CPU maintenance occupy the first entries. */
     } jobs_[8];
+    NativeAdrenoSubmitResource *resource_storage_=nullptr;
+    uint32_t *command_words_=nullptr;
     NativeAdrenoVm *vm_=nullptr;
     NativeAdrenoRing *ring_=nullptr;
     NativeAdrenoSubmitStats stats_{};
@@ -59,6 +76,8 @@ public:
      * submissions and is validated by the caller's open queue set. */
     IOReturn submit(const NativeAdrenoSubmitBuffer *,size_t,uint32_t queue,
         uint32_t *fence);
+    IOReturn submitResources(const NativeAdrenoSubmitBuffer *,size_t,
+        const NativeAdrenoSubmitResource *,size_t,uint32_t queue,uint32_t fallback_reason,uint32_t *fence);
     bool queueOutstanding(uint32_t queue) const;
     /* Queues [first, first+count): whether any of their jobs is outstanding, and a wait for every one of them (oldest first) that
      * leaves other queues' jobs alone. Each client of the shared ring owns one such range. */

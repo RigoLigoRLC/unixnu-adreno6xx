@@ -95,7 +95,7 @@ class AGXDeviceUserClient;
 static AGXDeviceUserClient *gMailboxOwner=nullptr;
 void nativeAdrenoMailboxPoller(void *,wait_result_t);
 static IOReturn runCore(AGXDeviceUserClient *,uint32_t method,const void *input,size_t input_size,void *output,size_t output_size);
-static uint32_t activeCoreCalls[NativeAdrenoMethodBoCpuUnmapV2+1]{};
+static uint32_t activeCoreCalls[NativeAdrenoMethodGetResourceBudget+1]{};
 
 /* The two sandbox gates IOServiceOpen applies after newUserClient (XNU IOUserClient.cpp is_io_service_open_extended): the MACF open check on
  * the client object and the sandbox's filter resolver. They are run here for the caller too, only to record which one refuses it. */
@@ -130,6 +130,7 @@ struct NativeAdrenoAskerRecord native_adreno_metal_askers[12];
  * boxes, none of which had a native device), 170 MiB each (page aligned). int-198: iconservicesagent reached 128 MiB into its window and then lost its
  * Metal device; whether the window is the cause is what the [gpu windows] log row decides before these sizes change. */
 enum : unsigned {NativeAdrenoMaxClients=4};
+static NativeAdrenoAbiResourceBudget resourceBudgets[NativeAdrenoMaxClients]{};
 static const struct {uint64_t start,bytes;} kClientWindows[NativeAdrenoMaxClients]={
     {0x20000000ull,0x40000000ull},{0x60000000ull,0x0AAA9000ull},{0x6AAA9000ull,0x0AAA9000ull},{0x75552000ull,0x0AAA9000ull}};
 
@@ -1149,7 +1150,7 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
     }
     /* Concurrent core calls retain one active count per method. The diagnostic
      * marker names a method that is still inside the driver. */
-    if(method<=NativeAdrenoMethodBoCpuUnmapV2) {
+    if(method<=NativeAdrenoMethodGetResourceBudget) {
         ++activeCoreCalls[method];
     }
     native_adreno_metal_diag.inflight=method+1;
@@ -1188,22 +1189,27 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         if(lockBegan && g.clock.now_us) {
             native_adreno_profile_lock_wait(method,entryLockWait+g.clock.now_us(g.clock.cookie)-lockBegan);
         }
-        if(method==NativeAdrenoMethodSubmit) {
+        if(method==NativeAdrenoMethodSubmit || method==NativeAdrenoMethodSubmitV2) {
             native_adreno_profile_set_client(connection->name_);
         }
         status=connection->live_ && !connection->closing_ && !connection->viewTeardownStatus_ && (!g.failed || method==NativeAdrenoMethodGetStatus)?
             connection->core_->dispatch(method,input,input_size,output,output_size,&g.clock):kIOReturnNotReady;
+        if(connection->live_ && connection->slot_<NativeAdrenoMaxClients &&
+            (method==NativeAdrenoMethodBoMap || method==NativeAdrenoMethodBoFree ||
+             method==NativeAdrenoMethodGetResourceBudget)) {
+            connection->core_->resourceBudget(&resourceBudgets[connection->slot_]);
+        }
         if(method==NativeAdrenoMethodBoMap && !status && connection->live_ && !connection->kernel_)
             if(NativeAdrenoClientRecord *record=clientRecord(connection->name_))
                 if(connection->core_->windowPeak()>>20>record->peak_mib)record->peak_mib=uint32_t(connection->core_->windowPeak()>>20);
         IOLockUnlock(g.lock);
     }
     IOLockLock(g.lock);
-    if(method<=NativeAdrenoMethodBoCpuUnmapV2) {
+    if(method<=NativeAdrenoMethodGetResourceBudget) {
         --activeCoreCalls[method];
     }
     native_adreno_metal_diag.inflight=0;
-    for(unsigned active=0;active<=NativeAdrenoMethodBoCpuUnmapV2;++active) {
+    for(unsigned active=0;active<=NativeAdrenoMethodGetResourceBudget;++active) {
         if(activeCoreCalls[active]) {
             native_adreno_metal_diag.inflight=active+1;
             break;
@@ -1394,6 +1400,35 @@ IOReturn AGXDeviceUserClient::action(OSObject *target,void *,IOExternalMethodArg
 IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodArguments *arguments,
     IOExternalMethodDispatch *,OSObject *target,void *reference)
 {
+    struct InputCopy {
+        uint8_t *bytes=nullptr;
+        size_t count=0;
+        ~InputCopy() {
+            if(bytes) {
+                IODeleteData(bytes,uint8_t,count);
+            }
+        }
+    } owned;
+    IOExternalMethodArguments copied{};
+    if(arguments && arguments->structureInputDescriptor) {
+        const uint64_t length=arguments->structureInputDescriptor->getLength();
+        if(!length || length>NativeAdrenoSubmitMaxPacketBytes+8) {
+            return kIOReturnBadArgument;
+        }
+        owned.count=size_t(length);
+        owned.bytes=IONewData(uint8_t,owned.count);
+        if(!owned.bytes) {
+            return kIOReturnNoMemory;
+        }
+        if(arguments->structureInputDescriptor->readBytes(0,owned.bytes,owned.count)!=owned.count) {
+            return kIOReturnBadArgument;
+        }
+        copied=*arguments;
+        copied.structureInput=owned.bytes;
+        copied.structureInputSize=uint32_t(owned.count);
+        copied.structureInputDescriptor=nullptr;
+        arguments=&copied;
+    }
     /* One entry per ABI method; sizes are the exact wire records. */
     static const IOExternalMethodDispatch table[]={
         {&action,0,0,0,sizeof(NativeAdrenoAbiParams)},
@@ -1414,7 +1449,10 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
         {&action,0,sizeof(NativeAdrenoAbiBoImport),0,sizeof(NativeAdrenoAbiBoAllocReply)},
         {&action,0,sizeof(NativeAdrenoAbiBoProfile),0,0},
         {&action,0,sizeof(NativeAdrenoAbiBoCpuMapV2),0,sizeof(NativeAdrenoAbiBoCpuMapV2Reply)},
-        {&action,0,sizeof(NativeAdrenoAbiBoCpuUnmapV2),0,0}};
+        {&action,0,sizeof(NativeAdrenoAbiBoCpuUnmapV2),0,0},
+        {&action,0,0,0,sizeof(NativeAdrenoAbiSubmitCaps)},
+        {&action,0,kIOUCVariableStructureSize,0,sizeof(NativeAdrenoAbiSubmitV2Reply)},
+        {&action,0,0,0,sizeof(NativeAdrenoAbiResourceBudget)}};
     __atomic_fetch_add(&native_adreno_metal_diag.ext_entries,1,__ATOMIC_RELAXED);
     if(selector<256) {
         __atomic_fetch_or(&native_adreno_metal_diag.sel_bits[selector>>5],1u<<(selector&31),__ATOMIC_RELAXED);
@@ -1807,12 +1845,27 @@ extern "C" void native_adreno_metal_dump_stats(void)
             backingCache[slot]=native_adreno_backing_cache_stats[slot];
         }
         const NativeAdrenoSubmitStats submit=g.submit->stats();
+        NativeAdrenoAbiResourceBudget budgets[NativeAdrenoMaxClients];
+        memcpy(budgets,resourceBudgets,sizeof(budgets));
+        const size_t mappingCapacity=g.vm->objectCapacity(),mappingReserved=g.vm->reservedObjects();
+        const uint64_t mappingGeneration=g.vm->budgetGeneration();
         const size_t objects=g.vm->objectCount(),spans=g.vm->spanCount(),jobs=g.submit->outstanding();
         const uint32_t submitted=g.ring->lastSubmitted(),completed=g.ring->completedFence();
         const uint32_t opened=g.opened,closed=g.closed;
         const uint64_t faults=g.status.faults(),suspends=g.status.suspends();
         const bool failed=g.failed,vmPoisoned=g.vm->poisoned(),submitPoisoned=g.submit->poisoned(),ringPoisoned=g.ring->poisoned();
         IOLockUnlock(g.lock);
+
+        IOLog("NativeAdrenoMetal: mapping_budget capacity=%zu used=%zu reserved=%zu generation=%llu\n",
+            mappingCapacity,objects,mappingReserved,mappingGeneration);
+        for(unsigned at=0;at<NativeAdrenoMaxClients;++at) {
+            const auto &budget=budgets[at];
+            if(budget.version) {
+                IOLog("NativeAdrenoMetal: mapping_client slot=%u used=%u target=%u active=%u reason=%u status=%08x handle=%llx iova=%llx\n",
+                    at,budget.connection_used,budget.connection_target,budget.active_connections,
+                    budget.last_failure_reason,budget.last_failure_status,budget.last_failure_handle,budget.last_failure_iova);
+            }
+        }
 
         for(unsigned row=0;row<2;++row) {
             const uint64_t *phase=vmPhases[row];

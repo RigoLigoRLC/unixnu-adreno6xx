@@ -66,10 +66,14 @@ class NativeAdrenoVm final {
     ArmSmmu4KContextConfig *context_=nullptr;
     ArmSmmu4KStreamState *streams_=nullptr;
     size_t lower_count_=0,upper_count_=0,objects_=0,free_head_=0,mapping_capacity_=0;
+    size_t reserved_objects_=0;
+    uint32_t clients_=0;
+    uint64_t budget_generation_=1;
     size_t class_objects_[16]{};
     unsigned budget_=0;
     uint64_t next_handle_=1;
     bool attached_=false,poisoned_=false,distrust_write_combined_=false;
+    bool map_busy_alias_=false;
     NativeAdrenoVmResult result_{};
     ArmSmmu4KLiveRegion region(unsigned) const;
     ArmSmmu4KStatus observe() const;
@@ -80,6 +84,7 @@ class NativeAdrenoVm final {
     void insert(Mapping *,unsigned);
     void erase(Mapping *,unsigned);
     IOReturn preflight(const NativeAdrenoMemory *,unsigned,uint64_t,unsigned,unsigned,unsigned) const;
+    bool activeAlias(const NativeAdrenoMemory *,uint64_t excluded) const;
 public:
     NativeAdrenoVm()=default;
     ~NativeAdrenoVm()=default;
@@ -96,6 +101,13 @@ public:
         unsigned permissions,unsigned writeback,unsigned shareability,uint64_t *handle);
     IOReturn unmap(uint64_t handle);
     IOReturn holdJob(uint64_t handle);
+    /* A retained mapping stays installed until every job releases it. These
+     * operations maintain only the caller's submitted BO range. */
+    IOReturn publishResource(uint64_t handle,size_t offset,size_t bytes,unsigned access);
+    IOReturn acquireResource(uint64_t handle,size_t offset,size_t bytes,unsigned access);
+    bool resourceNeedsMaintenance(uint64_t handle) const;
+    bool resourceImported(uint64_t handle) const;
+    bool resourcesAlias(uint64_t first,uint64_t second) const;
     /* TLBIALL for the context bank plus TLBSYNC: drops every cached translation of the bank whatever its ASID. Unmap already
      * synchronizes by ASID; this is the stronger form the submit path uses before each submission (int-070: on sheng the CP read
      * zeros from an IB whose table entry and DRAM were both correct, after the address had been mapped to other pages before). */
@@ -132,6 +144,13 @@ public:
     IOReturn retireJobAfterCompletion(uint64_t handle);
     bool poisoned() const {return poisoned_;}
     size_t objectCount() const {return objects_;}
+    size_t objectCapacity() const {return mapping_capacity_;}
+    size_t reservedObjects() const {return reserved_objects_;}
+    uint32_t clientCount() const {return clients_;}
+    uint64_t budgetGeneration() const {return budget_generation_;}
+    bool mapBusyAlias() const {return map_busy_alias_;}
+    void addClient();
+    void removeClient();
     size_t spanCount() const {return lower_count_+upper_count_;}
     NativeAdrenoVmResult lastResult() const {return result_;}
 };

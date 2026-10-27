@@ -903,12 +903,13 @@ IOReturn NativeAdrenoMemory::publishForDevice(size_t offset,size_t bytes,bool wr
     return NativeAdrenoMaintainOwnedPages(static_cast<unsigned char *>(storage_.mapping)+offset,bytes,
         writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);
 }
-IOReturn NativeAdrenoMemory::acquireDeviceWrites(size_t offset,size_t bytes)
+IOReturn NativeAdrenoMemory::acquireDeviceWrites(size_t offset,size_t bytes,bool submitted_range)
 {
     if(!backed() || !storage_.prepared || storage_.quarantined)return kIOReturnNotReady;
     if(!bytes || ((offset|bytes)&4095) || offset>storage_.bytes || bytes>storage_.bytes-offset)return kIOReturnBadArgument;
-    /* Imported pages may hold the owner's unrelated dirty lines next to the GPU's writes: clean as well as invalidate. */
-    if(imported_)return maintainImported(offset,bytes,NativeAdrenoCleanInvalidate);
+    if(imported_) {
+        return maintainImported(offset,bytes,submitted_range?NativeAdrenoInvalidate:NativeAdrenoCleanInvalidate);
+    }
     if(storage_.write_combined) {
         __asm__ volatile("dsb ld" ::: "memory");
         return kIOReturnSuccess;
