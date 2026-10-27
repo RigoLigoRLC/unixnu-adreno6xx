@@ -108,7 +108,7 @@ struct PhaseClock {
     }
 };
 }
-ArmSmmu4KStatus NativeAdrenoVm::observe() const
+ArmSmmu4KStatus NativeAdrenoVm::observeEmptyTables() const
 {
     ArmSmmu4KStreamResult routes;
     ArmSmmu4KStatus status=ArmSmmu4KObserveStreams(&io_,streams_,context_,&routes);if(status)return status;
@@ -166,7 +166,7 @@ IOReturn NativeAdrenoVm::attach(const ArmSmmu4KIo *io,ArmSmmu4KContextConfig *co
         }
     }
     attached_=true;
-    ArmSmmu4KStatus status=observe();if(status)return fail(status);
+    ArmSmmu4KStatus status=observeEmptyTables();if(status)return fail(status);
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoVm::detach()
@@ -190,10 +190,7 @@ IOReturn NativeAdrenoVm::enableCachedCoherentImports(uint32_t chip_id)
     if(chip_id!=0x06030500) {
         return kIOReturnUnsupported;
     }
-    const ArmSmmu4KStatus status=observe();
-    if(status) {
-        return fail(status);
-    }
+
     cached_coherent_imports_=true;
     return kIOReturnSuccess;
 }

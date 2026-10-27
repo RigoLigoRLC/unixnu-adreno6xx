@@ -808,11 +808,15 @@ IOReturn A642LState::startCp()
     info_.ubwc_swizzle = 6;
     info_.macrotile_mode = 0;
     info_.ubwc_version = 3;
+    info_.flags = NativeAdrenoDeviceClientIova;
     status=gpuContext_.vm()->enableCachedCoherentImports(resources_.chipId);
     if(status) {
-        return status;
+        IOLog("NativeAdrenoA6xx: cached import coherence disabled chip=%08x status=%08x, using CPU cache maintenance\n",
+            resources_.chipId,status);
+    } else {
+        info_.flags|=NativeAdrenoDeviceCachedCoherentImports;
+        IOLog("NativeAdrenoA6xx: cached import coherence enabled chip=%08x\n",resources_.chipId);
     }
-    info_.flags = NativeAdrenoDeviceClientIova|NativeAdrenoDeviceCachedCoherentImports;
 
     return native_adreno_publish(gpuContext_.vm(),&submit_,&ring_,&clock_,&timer_,&info_,32,40);
 }

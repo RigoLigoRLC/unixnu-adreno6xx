@@ -153,7 +153,7 @@ class NativeAdrenoVm final {
     bool map_busy_alias_=false,map_alias_limit_=false;
     NativeAdrenoVmResult result_{};
     ArmSmmu4KLiveRegion region(unsigned) const;
-    ArmSmmu4KStatus observe() const;
+    ArmSmmu4KStatus observeEmptyTables() const;
     IOReturn fail(ArmSmmu4KStatus);
     Mapping *find(uint64_t) const;
     const Mapping *findAddressRecord(uint64_t) const;
@@ -178,7 +178,7 @@ public:
      * disables a bank or returns the platform lease; board lifecycle owns it. */
     IOReturn detach();
     /* The initialized A642L platform permits cached imports to use coherent
-     * SMMU mappings. Each backing still supplies its CPU cache qualification. */
+     * SMMU mappings. Each backing supplies its CPU cache qualification. */
     IOReturn enableCachedCoherentImports(uint32_t chip_id);
     bool cachedCoherentImports() const {return cached_coherent_imports_;}
     IOReturn findAddress(unsigned upper,size_t bytes,uint64_t alignment,uint64_t *iova) const;
