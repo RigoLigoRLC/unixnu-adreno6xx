@@ -16,11 +16,12 @@ struct NativeAdrenoVmResult {
 };
 /* NativeAdrenoVm owns the CPU records for BOs mapped into the GPU context.
  * Each record retains its backing memory, physical ranges and a physical-address
- * index. A red-black tree locates neighboring GPU address ranges;
- * generation handles locate records directly. Mapping validates the BO against
- * its neighbors, conflicting physical attributes and both page-table pools,
- * then asks ArmSmmu4K to change only that BO's leaves. Unmapping completes the
- * context's TLB synchronization before releasing the memory reference.
+ * index. Generation handles locate records directly. Mapping validates the BO
+ * against its GPU address neighbors, physical attributes and page-table pools,
+ * then records shared physical intervals as pairs of BO offsets before asking
+ * ArmSmmu4K to install its leaves. Submission follows these recorded intervals
+ * to find overlapping job resources. Unmapping completes TLB synchronization
+ * and removes both ends of each alias before releasing the memory reference.
  *
  * The service serializes these operations and owns the powered context, streams
  * and page-table allocations. NativeAdrenoSubmit retains job references until
@@ -29,7 +30,8 @@ struct NativeAdrenoVmResult {
 enum : size_t {
     NativeAdrenoVmMaxObjects=4096,
     NativeAdrenoAliasQueryLimit=262144,
-    NativeAdrenoAliasHitLimit=1048576
+    NativeAdrenoAliasHitLimit=1048576,
+    NativeAdrenoAliasRangeLimit=262144
 };
 /* Board hook for sampleWord(): reads one aligned word of physical memory through a fresh uncached mapping; 0 on success. */
 extern "C" int (*native_adreno_dram_read32)(uint64_t physical,uint32_t *value);
@@ -41,11 +43,15 @@ extern "C" int (*native_adreno_cached_read32)(uint64_t physical,uint32_t *value)
 extern "C" int (*native_adreno_line_audit)(uint64_t physical,size_t bytes,uint32_t *dirty,uint32_t *stale);
 class NativeAdrenoVm final {
     struct PhysicalRange;
+    struct MappingAlias;
     struct Mapping {
         NativeAdrenoMemory *memory=nullptr;
         ArmSmmu4KRange *ranges=nullptr;
         uint32_t *physical_order=nullptr;
         PhysicalRange *physical_ranges=nullptr;
+        MappingAlias *aliases=nullptr; /* All live intervals involving this mapping. */
+        MappingAlias *alias_storage=nullptr; /* One allocation for intervals discovered by this map. */
+        size_t alias_count=0; /* Allocated slots, including intervals whose other mapping was removed. */
         size_t physical_count=0;
         uint64_t handle=0,iova=0;
         size_t spans=0,mapped_spans=0;
@@ -105,7 +111,29 @@ class NativeAdrenoVm final {
         RB_GENERATE(PhysicalRoot,PhysicalRange,link,compare)
 #pragma pop_macro("RB_AUGMENT")
     } physical_;
+    /* MappingAlias records equal physical bytes at two BO offsets. Its newer
+     * mapping owns the storage; both mappings link the record until either is
+     * unmapped. Adjacent equal-offset translations share one record. */
+    struct MappingAlias {
+        Mapping *mapping[2]{};
+        size_t offset[2]{},bytes=0;
+        MappingAlias *next[2]{},*previous[2]{};
+    };
+    struct AliasMergeState {
+        uint64_t generation=0;
+        size_t offset=0,other_offset=0,bytes=0,index=0;
+    };
+    struct AliasBuild {
+        Mapping *owner;
+        MappingAlias *output;
+        size_t count,limit;
+        uint64_t generation,hits;
+        IOReturn status;
+    };
     Mapping *mappings_=nullptr;
+    AliasMergeState *alias_merge_=nullptr;
+    size_t alias_storage_count_=0;
+    uint64_t alias_build_generation_=0;
     Mapping *first_=nullptr,*last_=nullptr;
     NativeAdrenoVmRegion regions_[2]{};
     ArmSmmu4KLiveVisibility visibility_[2]{};
@@ -120,7 +148,7 @@ class NativeAdrenoVm final {
     unsigned budget_=0;
     uint64_t next_handle_=1;
     bool attached_=false,poisoned_=false,distrust_write_combined_=false;
-    bool map_busy_alias_=false;
+    bool map_busy_alias_=false,map_alias_limit_=false;
     NativeAdrenoVmResult result_{};
     ArmSmmu4KLiveRegion region(unsigned) const;
     ArmSmmu4KStatus observe() const;
@@ -132,8 +160,10 @@ class NativeAdrenoVm final {
     void erase(Mapping *,unsigned);
     IOReturn preflight(const NativeAdrenoMemory *,unsigned,uint64_t,unsigned,unsigned,unsigned) const;
     bool activeAlias(const NativeAdrenoMemory *,uint64_t excluded) const;
-    bool visitPhysicalAliases(const PhysicalRange *,uint64_t,uint64_t,
-        bool (*)(void *,uint64_t,size_t,size_t),void *,uint64_t *) const;
+    bool collectPhysicalAliases(const PhysicalRange *,uint64_t,uint64_t,size_t,AliasBuild &);
+    IOReturn buildMappingAliases(Mapping *,const NativeAdrenoMemory *,PhysicalRange *,MappingAlias **,size_t *);
+    static void linkMappingAlias(MappingAlias &);
+    static void unlinkMappingAlias(MappingAlias &);
 public:
     NativeAdrenoVm()=default;
     ~NativeAdrenoVm()=default;
@@ -156,9 +186,9 @@ public:
     IOReturn acquireResource(uint64_t handle,size_t offset,size_t bytes,unsigned access);
     bool resourceNeedsMaintenance(uint64_t handle) const;
     bool resourceImported(uint64_t handle) const;
-    /* The callback receives each overlapping mapping and its BO-relative byte
-     * interval. A conflict or exhausted query budget returns Busy. The caller
-     * retries after active jobs retire; an empty queue needs no alias query. */
+    /* The callback receives the same mapping and each static physical alias at
+     * the translated BO interval. A conflict or exhausted query budget returns
+     * Busy; the caller retries after active jobs retire. */
     IOReturn visitResourceAliases(uint64_t handle,size_t offset,size_t bytes,size_t cache_line,
         bool (*)(void *,uint64_t,size_t,size_t),void *,uint64_t *queries,uint64_t *hits) const;
     /* TLBIALL for the context bank plus TLBSYNC: drops every cached translation of the bank whatever its ASID. Unmap already
@@ -202,6 +232,7 @@ public:
     uint32_t clientCount() const {return clients_;}
     uint64_t budgetGeneration() const {return budget_generation_;}
     bool mapBusyAlias() const {return map_busy_alias_;}
+    bool mapAliasLimit() const {return map_alias_limit_;}
     void addClient();
     void removeClient();
     size_t spanCount() const {return lower_count_+upper_count_;}

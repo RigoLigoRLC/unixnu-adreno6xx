@@ -81,7 +81,7 @@ struct SubmitFailure {
 static SubmitFailure firstSubmitFailure;
 static SubmitFailure firstResourceFailure;
 static uint64_t submitV2Counters[8]{}; /* Calls, resources, fallback, clean bytes, acquire bytes, busy, completed, failures. */
-static uint64_t aliasTotals[4]{}; /* Elapsed us, interval queries, overlapping spans and Busy attempts at a query limit. */
+static uint64_t aliasTotals[4]{}; /* Elapsed us, mapping interval checks, callback ranges and Busy attempts at a query limit. */
 /* Per-submission interval deltas of the ABI method totals, so the dump can
  * show the BO work between two submissions without sampling the clock. */
 static uint32_t profileLastCalls[6];
@@ -302,7 +302,7 @@ extern "C" void native_adreno_profile_dump(void)
     profileLeave();
     IOLog("NativeAdrenoProfile: resources calls=%llu objects=%llu fallback=%llu clean_bytes=%llu acquire_bytes=%llu busy=%llu completed=%llu failures=%llu\n",
         v2[0],v2[1],v2[2],v2[3],v2[4],v2[5],v2[6],v2[7]);
-    IOLog("NativeAdrenoProfile: aliases us=%llu queries=%llu hits=%llu limit_busy=%llu\n",
+    IOLog("NativeAdrenoProfile: aliases version=2 us=%llu queries=%llu hits=%llu limit_busy=%llu\n",
         aliases[0],aliases[1],aliases[2],aliases[3]);
     if(failure.stage) {
         IOLog("NativeAdrenoProfile: first_failure client=%s stage=%u status=%08x index=%u ib=%u resources=%u t=%llu handle=%llx iova=%llx bytes=%llu\n",
@@ -704,9 +704,9 @@ IOReturn NativeAdrenoSubmit::submitResources(const NativeAdrenoSubmitBuffer *buf
     if(!cache_line) {
         return kIOReturnUnsupported;
     }
-    /* Cached ranges query mapped physical intervals, then the other job's
-     * intervals of that mapping. The reverse pass covers a prior cached range
-     * overlapping a new WC range. Read/read access needs no ownership wait. */
+    /* Cached ranges check their mapping and the offset translations recorded
+     * for its physical aliases at map time. The reverse pass covers a prior
+     * cached range overlapping a new WC range. Read/read access can overlap. */
     for(const Job &previous:jobs_) {
         if(!previous.active) {
             continue;

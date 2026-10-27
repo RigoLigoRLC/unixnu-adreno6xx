@@ -370,7 +370,8 @@ IOReturn NativeAdrenoUserClient::mapBo(const NativeAdrenoAbiBoMap *request,
         map_failure_.last_failure_reason=status==kIOReturnNoSpace?NativeAdrenoMapFailureCapacity:
             status==kIOReturnBusy && vm_->mapBusyAlias()?NativeAdrenoMapFailureActiveAlias:
             status==kIOReturnBadArgument || status==kIOReturnBusy?NativeAdrenoMapFailureAddress:
-            status==kIOReturnNoResources?NativeAdrenoMapFailureTables:NativeAdrenoMapFailureOther;
+            status==kIOReturnNoResources && !vm_->mapAliasLimit()?NativeAdrenoMapFailureTables:
+            NativeAdrenoMapFailureOther;
         return status;
     }
     entry->mapped=handle;entry->iova=request->iova;entry->mapped_state=true;

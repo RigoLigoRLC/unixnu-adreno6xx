@@ -85,11 +85,21 @@ IOReturn NativeAdrenoVm::attach(const ArmSmmu4KIo *io,ArmSmmu4KContextConfig *co
         !budget || budget>1048576 || (lower && !validBinding(*lower,0)) || (upper && !validBinding(*upper,1)))
         return kIOReturnBadArgument;
     mappings_=IONewData(Mapping,max_objects);
-    if(!mappings_) {
+    alias_merge_=IONewData(AliasMergeState,max_objects);
+    if(!mappings_ || !alias_merge_) {
+        if(mappings_) {
+            IODeleteData(mappings_,Mapping,max_objects);
+            mappings_=nullptr;
+        }
+        if(alias_merge_) {
+            IODeleteData(alias_merge_,AliasMergeState,max_objects);
+            alias_merge_=nullptr;
+        }
         return kIOReturnNoMemory;
     }
     mapping_capacity_=max_objects;
     memset(mappings_,0,sizeof(Mapping)*mapping_capacity_);
+    memset(alias_merge_,0,sizeof(AliasMergeState)*mapping_capacity_);
     for(size_t i=0;i<mapping_capacity_;++i) {
         mappings_[i].next_free=i+1;
     }
@@ -99,6 +109,9 @@ IOReturn NativeAdrenoVm::attach(const ArmSmmu4KIo *io,ArmSmmu4KContextConfig *co
     for(unsigned i=0;i<2;++i)if(regions_[i].arena) {
         if(NativeAdrenoBindSmmuVisibility(regions_[i].tables,&visibility_[i])!=kIOReturnSuccess) {
             IODeleteData(mappings_,Mapping,mapping_capacity_);
+            IODeleteData(alias_merge_,AliasMergeState,mapping_capacity_);
+            mappings_=nullptr;
+            alias_merge_=nullptr;
             regions_[0]={};regions_[1]={};return kIOReturnBadArgument;
         }
     }
@@ -111,6 +124,9 @@ IOReturn NativeAdrenoVm::detach()
     if(poisoned_ || objects_ || spanCount())return kIOReturnBusy;
     if(!attached_)return kIOReturnNotReady;
     IODeleteData(mappings_,Mapping,mapping_capacity_);
+    IODeleteData(alias_merge_,AliasMergeState,mapping_capacity_);
+    mappings_=nullptr;
+    alias_merge_=nullptr;
     mapping_capacity_=0;
     attached_=false;regions_[0]={};regions_[1]={};context_=nullptr;streams_=nullptr;
     return kIOReturnSuccess;
@@ -293,6 +309,7 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
 {
     if(!handle)return kIOReturnBadArgument;*handle=0;result_={};
     map_busy_alias_=false;
+    map_alias_limit_=false;
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     PhaseClock clock;
     IOReturn checked=preflight(memory,upper,iova,permissions,writeback,shareability);if(checked)return checked;
@@ -327,15 +344,28 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
         physical_order[i]=(uint32_t)i;
     }
     NativeAdrenoPhysicalIndex index(memory->spans(),physical_order,spans);
-    checked=memory->holdForDevice();
+    Mapping *record=&mappings_[free_head_];
+    MappingAlias *aliases=nullptr;
+    size_t alias_count=0;
+    checked=buildMappingAliases(record,memory,physical_ranges,&aliases,&alias_count);
     if(checked) {
+        map_alias_limit_=checked==kIOReturnNoResources;
         IODeleteData(changes,ArmSmmu4KRange,spans);
         IODeleteData(physical_order,uint32_t,spans);
         IODeleteData(physical_ranges,PhysicalRange,spans);
         return checked;
     }
+    checked=memory->holdForDevice();
+    if(checked) {
+        IODeleteData(changes,ArmSmmu4KRange,spans);
+        IODeleteData(physical_order,uint32_t,spans);
+        IODeleteData(physical_ranges,PhysicalRange,spans);
+        if(aliases) {
+            IODeleteData(aliases,MappingAlias,alias_count);
+        }
+        return checked;
+    }
 
-    Mapping *record=&mappings_[free_head_];
     free_head_=record->next_free;
     ++reserved_objects_;
     ++budget_generation_;
@@ -344,6 +374,9 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
     record->ranges=changes;
     record->physical_order=physical_order;
     record->physical_ranges=physical_ranges;
+    record->alias_storage=aliases;
+    record->alias_count=alias_count;
+    alias_storage_count_+=alias_count;
     record->physical_count=index.count();
     record->handle=(next_handle_++<<12)|size_t(record-mappings_);
     record->iova=iova;
@@ -375,6 +408,9 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
         range.subtree_end=range.end;
         range.offset=span.offset;
         physical_.PhysicalRoot_RB_INSERT(&physical_.root,&range);
+    }
+    for(size_t at=0;at<alias_count;++at) {
+        linkMappingAlias(aliases[at]);
     }
     --reserved_objects_;
     clock.lap(0,4);clock.done(0,memory->bytes());
@@ -411,12 +447,19 @@ IOReturn NativeAdrenoVm::unmap(uint64_t handle)
     for(size_t at=0;at<spans;++at) {
         physical_.PhysicalRoot_RB_REMOVE(&physical_.root,&record->physical_ranges[at]);
     }
+    while(record->aliases) {
+        unlinkMappingAlias(*record->aliases);
+    }
     native_adreno_trace_stage=14;
     clock.lap(1,4);
     if(record->memory->retireAfterQuiescence()!=kIOReturnSuccess)return fail(ArmSmmu4KStateMismatch);
     IODeleteData(record->ranges,ArmSmmu4KRange,spans);
     IODeleteData(record->physical_order,uint32_t,spans);
     IODeleteData(record->physical_ranges,PhysicalRange,spans);
+    if(record->alias_storage) {
+        IODeleteData(record->alias_storage,MappingAlias,record->alias_count);
+        alias_storage_count_-=record->alias_count;
+    }
     clock.lap(1,5);clock.done(1,record->memory->bytes());
     *record={};
     record->next_free=free_head_;
@@ -596,13 +639,13 @@ bool NativeAdrenoVm::resourceImported(uint64_t handle) const
     return record && record->memory->imported();
 }
 
-bool NativeAdrenoVm::visitPhysicalAliases(const PhysicalRange *range,uint64_t first,uint64_t end,
-    bool (*visit)(void *,uint64_t,size_t,size_t),void *context,uint64_t *hits) const
+bool NativeAdrenoVm::collectPhysicalAliases(const PhysicalRange *range,uint64_t first,uint64_t end,
+    size_t offset,AliasBuild &build)
 {
     if(!range || range->subtree_end<=first) {
         return false;
     }
-    if(visitPhysicalAliases(RB_LEFT(range,link),first,end,visit,context,hits)) {
+    if(collectPhysicalAliases(RB_LEFT(range,link),first,end,offset,build)) {
         return true;
     }
     if(range->physical>=end) {
@@ -611,15 +654,143 @@ bool NativeAdrenoVm::visitPhysicalAliases(const PhysicalRange *range,uint64_t fi
     if(range->end>first) {
         const uint64_t begin=range->physical>first?range->physical:first;
         const uint64_t limit=range->end<end?range->end:end;
-        if(*hits==NativeAdrenoAliasHitLimit) {
+        if(build.hits==NativeAdrenoAliasHitLimit) {
+            build.status=kIOReturnNoResources;
             return true;
         }
-        ++*hits;
-        if(visit(context,range->mapping->handle,range->offset+size_t(begin-range->physical),size_t(limit-begin))) {
-            return true;
+        ++build.hits;
+        const size_t source_offset=offset+size_t(begin-first);
+        const size_t other_offset=range->offset+size_t(begin-range->physical);
+        const size_t bytes=size_t(limit-begin);
+        if(range->mapping!=build.owner || source_offset<other_offset) {
+            const size_t slot=size_t(range->mapping-mappings_);
+            AliasMergeState &last=alias_merge_[slot];
+            if(last.generation==build.generation && last.offset+last.bytes==source_offset &&
+                last.other_offset+last.bytes==other_offset) {
+                last.bytes+=bytes;
+                if(build.output) {
+                    build.output[last.index].bytes=last.bytes;
+                }
+            } else {
+                if(build.count==build.limit) {
+                    build.status=kIOReturnNoResources;
+                    return true;
+                }
+                last={build.generation,source_offset,other_offset,bytes,build.count};
+                if(build.output) {
+                    MappingAlias &alias=build.output[build.count];
+                    alias={};
+                    alias.mapping[0]=build.owner;
+                    alias.mapping[1]=range->mapping;
+                    alias.offset[0]=source_offset;
+                    alias.offset[1]=other_offset;
+                    alias.bytes=bytes;
+                }
+                ++build.count;
+            }
         }
     }
-    return visitPhysicalAliases(RB_RIGHT(range,link),first,end,visit,context,hits);
+    return collectPhysicalAliases(RB_RIGHT(range,link),first,end,offset,build);
+}
+
+IOReturn NativeAdrenoVm::buildMappingAliases(Mapping *owner,const NativeAdrenoMemory *memory,
+    PhysicalRange *ranges,MappingAlias **out,size_t *out_count)
+{
+    *out=nullptr;
+    *out_count=0;
+    PhysicalTree own;
+    const size_t spans=memory->spanCount();
+    for(size_t at=0;at<spans;++at) {
+        const auto &span=memory->spans()[at];
+        PhysicalRange &range=ranges[at];
+        range={};
+        range.mapping=owner;
+        range.physical=span.physical;
+        range.end=span.physical+span.bytes;
+        range.subtree_end=range.end;
+        range.offset=span.offset;
+        own.PhysicalRoot_RB_INSERT(&own.root,&range);
+    }
+
+    MappingAlias *storage=nullptr;
+    size_t allocated=0;
+    for(unsigned pass=0;pass<2;++pass) {
+        if(++alias_build_generation_==0) {
+            memset(alias_merge_,0,sizeof(AliasMergeState)*mapping_capacity_);
+            alias_build_generation_=1;
+        }
+        AliasBuild build{owner,storage,0,NativeAdrenoAliasRangeLimit-alias_storage_count_,
+            alias_build_generation_,0,kIOReturnSuccess};
+        if(pass) {
+            build.limit=allocated;
+        }
+        for(size_t at=0;at<spans && !build.status;++at) {
+            const auto &span=memory->spans()[at];
+            if(collectPhysicalAliases(RB_ROOT(&physical_.root),span.physical,span.physical+span.bytes,
+                span.offset,build)) {
+                break;
+            }
+            collectPhysicalAliases(RB_ROOT(&own.root),span.physical,span.physical+span.bytes,span.offset,build);
+        }
+        if(build.status || (pass && build.count!=allocated)) {
+            if(storage) {
+                IODeleteData(storage,MappingAlias,allocated);
+            }
+            return build.status?build.status:kIOReturnInternalError;
+        }
+        if(!pass) {
+            allocated=build.count;
+            if(!allocated) {
+                return kIOReturnSuccess;
+            }
+            storage=IONewData(MappingAlias,allocated);
+            if(!storage) {
+                return kIOReturnNoMemory;
+            }
+        }
+    }
+    *out=storage;
+    *out_count=allocated;
+    return kIOReturnSuccess;
+}
+
+void NativeAdrenoVm::linkMappingAlias(MappingAlias &alias)
+{
+    for(unsigned side=0;side<2;++side) {
+        Mapping *mapping=alias.mapping[side];
+        if(side && mapping==alias.mapping[0]) {
+            continue;
+        }
+        MappingAlias *head=mapping->aliases;
+        alias.next[side]=head;
+        if(head) {
+            const unsigned head_side=head->mapping[0]==mapping?0:1;
+            head->previous[head_side]=&alias;
+        }
+        mapping->aliases=&alias;
+    }
+}
+
+void NativeAdrenoVm::unlinkMappingAlias(MappingAlias &alias)
+{
+    for(unsigned side=0;side<2;++side) {
+        Mapping *mapping=alias.mapping[side];
+        if(side && mapping==alias.mapping[0]) {
+            continue;
+        }
+        MappingAlias *previous=alias.previous[side],*next=alias.next[side];
+        if(previous) {
+            const unsigned previous_side=previous->mapping[0]==mapping?0:1;
+            previous->next[previous_side]=next;
+        } else {
+            mapping->aliases=next;
+        }
+        if(next) {
+            const unsigned next_side=next->mapping[0]==mapping?0:1;
+            next->previous[next_side]=previous;
+        }
+    }
+    alias={};
 }
 
 IOReturn NativeAdrenoVm::visitResourceAliases(uint64_t handle,size_t offset,size_t bytes,size_t cache_line,
@@ -630,31 +801,43 @@ IOReturn NativeAdrenoVm::visitResourceAliases(uint64_t handle,size_t offset,size
         (cache_line&(cache_line-1)) || offset>record->memory->bytes() || bytes>record->memory->bytes()-offset) {
         return kIOReturnBadArgument;
     }
-    const auto *spans=record->memory->spans();
-    const size_t count=record->memory->spanCount();
-    const size_t limit=offset+bytes;
-    size_t first=0,last=count;
-    while(first<last) {
-        const size_t middle=first+(last-first)/2;
-        if(spans[middle].offset+spans[middle].bytes<=offset) {
-            first=middle+1;
-        } else {
-            last=middle;
-        }
+    const size_t begin=offset&~(cache_line-1);
+    const size_t end=(offset+bytes+cache_line-1)&~(cache_line-1);
+    if(*queries==NativeAdrenoAliasQueryLimit || *hits==NativeAdrenoAliasHitLimit) {
+        return kIOReturnBusy;
     }
-    for(size_t at=first;at<count && spans[at].offset<limit;++at) {
-        const auto &span=spans[at];
-        const size_t begin=offset>span.offset?offset:span.offset;
-        const size_t end=limit<span.offset+span.bytes?limit:span.offset+span.bytes;
-        const uint64_t physical=(span.physical+begin-span.offset)&~uint64_t(cache_line-1);
-        const uint64_t physical_end=(span.physical+end-span.offset+cache_line-1)&~uint64_t(cache_line-1);
-        if(*queries==NativeAdrenoAliasQueryLimit) {
-            return kIOReturnBusy;
+    ++*queries;
+    ++*hits;
+    if(visit(context,handle,begin,end-begin)) {
+        return kIOReturnBusy;
+    }
+    for(const MappingAlias *alias=record->aliases;alias;) {
+        const unsigned linked_side=alias->mapping[0]==record?0:1;
+        const MappingAlias *next=alias->next[linked_side];
+        for(unsigned side=0;side<2;++side) {
+            if(alias->mapping[side]!=record) {
+                continue;
+            }
+            if(*queries==NativeAdrenoAliasQueryLimit) {
+                return kIOReturnBusy;
+            }
+            ++*queries;
+            const size_t alias_end=alias->offset[side]+alias->bytes;
+            if(begin>=alias_end || alias->offset[side]>=end) {
+                continue;
+            }
+            const size_t first=begin>alias->offset[side]?begin:alias->offset[side];
+            const size_t limit=end<alias_end?end:alias_end;
+            const size_t translated=alias->offset[side^1]+first-alias->offset[side];
+            if(*hits==NativeAdrenoAliasHitLimit) {
+                return kIOReturnBusy;
+            }
+            ++*hits;
+            if(visit(context,alias->mapping[side^1]->handle,translated,limit-first)) {
+                return kIOReturnBusy;
+            }
         }
-        ++*queries;
-        if(visitPhysicalAliases(RB_ROOT(&physical_.root),physical,physical_end,visit,context,hits)) {
-            return kIOReturnBusy;
-        }
+        alias=next;
     }
     return kIOReturnSuccess;
 }
