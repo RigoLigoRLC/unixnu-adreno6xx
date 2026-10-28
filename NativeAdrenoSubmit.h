@@ -5,6 +5,7 @@
 #include "NativeAdrenoVm.h"
 #include "NativeAdrenoABI.h"
 #include "NativeAdrenoDisplay.h"
+class NativeAdrenoScheduler;
 
 struct NativeAdrenoSubmitBuffer {
     uint64_t handle;
@@ -46,15 +47,16 @@ struct NativeAdrenoSubmitStats {
     uint32_t submissions,completed,timeouts,poisoned_jobs;
     size_t references_held,references_retired,peak_jobs;
 };
-/* NativeAdrenoSubmit owns eight jobs on the shared ring. A resource submission
- * retains every supplied mapping and emits all IB packets with one final
- * fence. Conflicting aliases wait for the preceding GPU fence. CPU stores and
- * completed GPU writes use ordering barriers and hardware coherence.
+/* NativeAdrenoSubmit owns eight issued jobs on the shared ring. The scheduler
+ * retains accepted jobs and resolves their queue, timeline and memory
+ * dependencies before calling submitResources. This object retains each
+ * mapping, emits the IB packets and a final hardware fence, then releases those
+ * references after the IRQ worker observes that fence. CPU stores and completed
+ * GPU writes use ordering barriers and hardware coherence.
  *
- * The IOKit service serializes calls and retries Busy outside its device lock.
- * A poisoned ring retains every job reference until hardware recovery proves
- * that GPU access stopped. The small submit method serves kernel diagnostics;
- * user connections use submitResources for both ABI versions. */
+ * The IOKit service serializes VM changes, scheduling and retirement. A fault
+ * retains hardware references until the service stops CP and GMU DMA. The
+ * small submit method serves kernel startup diagnostics. */
 class NativeAdrenoSubmit final {
     struct Job {
         uint32_t fence=0;
@@ -68,30 +70,27 @@ class NativeAdrenoSubmit final {
         uint16_t *mapping_resources=nullptr;
         size_t cache_line=0;
     } jobs_[8];
-    struct AliasQuery {
-        const NativeAdrenoSubmitResource *resources;
-        const uint16_t *mapping_resources;
-        size_t cache_line;
-        bool writes,skip_checked;
-    };
     NativeAdrenoSubmitResource *resource_storage_=nullptr;
     uint16_t *mapping_resource_storage_=nullptr;
     uint32_t *command_words_=nullptr;
     NativeAdrenoVm *vm_=nullptr;
     NativeAdrenoRing *ring_=nullptr;
+    NativeAdrenoScheduler *scheduler_=nullptr;
     NativeAdrenoSubmitStats stats_{};
     bool attached_=false,poisoned_=false;
     Job *find(uint32_t fence);
     Job *free();
     IOReturn release(Job &);
     IOReturn poison();
-    static bool resourceConflict(void *,uint64_t,size_t,size_t);
 public:
     NativeAdrenoSubmit()=default;
     ~NativeAdrenoSubmit()=default;
     NativeAdrenoSubmit(const NativeAdrenoSubmit &)=delete;
     NativeAdrenoSubmit &operator=(const NativeAdrenoSubmit &)=delete;
     IOReturn attach(NativeAdrenoVm *,NativeAdrenoRing *);
+    NativeAdrenoScheduler *scheduler() const {
+        return scheduler_;
+    }
     /* Refuses while jobs are outstanding or poisoned; the caller must have
      * stopped the GPU and observed every fence before calling this. */
     IOReturn detach();
@@ -110,6 +109,8 @@ public:
     /* Completed jobs release their mapping references after the fence read and
      * CPU barrier. The caller serializes submissions, VM changes and retirement. */
     IOReturn retireCompleted();
+    /* The service calls this after stopping CP and GMU DMA. */
+    IOReturn releaseAfterDmaStopped();
     /* Waits for every outstanding job in submission order and retires its references. */
     IOReturn waitAll(const NativeAdrenoRingClock *,uint32_t timeout_us);
     /* Polls the CP timestamp; on completion retires every buffer reference. A fence whose job was already retired (by

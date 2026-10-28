@@ -70,6 +70,8 @@ class A642LState final {
     bool cpTrace_=false;
     bool ready_=false;
     bool irqAttached_=false;
+    bool hardwareIrqEnabled_=false;
+    uint32_t hardwareIrqFailed_=0;
     uint32_t watchedFence_=0;
     uint64_t watchedSince_=0;
     unsigned gpuSlots_[2]{},gmuSlots_[2]{},lpacSlots_[2]{};
@@ -86,6 +88,7 @@ class A642LState final {
     static int acquireFence(void *,volatile uint32_t *,size_t);
     static uint64_t now(void *);
     static int idle(void *);
+    static void gpuInterrupt(void *);
     IOReturn observeInitialization();
     IOReturn checkGpuTranslations();
     IOReturn mapWindows();
@@ -259,7 +262,7 @@ IOReturn A642LState::observeInitialization()
     if(!status) {
         status=gmu_.poll();
     }
-    if(status || !irqAttached_) {
+    if(status || !irqAttached_ || hardwareIrqEnabled_) {
         return status;
     }
     NativeAdrenoIrqResult result{};
@@ -270,6 +273,24 @@ IOReturn A642LState::observeInitialization()
         return status?status:kIOReturnIOError;
     }
     return kIOReturnSuccess;
+}
+
+void A642LState::gpuInterrupt(void *cookie)
+{
+    A642LState *self=static_cast<A642LState *>(cookie);
+    NativeAdrenoIrqResult result{};
+    const IOReturn status=self->irq_.handle(&result);
+    native_adreno_a6xx_stats[11]=result.status;
+    native_adreno_a6xx_stats[12]=result.cp_status;
+    native_adreno_a6xx_stats[13]=result.protect_status;
+    const bool failed=status || (result.flags&NativeAdrenoIrqFatal);
+    if(failed) {
+        __atomic_store_n(&self->hardwareIrqFailed_,1,__ATOMIC_RELEASE);
+        native_adreno_smmu_disable_irq(self->resources_.gpuInterrupt);
+    }
+    if(failed || (result.flags&NativeAdrenoIrqFence)) {
+        native_adreno_gpu_interrupt(failed);
+    }
 }
 
 IOReturn A642LState::checkGpuTranslations()
@@ -815,6 +836,10 @@ IOReturn A642LState::startCp()
 
 IOReturn A642LState::fail(IOReturn status)
 {
+    if(hardwareIrqEnabled_) {
+        native_adreno_smmu_disable_irq(resources_.gpuInterrupt);
+        hardwareIrqEnabled_=false;
+    }
     smmuProvider_.observe();
     smmuProvider_.disableInterrupts();
     native_adreno_a6xx_stats[1]=uint32_t(status);
@@ -831,6 +856,7 @@ IOReturn A642LState::fail(IOReturn status)
     native_adreno_a6xx_stats[20]=stopped;
     native_adreno_a6xx_stats[21]=uint32_t(gmuStopped);
     if(stopped && !gmuStopped) {
+        native_adreno_dma_stopped();
         power_.stop(true);
     }
     dump();
@@ -898,6 +924,14 @@ IOReturn A642LState::start()
     if(status) {
         return fail(status);
     }
+    status=native_adreno_smmu_register_irq(resources_.gpuInterrupt,gpuInterrupt,this);
+    if(!status) {
+        hardwareIrqEnabled_=true;
+        status=native_adreno_smmu_enable_irq(resources_.gpuInterrupt);
+    }
+    if(status) {
+        return fail(status);
+    }
     ready_=true;
     native_adreno_a6xx_stats[0]=7;
     native_adreno_control_update(7,0,"ready");
@@ -922,11 +956,8 @@ void A642LState::poll()
         return;
     }
 
-    NativeAdrenoIrqResult result{};
-    const IOReturn status=irq_.handle(&result);
-    native_adreno_a6xx_stats[11]=result.status;
-    native_adreno_a6xx_stats[12]=result.cp_status;
-    native_adreno_a6xx_stats[13]=result.protect_status;
+    const IOReturn status=__atomic_load_n(&hardwareIrqFailed_,__ATOMIC_ACQUIRE)?
+        kIOReturnIOError:kIOReturnSuccess;
     uint32_t submitted=0,completed=0;
     const int progress=native_adreno_progress(&submitted,&completed);
     const uint64_t current=now(nullptr);
@@ -935,7 +966,7 @@ void A642LState::poll()
         watchedSince_=current;
     }
     const bool timeout=submitted!=completed && current-watchedSince_>500000;
-    if(status || progress || (result.flags&NativeAdrenoIrqFatal) || timeout) {
+    if(status || progress || timeout) {
         ready_=false;
         native_adreno_a6xx_stats[0]=8;
         fail(status?status:(timeout?kIOReturnTimeout:kIOReturnIOError));

@@ -459,13 +459,14 @@ IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,u
 {
     if(!fence)return kIOReturnBadArgument;*fence=0;
     if(!attached_ || poisoned_ || bootstrap_pending_)return kIOReturnNotReady;
-    if(!words || !word_count || word_count>SIZE_MAX/sizeof(uint32_t))return kIOReturnBadArgument;
+    if((word_count && !words) || (!word_count && !framed) ||
+        word_count>SIZE_MAX/sizeof(uint32_t))return kIOReturnBadArgument;
     const uint32_t size_words=(uint32_t)(ring_bytes_/4),mask=size_words-1;
     const bool reset=framed && reset_pending_;
     const uint32_t extra=generation_==NativeAdrenoA642L?
         (framed?4+(reset?1:0)+RingFenceWords+8:RingFenceWords):
         (framed?RingPrologueWords+(reset?RingResetWords:0)+RingFramedFenceWords:RingFenceWords);
-    if(word_count>size_words-extra-8)return kIOReturnNoResources;
+    if(word_count>size_words-extra-8)return kIOReturnBadArgument;
     uint32_t at=next_;
     IOReturn status=kIOReturnSuccess;
     if(generation_==NativeAdrenoA642L) {

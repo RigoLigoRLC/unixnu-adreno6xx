@@ -22,12 +22,14 @@
 #include <string.h>
 #include <kern/thread.h>
 #include <kern/clock.h>
+#include <kern/thread_call.h>
 #include <mach/kmod.h>
 #include <pexpert/pexpert.h>
 #include "NativeAdrenoUserClient.h"
 #include "NativeAdrenoIntegration.h"
 #include "NativeAdrenoA6xxService.h"
 #include "NativeAdrenoDisplay.h"
+#include "NativeAdrenoScheduler.h"
 
 static NativeAdrenoIntegration integration = {};
 extern "C" kmod_info_t g_kernel_kmod_info;
@@ -155,6 +157,9 @@ struct Published {
     const NativeAdrenoAbiDeviceInfo *info=nullptr;
     IOLock *lock=nullptr;
     IOLock *export_lock=nullptr; /* Serializes optional persistent-log fragment writes. */
+    thread_call_t completionCall=nullptr;
+    uint32_t completionEvent=0;
+    uint32_t interruptFailure=0;
     IOService *service=nullptr;
     bool slots[NativeAdrenoMaxClients]{};
     char slot_names[NativeAdrenoMaxClients][20]{}; /* Owners of occupied slots, including failed teardown. */
@@ -162,6 +167,39 @@ struct Published {
     uint32_t input_bits=0,output_bits=0;
     uint32_t opened=0,closed=0;
 } g;
+
+void completionWorker(thread_call_param_t,thread_call_param_t)
+{
+    IOLockLock(g.lock);
+    if(__atomic_exchange_n(&g.interruptFailure,0,__ATOMIC_ACQ_REL)) {
+        g.failed=true;
+        g.status.noteFault();
+        g.ring->recordFault();
+        g.submit->scheduler()->fault(kIOReturnIOError,false);
+    } else if(!g.failed) {
+        const IOReturn status=g.submit->scheduler()->advance();
+        if(status) {
+            g.failed=true;
+            g.status.noteFault();
+            g.ring->recordFault();
+            g.submit->scheduler()->fault(status,false);
+        }
+    }
+    ++g.completionEvent;
+    IOLockWakeup(g.lock,&g.completionEvent,false);
+    for(;;) {
+        NativeAdrenoSurfaceRead *read=g.submit->scheduler()->takeCallback();
+        if(!read) {
+            break;
+        }
+        IOLockUnlock(g.lock);
+        NativeAdrenoScheduler::invokeCallback(read);
+        IOLockLock(g.lock);
+        g.submit->scheduler()->finishCallback(read);
+        IOLockWakeup(g.lock,read,false);
+    }
+    IOLockUnlock(g.lock);
+}
 
 /* BoProfileRecords retains one Vulkan device's counters, bins and slow events.
  * The connection generation and device ID identify the reporting owner. Closed
@@ -974,6 +1012,11 @@ IOReturn AGXDeviceUserClient::clientClose()
 {
     IOLockLock(g.lock);
     closing_=true;
+    if(live_) {
+        core_->beginClose();
+        thread_call_enter(g.completionCall);
+    }
+    IOLockWakeup(g.lock,&g.completionEvent,false);
     if(!kernel_ && slot_<NativeAdrenoMaxClients) {
         for(auto &profile:boProfiles) {
             if(profile.generation==profileGeneration_ && profile.connection_slot==slot_) {
@@ -994,7 +1037,18 @@ IOReturn AGXDeviceUserClient::clientClose()
     IOLockLock(g.lock);
     if(!status && live_) {
         const uint64_t peak=core_->windowPeak();
-        status=core_->releaseAll(&g.clock,2000000);
+        uint64_t deadline=0;
+        clock_interval_to_deadline(2000,kMillisecondScale,&deadline);
+        for(;;) {
+            status=core_->releaseAll(&g.clock,0);
+            if((status!=kIOReturnTimeout && status!=kIOReturnBusy) || g.failed) {
+                break;
+            }
+            if(IOLockSleepDeadline(g.lock,&g.completionEvent,deadline,THREAD_ABORTSAFE)!=THREAD_AWAKENED) {
+                status=kIOReturnTimeout;
+                break;
+            }
+        }
         /* A failed teardown leaves the objects live and the slot taken: nothing is forced or reused. */
         if(!status) {
             live_=false;
@@ -1159,31 +1213,58 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
     native_adreno_metal_diag.inflight_since_calls=native_adreno_metal_diag.calls;
     IOLockUnlock(g.lock);
     IOReturn status;
-    if(method==NativeAdrenoMethodWaitFence && input && input_size==sizeof(NativeAdrenoAbiWaitFence) && g.clock.now_us) {
-        /* int-147: a fence wait polls under the lock but pauses outside it. int-146 slept inside the lock (up to the caller's 1 ms slice per
-         * call), so every other thread's submit, map or allocation waited for the GPU to finish unrelated work: a frame could not be queued
-         * while the previous one ran. Each poll is the core's own zero-timeout wait (same checks, retirement and statistics); the pause is the
-         * board's (until the next GPU interrupt, at most 100 us). */
-        NativeAdrenoAbiWaitFence poll{};
-        memcpy(&poll,input,sizeof(poll));
-        const uint64_t timeout_us=poll.timeout_ns/1000,began=entered?entered:g.clock.now_us(g.clock.cookie);
-        poll.timeout_ns=0;
-        uint64_t waited=0,pauses=0;
-        for(;;) {
-            /* The connection's own core while it is live; a close that ran between two polls ends the wait. */
-            IOLockLock(g.lock);
-            status=connection->live_ && !connection->closing_ && !connection->viewTeardownStatus_ && !g.failed?
-                connection->core_->dispatch(method,&poll,sizeof(poll),output,output_size,&g.clock):kIOReturnNotReady;
-            IOLockUnlock(g.lock);
-            waited=g.clock.now_us(g.clock.cookie)-began;
-            if(status!=kIOReturnTimeout || waited>=timeout_us)break;
-            ++pauses;
-            if(!g.clock.idle || g.clock.idle(g.clock.cookie))break;
+    uint64_t timeoutNs=0;
+    bool sleepingWait=false;
+    NativeAdrenoAbiWaitFence legacyPoll{};
+    const void *waitInput=input;
+    if(method==NativeAdrenoMethodWaitFence && input && input_size==sizeof(legacyPoll)) {
+        memcpy(&legacyPoll,input,sizeof(legacyPoll));
+        timeoutNs=legacyPoll.timeout_ns;
+        legacyPoll.timeout_ns=0;
+        waitInput=&legacyPoll;
+        sleepingWait=true;
+    } else if(method==NativeAdrenoMethodSyncWait && input && input_size==sizeof(NativeAdrenoAbiSyncWait)) {
+        timeoutNs=static_cast<const NativeAdrenoAbiSyncWait *>(input)->timeout_ns;
+        sleepingWait=true;
+    } else if(method==NativeAdrenoMethodWaitCompletion && input && input_size==sizeof(NativeAdrenoAbiCompletionWait)) {
+        timeoutNs=static_cast<const NativeAdrenoAbiCompletionWait *>(input)->timeout_ns;
+        sleepingWait=true;
+    } else if(method==NativeAdrenoMethodWaitCapacity && input && input_size==sizeof(NativeAdrenoAbiCapacityWait)) {
+        timeoutNs=static_cast<const NativeAdrenoAbiCapacityWait *>(input)->timeout_ns;
+        sleepingWait=true;
+    } else if(method==NativeAdrenoMethodWaitBoIdle && input && input_size==sizeof(NativeAdrenoAbiBoWait)) {
+        timeoutNs=static_cast<const NativeAdrenoAbiBoWait *>(input)->timeout_ns;
+        sleepingWait=true;
+    }
+    if(sleepingWait) {
+        uint64_t interval=0,deadline=0,pauses=0;
+        if(timeoutNs!=UINT64_MAX) {
+            nanoseconds_to_absolutetime(timeoutNs,&interval);
+            clock_absolutetime_interval_to_deadline(interval,&deadline);
         }
         IOLockLock(g.lock);
-        native_adreno_wait_outer[0]=native_adreno_wait_outer[0]+1;native_adreno_wait_outer[1]=native_adreno_wait_outer[1]+waited;
+        for(;;) {
+            status=connection->live_ && !connection->closing_ && !connection->viewTeardownStatus_ && !g.failed?
+                connection->core_->dispatch(method,waitInput,input_size,output,output_size,&g.clock):kIOReturnNotReady;
+            if(status!=kIOReturnTimeout || !timeoutNs) {
+                break;
+            }
+            ++pauses;
+            const int awakened=timeoutNs==UINT64_MAX?
+                IOLockSleep(g.lock,&g.completionEvent,THREAD_ABORTSAFE):
+                IOLockSleepDeadline(g.lock,&g.completionEvent,deadline,THREAD_ABORTSAFE);
+            if(awakened!=THREAD_AWAKENED) {
+                status=awakened==THREAD_TIMED_OUT?kIOReturnTimeout:kIOReturnAborted;
+                break;
+            }
+        }
+        const uint64_t waited=g.clock.now_us(g.clock.cookie)-entered;
+        ++native_adreno_wait_outer[0];
+        native_adreno_wait_outer[1]+=waited;
         native_adreno_wait_outer[2]+=pauses;
-        if(waited>native_adreno_wait_outer[3])native_adreno_wait_outer[3]=waited;
+        if(waited>native_adreno_wait_outer[3]) {
+            native_adreno_wait_outer[3]=waited;
+        }
         IOLockUnlock(g.lock);
     } else {
         const uint64_t lockBegan=g.clock.now_us?g.clock.now_us(g.clock.cookie):0;
@@ -1191,11 +1272,22 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         if(lockBegan && g.clock.now_us) {
             native_adreno_profile_lock_wait(method,entryLockWait+g.clock.now_us(g.clock.cookie)-lockBegan);
         }
-        if(method==NativeAdrenoMethodSubmit || method==NativeAdrenoMethodSubmitV2) {
+        if(method==NativeAdrenoMethodSubmit || method==NativeAdrenoMethodSubmitV2 ||
+            method==NativeAdrenoMethodSubmitAsync) {
             native_adreno_profile_set_client(connection->name_);
         }
         status=connection->live_ && !connection->closing_ && !connection->viewTeardownStatus_ && (!g.failed || method==NativeAdrenoMethodGetStatus)?
             connection->core_->dispatch(method,input,input_size,output,output_size,&g.clock):kIOReturnNotReady;
+        if(!g.failed && (g.vm->poisoned() || g.submit->poisoned() || g.ring->poisoned())) {
+            g.failed=true;
+            g.status.noteFault();
+            g.submit->scheduler()->fault(kIOReturnIOError,false);
+            IOLockWakeup(g.lock,&g.completionEvent,false);
+            thread_call_enter(g.completionCall);
+        }
+        if(method==NativeAdrenoMethodSubmitAsync || method==NativeAdrenoMethodSyncSignal) {
+            IOLockWakeup(g.lock,&g.completionEvent,false);
+        }
         if(connection->live_ && connection->slot_<NativeAdrenoMaxClients &&
             (method==NativeAdrenoMethodBoMap || method==NativeAdrenoMethodBoFree ||
              method==NativeAdrenoMethodGetResourceBudget)) {
@@ -1468,7 +1560,17 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
         {&action,0,sizeof(NativeAdrenoAbiBoCpuUnmapV2),0,0},
         {&action,0,0,0,sizeof(NativeAdrenoAbiSubmitCaps)},
         {&action,0,kIOUCVariableStructureSize,0,sizeof(NativeAdrenoAbiSubmitV2Reply)},
-        {&action,0,0,0,sizeof(NativeAdrenoAbiResourceBudget)}};
+        {&action,0,0,0,sizeof(NativeAdrenoAbiResourceBudget)},
+        {&action,0,0,0,sizeof(NativeAdrenoAbiAsyncCaps)},
+        {&action,0,sizeof(NativeAdrenoAbiSyncCreate),0,sizeof(NativeAdrenoAbiSyncHandle)},
+        {&action,0,sizeof(NativeAdrenoAbiSyncHandle),0,0},
+        {&action,0,sizeof(NativeAdrenoAbiSyncPoint),0,0},
+        {&action,0,sizeof(NativeAdrenoAbiSyncHandle),0,sizeof(NativeAdrenoAbiSyncValue)},
+        {&action,0,sizeof(NativeAdrenoAbiSyncWait),0,0},
+        {&action,0,kIOUCVariableStructureSize,0,sizeof(NativeAdrenoAbiAsyncReply)},
+        {&action,0,sizeof(NativeAdrenoAbiCompletionWait),0,0},
+        {&action,0,sizeof(NativeAdrenoAbiCapacityWait),0,0},
+        {&action,0,sizeof(NativeAdrenoAbiBoWait),0,0}};
     __atomic_fetch_add(&native_adreno_metal_diag.ext_entries,1,__ATOMIC_RELAXED);
     if(selector<256) {
         __atomic_fetch_or(&native_adreno_metal_diag.sel_bits[selector>>5],1u<<(selector&31),__ATOMIC_RELAXED);
@@ -1716,8 +1818,9 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
     if(g.published || !vm || !submit || !ring || !clock || !clock->now_us)return kIOReturnBadArgument;
     g.lock=IOLockAlloc();
     g.export_lock=IOLockAlloc();
+    g.completionCall=thread_call_allocate(completionWorker,nullptr);
     NativeAdrenoGpuPublished *service=new NativeAdrenoGpuPublished;
-    if(!g.lock || !g.export_lock || !service || !service->init() || !service->attach(IOService::getPlatform())) {
+    if(!g.lock || !g.export_lock || !g.completionCall || !service || !service->init() || !service->attach(IOService::getPlatform())) {
         if(service)service->release();
         if(g.export_lock) {
             IOLockFree(g.export_lock);
@@ -1726,6 +1829,10 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
         if(g.lock) {
             IOLockFree(g.lock);
             g.lock=nullptr;
+        }
+        if(g.completionCall) {
+            thread_call_free(g.completionCall);
+            g.completionCall=nullptr;
         }
         return kIOReturnNoMemory;
     }
@@ -1869,6 +1976,8 @@ extern "C" void native_adreno_metal_dump_stats(void)
             backingCache[slot]=native_adreno_backing_cache_stats[slot];
         }
         const NativeAdrenoSubmitStats submit=g.submit->stats();
+        static NativeAdrenoSchedulerSample scheduled[256];
+        g.submit->scheduler()->copySamples(scheduled);
         NativeAdrenoAbiResourceBudget budgets[NativeAdrenoMaxClients];
         memcpy(budgets,resourceBudgets,sizeof(budgets));
         const size_t mappingCapacity=g.vm->objectCapacity(),mappingReserved=g.vm->reservedObjects();
@@ -1916,6 +2025,17 @@ extern "C" void native_adreno_metal_dump_stats(void)
         IOLog("NativeAdrenoMetal: submissions=%u completed=%u timeouts=%u poisoned_jobs=%u held=%zu retired=%zu peak_jobs=%zu submitted_fence=%u completed_fence=%u\n",
             submit.submissions,submit.completed,submit.timeouts,submit.poisoned_jobs,
             submit.references_held,submit.references_retired,submit.peak_jobs,submitted,completed);
+        for(const NativeAdrenoSchedulerSample &sample:scheduled) {
+            if(!sample.completion) {
+                continue;
+            }
+            IOLog("NativeAdrenoAsync: completion=%llu queue=%u hardware=%u accepted=%llu issued=%llu completed=%llu status=%08x\n",
+                sample.completion,sample.queue,sample.hardware,sample.acceptedUs,
+                sample.issuedUs,sample.completedUs,sample.status);
+            IOLog("NativeAdrenoAsync: ranges completion=%llu resources=%u alias_queries=%llu alias_hits=%llu waits=%u signals=%u gpu_dependencies=%u dpu_readers=%u pages_walked=0\n",
+                sample.completion,sample.resources,sample.aliasQueries,sample.aliasHits,
+                sample.waits,sample.signals,sample.gpuDependencies,sample.dpuReaders);
+        }
     } else {
         IOLog("NativeAdrenoMetal: submission_sample=%s\n",g.published?"lock_busy":"not_published");
     }
@@ -1938,7 +2058,33 @@ extern "C" void native_adreno_fault(void)
         g.status.noteFault();
         g.ring->recordFault();
     }
+    g.submit->scheduler()->fault(kIOReturnIOError,false);
+    IOLockWakeup(g.lock,&g.completionEvent,false);
     IOLockUnlock(g.lock);
+    thread_call_enter(g.completionCall);
+}
+
+extern "C" void native_adreno_dma_stopped(void)
+{
+    if(!g.published || !g.lock) {
+        return;
+    }
+    IOLockLock(g.lock);
+    g.submit->releaseAfterDmaStopped();
+    IOLockWakeup(g.lock,&g.completionEvent,false);
+    IOLockUnlock(g.lock);
+    thread_call_enter(g.completionCall);
+}
+
+extern "C" void native_adreno_gpu_interrupt(bool failed)
+{
+    if(!g.published || !g.completionCall) {
+        return;
+    }
+    if(failed) {
+        __atomic_store_n(&g.interruptFailure,1,__ATOMIC_RELEASE);
+    }
+    thread_call_enter(g.completionCall);
 }
 extern "C" int native_adreno_progress(uint32_t *submitted,uint32_t *completed)
 {
@@ -1946,7 +2092,7 @@ extern "C" int native_adreno_progress(uint32_t *submitted,uint32_t *completed)
         return 1;
     }
     IOLockLock(g.lock);
-    IOReturn status=g.failed?kIOReturnNotReady:g.submit->retireCompleted();
+    IOReturn status=g.failed?kIOReturnNotReady:kIOReturnSuccess;
     *submitted=g.ring->lastSubmitted();
     uint32_t observed=0;
     if(!status && *submitted) {
@@ -1962,6 +2108,54 @@ extern "C" int native_adreno_progress(uint32_t *submitted,uint32_t *completed)
 extern "C" IOService *native_adreno_published_service()
 {
     return g.service;
+}
+
+extern "C" IOReturn native_adreno_surface_acquire_read(IOMemoryDescriptor *memory,
+    void (*callback)(void *,IOReturn),void *context,NativeAdrenoSurfaceRead **out)
+{
+    if(!out) {
+        return kIOReturnBadArgument;
+    }
+    *out=nullptr;
+    if(!g.published) {
+        return kIOReturnSuccess;
+    }
+    IOLockLock(g.lock);
+    const IOReturn status=g.failed?kIOReturnNotReady:
+        g.submit->scheduler()->acquireRead(memory,callback,context,out);
+    IOLockUnlock(g.lock);
+    return status;
+}
+
+extern "C" IOReturn native_adreno_surface_read_status(NativeAdrenoSurfaceRead *read,
+    uint32_t *latestHardware)
+{
+    if(!read) {
+        if(latestHardware) {
+            *latestHardware=0;
+        }
+        return kIOReturnSuccess;
+    }
+    IOLockLock(g.lock);
+    const IOReturn status=g.submit->scheduler()->readStatus(read,latestHardware);
+    IOLockUnlock(g.lock);
+    return status;
+}
+
+extern "C" void native_adreno_surface_release_read(NativeAdrenoSurfaceRead *read)
+{
+    if(!read) {
+        return;
+    }
+    IOLockLock(g.lock);
+    NativeAdrenoScheduler *scheduler=g.submit->scheduler();
+    scheduler->cancelRead(read);
+    while(scheduler->callbackRunning(read)) {
+        IOLockSleep(g.lock,read,THREAD_UNINT);
+    }
+    scheduler->releaseRead(read);
+    IOLockWakeup(g.lock,&g.completionEvent,false);
+    IOLockUnlock(g.lock);
 }
 
 static IOReturn pollSurfaceProducerLocked(uint32_t fence)
@@ -2065,28 +2259,23 @@ extern "C" IOReturn native_adreno_wait_surface_producer(uint32_t timeout_us,
         return kIOReturnNotReady;
     }
 
-    const NativeAdrenoRingClock clock=g.clock;
-    const uint64_t began=clock.now_us(clock.cookie);
-    uint32_t fence=0;
-    bool captured=false;
+    uint64_t deadline=0;
+    clock_interval_to_deadline(timeout_us,kMicrosecondScale,&deadline);
+    IOLockLock(g.lock);
+    const uint32_t fence=g.ring->lastSubmitted();
+    if(captured_fence) {
+        *captured_fence=fence;
+    }
     for(;;) {
-        IOReturn status=kIOReturnTimeout;
-        if(IOLockTryLock(g.lock)) {
-            if(!captured) {
-                fence=g.ring->lastSubmitted();
-                captured=true;
-                if(captured_fence) {
-                    *captured_fence=fence;
-                }
-            }
-
-            status=pollSurfaceProducerLocked(fence);
+        const IOReturn status=pollSurfaceProducerLocked(fence);
+        if(status!=kIOReturnTimeout || !timeout_us) {
             IOLockUnlock(g.lock);
-        }
-
-        if(status!=kIOReturnTimeout || clock.now_us(clock.cookie)-began>=timeout_us) {
             return status;
         }
-        IOSleep(1);
+        const int awakened=IOLockSleepDeadline(g.lock,&g.completionEvent,deadline,THREAD_ABORTSAFE);
+        if(awakened!=THREAD_AWAKENED) {
+            IOLockUnlock(g.lock);
+            return awakened==THREAD_TIMED_OUT?kIOReturnTimeout:kIOReturnAborted;
+        }
     }
 }

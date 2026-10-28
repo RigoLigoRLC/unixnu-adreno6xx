@@ -4,6 +4,30 @@
 #include <IOKit/IOTypes.h>
 #include <stdint.h>
 class IOMemoryDescriptor;
+struct NativeAdrenoSurfaceRead;
+
+/* NativeAdrenoSurfaceRead retains the prepared surface memory and its GPU
+ * mapping references while DPU reads it. Acquisition records the current GPU
+ * writers and registers the DPU read before allowing another GPU submission.
+ * A CPU-produced surface with no GPU writer is ready immediately.
+ *
+ * Success means ready; NotReady means that a writer is outstanding and the
+ * callback will report completion. Both results transfer one read to out.
+ * Other errors leave out null. Callbacks run without the GPU lock. Display
+ * signals its workloop from the callback and releases the read after the DPU
+ * has stopped scanning it, or after cancelling an unpresented request. */
+extern "C" IOReturn native_adreno_surface_acquire_read(IOMemoryDescriptor *,
+    void (*ready)(void *, IOReturn), void *context, NativeAdrenoSurfaceRead **out);
+
+/* The hardware fence is diagnostic information. The read object owns all
+ * writer dependencies, including work accepted before its ring publication. */
+extern "C" IOReturn native_adreno_surface_read_status(NativeAdrenoSurfaceRead *,
+    uint32_t *latest_hardware_fence);
+
+/* Release cancels a pending callback and waits for an executing callback to
+ * return before releasing context ownership. The callback must not call this
+ * function for its own read. After return, context is never accessed again. */
+extern "C" void native_adreno_surface_release_read(NativeAdrenoSurfaceRead *);
 
 enum : uint32_t {
     NativeAdrenoSurfaceProfileMissingStart = 1u << 0,

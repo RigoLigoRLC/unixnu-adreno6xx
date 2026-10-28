@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "NativeAdrenoSubmit.h"
+#include "NativeAdrenoScheduler.h"
 #include "AdrenoPM4.h"
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -784,6 +785,15 @@ IOReturn NativeAdrenoSubmit::attach(NativeAdrenoVm *vm,NativeAdrenoRing *ring)
         return kIOReturnNoMemory;
     }
     vm_=vm;ring_=ring;attached_=true;stats_={};
+    scheduler_=new NativeAdrenoScheduler;
+    if(!scheduler_ || scheduler_->attach(vm,this,ring)) {
+        if(scheduler_) {
+            delete scheduler_;
+            scheduler_=nullptr;
+        }
+        detach();
+        return kIOReturnNoMemory;
+    }
     memset(surfaceWriters,0,sizeof(surfaceWriters));
     memset(surfaceWrites,0,sizeof(surfaceWrites));
     memset(releasedSurfaceWriters,0,sizeof(releasedSurfaceWriters));
@@ -824,6 +834,14 @@ IOReturn NativeAdrenoSubmit::detach()
 {
     if(poisoned_ || outstanding())return kIOReturnBusy;
     if(!attached_)return kIOReturnNotReady;
+    if(scheduler_) {
+        const IOReturn status=scheduler_->detach();
+        if(status) {
+            return status;
+        }
+        delete scheduler_;
+        scheduler_=nullptr;
+    }
     vm_->setBackingReleaseObserver(nullptr);
     for (SurfaceDescriptor &source : surfaceDescriptors) {
         if (source.memory) {
@@ -845,6 +863,9 @@ bool NativeAdrenoSubmit::queueOutstanding(uint32_t queue) const
 }
 bool NativeAdrenoSubmit::rangeOutstanding(uint32_t first,uint32_t count) const
 {
+    if(scheduler_ && scheduler_->rangeOutstanding(first,count)) {
+        return true;
+    }
     for(const auto &job:jobs_)if(job.active && job.queue-first<count)return true;
     return false;
 }
@@ -937,27 +958,6 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
     *fence=value;
     return kIOReturnSuccess;
 }
-bool NativeAdrenoSubmit::resourceConflict(void *cookie,uint64_t handle,size_t offset,size_t bytes)
-{
-    const auto &query=*static_cast<const AliasQuery *>(cookie);
-    const size_t slot=size_t(handle&(NativeAdrenoVmMaxObjects-1));
-    const size_t end=offset+bytes;
-    for(uint16_t item=query.mapping_resources[slot];item;) {
-        const NativeAdrenoSubmitResource &resource=query.resources[item-1];
-        item=resource.next_for_mapping;
-        if(resource.handle!=handle || (query.skip_checked && resource.check_overlap) ||
-            (!query.writes && !(resource.access&NativeAdrenoResourceWrite))) {
-            continue;
-        }
-        const size_t begin=resource.offset&~(query.cache_line-1);
-        const size_t limit=(resource.offset+resource.bytes+query.cache_line-1)&~(query.cache_line-1);
-        if(begin<end && offset<limit) {
-            return true;
-        }
-    }
-    return false;
-}
-
 IOReturn NativeAdrenoSubmit::submitResources(const NativeAdrenoSubmitBuffer *buffers,size_t count,
     const NativeAdrenoSubmitResource *resources,size_t resource_count,uint32_t queue,
     uint32_t fallback_reason,uint32_t *fence)
@@ -969,8 +969,8 @@ IOReturn NativeAdrenoSubmit::submitResources(const NativeAdrenoSubmitBuffer *buf
     if(!attached_ || poisoned_) {
         return kIOReturnNotReady;
     }
-    if(!buffers || !count || count>NativeAdrenoSubmitMaxIbs || !resources ||
-        !resource_count || resource_count>NativeAdrenoSubmitMaxResources) {
+    if((count && !buffers) || count>NativeAdrenoSubmitMaxIbs ||
+        (resource_count && !resources) || resource_count>NativeAdrenoSubmitMaxResources) {
         return kIOReturnBadArgument;
     }
 
@@ -1012,88 +1012,37 @@ IOReturn NativeAdrenoSubmit::submitResources(const NativeAdrenoSubmitBuffer *buf
 
     NativeAdrenoSubmitResource *held=resource_storage_+(job-jobs_)*NativeAdrenoSubmitMaxResources;
     uint16_t *mapping_resources=mapping_resource_storage_+(job-jobs_)*NativeAdrenoVmMaxObjects;
-    memset(mapping_resources,0,sizeof(uint16_t)*NativeAdrenoVmMaxObjects);
-    size_t overlap_count=0;
-    size_t copied=0;
-    for(unsigned pass=0;pass<2;++pass) {
-        for(size_t at=0;at<resource_count;++at) {
-            const bool check_overlap=vm_->resourceHasUncachedImport(resources[at].handle);
-            if(check_overlap!=(pass==0)) {
-                continue;
-            }
-            held[copied]=resources[at];
-            held[copied++].check_overlap=check_overlap;
-        }
-        if(!pass) {
-            overlap_count=copied;
-        }
-    }
+    uint64_t referenced_slots[(NativeAdrenoVmMaxObjects+63)/64]{};
+    const size_t overlap_count=0;
     for(size_t at=0;at<resource_count;++at) {
+        held[at]=resources[at];
         NativeAdrenoSubmitResource &resource=held[at];
         const size_t slot=size_t(resource.handle&(NativeAdrenoVmMaxObjects-1));
+        const uint64_t bit=UINT64_C(1)<<(slot&63);
+        if(!(referenced_slots[slot/64]&bit)) {
+            referenced_slots[slot/64]|=bit;
+            mapping_resources[slot]=0;
+        }
         resource.next_for_mapping=mapping_resources[slot];
         mapping_resources[slot]=uint16_t(at+1);
     }
 
-    const uint64_t alias_began=profileNow();
     uint64_t alias_queries=0,alias_hits=0;
     const size_t cache_line=64;
-    /* Active jobs retain physical alias exclusion until their GPU fences
-     * complete. Read/read access can overlap. */
-    for(const Job &previous:jobs_) {
-        if(!previous.active) {
-            continue;
-        }
-        if(!previous.resources) {
-            return kIOReturnBusy;
-        }
-        const size_t line=cache_line>previous.cache_line?cache_line:previous.cache_line;
-        for(size_t at=0;at<overlap_count && !status;++at) {
-            const NativeAdrenoSubmitResource &resource=held[at];
-            AliasQuery query{previous.resources,previous.mapping_resources,line,
-                bool(resource.access&NativeAdrenoResourceWrite),false};
-            status=vm_->visitResourceAliases(resource.handle,resource.offset,resource.bytes,line,
-                resourceConflict,&query,&alias_queries,&alias_hits);
-        }
-        for(size_t at=0;at<previous.overlap_count && !status;++at) {
-            const NativeAdrenoSubmitResource &resource=previous.resources[at];
-            AliasQuery query{held,mapping_resources,line,bool(resource.access&NativeAdrenoResourceWrite),true};
-            status=vm_->visitResourceAliases(resource.handle,resource.offset,resource.bytes,line,
-                resourceConflict,&query,&alias_queries,&alias_hits);
-        }
-        if(status) {
-            break;
-        }
-    }
-    const uint32_t alias_us=uint32_t(profileNow()-alias_began);
-    profileEnter();
-    aliasTotals[0]+=alias_us;
-    aliasTotals[1]+=alias_queries;
-    aliasTotals[2]+=alias_hits;
-    if(status==kIOReturnBusy) {
-        ++submitV2Counters[5];
-        aliasTotals[3]+=alias_queries==NativeAdrenoAliasQueryLimit || alias_hits==NativeAdrenoAliasHitLimit;
-    }
-    profileLeave();
-    if(status) {
-        return status;
-    }
+    const uint32_t alias_us=0;
 
-    uint64_t referenced_slots[(NativeAdrenoVmMaxObjects+63)/64]{};
     size_t held_count=0;
     for(;held_count<resource_count;++held_count) {
         NativeAdrenoSubmitResource &resource=held[held_count];
         resource.owns_reference=false;
         const size_t slot=size_t(resource.handle&4095);
-        const uint64_t bit=UINT64_C(1)<<(slot&63);
-        if(referenced_slots[slot/64]&bit) {
+        if(mapping_resources[slot]!=held_count+1) {
             continue;
         }
         status=vm_->holdJob(held[held_count].handle);
         if(status) {
             break;
         }
-        referenced_slots[slot/64]|=bit;
         resource.owns_reference=true;
         ++stats_.references_held;
     }
@@ -1232,8 +1181,20 @@ IOReturn NativeAdrenoSubmit::waitRange(uint32_t first,uint32_t count,const Nativ
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     while(rangeOutstanding(first,count)) {
+        if(scheduler_) {
+            const IOReturn scheduled=scheduler_->advance();
+            if(scheduled) {
+                return scheduled;
+            }
+            if(!rangeOutstanding(first,count)) {
+                break;
+            }
+        }
         Job *oldest=nullptr;
         for(auto &job:jobs_)if(job.active && job.queue-first<count && (!oldest || job.fence-oldest->fence>0x80000000u))oldest=&job;
+        if(!oldest) {
+            return kIOReturnTimeout;
+        }
         const IOReturn status=wait(oldest->fence,clock,timeout_us);
         if(status)return status;
     }
@@ -1276,5 +1237,21 @@ IOReturn NativeAdrenoSubmit::retireCompleted()
         ++stats_.completed;
     }
 
+    return kIOReturnSuccess;
+}
+
+IOReturn NativeAdrenoSubmit::releaseAfterDmaStopped()
+{
+    if(scheduler_) {
+        scheduler_->fault(kIOReturnIOError,true);
+    }
+    for(Job &job:jobs_) {
+        if(job.active) {
+            const IOReturn status=release(job);
+            if(status) {
+                return status;
+            }
+        }
+    }
     return kIOReturnSuccess;
 }

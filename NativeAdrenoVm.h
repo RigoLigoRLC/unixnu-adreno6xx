@@ -151,6 +151,9 @@ class NativeAdrenoVm final {
     bool cached_coherent_imports_=false;
     bool map_busy_alias_=false,map_alias_limit_=false;
     void (*backing_release_observer_)(uint64_t)=nullptr;
+    IOReturn (*mapping_added_)(void *,uint64_t)=nullptr;
+    void (*mapping_removed_)(void *,uint64_t)=nullptr;
+    void *mapping_observer_context_=nullptr;
     NativeAdrenoVmResult result_{};
     ArmSmmu4KLiveRegion region(unsigned) const;
     ArmSmmu4KStatus observeEmptyTables() const;
@@ -166,6 +169,8 @@ class NativeAdrenoVm final {
     IOReturn buildMappingAliases(Mapping *,const NativeAdrenoMemory *,PhysicalRange *,MappingAlias **,size_t *);
     static void linkMappingAlias(MappingAlias &);
     static void unlinkMappingAlias(MappingAlias &);
+    static bool visitPhysical(const PhysicalRange *,uint64_t,uint64_t,
+        bool (*)(void *,uint64_t,size_t,size_t),void *);
 public:
     NativeAdrenoVm()=default;
     ~NativeAdrenoVm()=default;
@@ -186,6 +191,7 @@ public:
         unsigned permissions,unsigned writeback,unsigned shareability,uint64_t *handle);
     IOReturn unmap(uint64_t handle);
     IOReturn holdJob(uint64_t handle);
+    bool resourceBusy(uint64_t handle) const;
     bool resourceHasUncachedImport(uint64_t handle) const;
     bool resourceImported(uint64_t handle) const;
     /* The borrowed backing remains valid while the service holds its GPU lock.
@@ -196,6 +202,16 @@ public:
     void setBackingReleaseObserver(void (*observer)(uint64_t)) {
         backing_release_observer_=observer;
     }
+    void setMappingObserver(IOReturn (*observer)(void *,uint64_t),
+        void (*removed)(void *,uint64_t),void *context) {
+        mapping_added_=observer;
+        mapping_removed_=removed;
+        mapping_observer_context_=context;
+    }
+    /* Physical ranges are visited during display acquisition and map creation.
+     * The callback receives the mapped handle and exact overlapping BO bytes. */
+    IOReturn visitPhysicalAliases(uint64_t,size_t,
+        bool (*)(void *,uint64_t,size_t,size_t),void *) const;
     /* The callback receives the same mapping and each static physical alias at
      * the translated BO interval. A conflict or exhausted query budget returns
      * Busy; the caller retries after active jobs retire. */

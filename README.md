@@ -15,6 +15,43 @@ BO ownership, the GPU address tree, incremental page-table updates, reusable
 backing allocations and USB timing counters are described in
 [BO memory management](BO_MEMORY_MANAGEMENT.md).
 
+## Submission and completion
+
+`QueryAsync` exposes version 1 of the asynchronous extension independently of
+ABI v1. The driver copies up to 64 accepted jobs and retains their BO ranges,
+input timeline points and output signals. Eight jobs can occupy the hardware
+ring. Each software queue preserves submission order; the oldest runnable queue
+head is issued when ring space is available. A producer already issued on this
+ring satisfies a GPU scheduling dependency. Host signals, future timeline values
+and DPU readers resume scheduling through their completion events.
+
+The GPU SPI is registered from the board's `gpu` interrupt entry. Its handler
+acknowledges RBBM status and schedules the completion worker. That worker reads
+the CP-written fence, retires matching jobs, updates timeline values and wakes
+sleeping CPU waiters. The 10 ms service poll checks faults and the 500 ms
+hardware timeout. Empty submissions emit a fence after their input dependencies
+and prior queue work. ABI v1 submissions retain their hardware-fence replies and
+report Busy when their dependencies cannot be issued immediately.
+
+`NativeAdrenoSurfaceRead` retains the source descriptor and the mapped physical
+ranges used by DPU. A bounded backing cache keeps the descriptor prepared and
+stores its physical segments and mapping intervals. Repeated acquisition reads
+those intervals, records the outstanding writers and inserts the display read
+in the same locked operation. Mapping creation and removal maintain the cached
+intervals; subsequent submissions follow those stored ranges.
+The callback runs outside the GPU lock. Release synchronously cancels or joins
+the callback and removes the read after DPU has stopped using the memory.
+Kernel BO-idle waits cover accepted jobs, issued jobs and display reads before
+the Darwin allocator reuses a BO. A fault completes waits with an error and
+retains hardware references until CP and GMU DMA have stopped.
+
+The `gpu` dump includes 256 bounded `NativeAdrenoAsync` records connecting each
+software completion to its hardware fence and accepted, issued and completed
+timestamps. Resource records count actual submitted ranges, alias queries,
+matched intervals, GPU dependencies and display readers. Submission performs
+zero physical-page walks. Detailed descriptor matching happens at display
+acquisition and mapping creation.
+
 Ordinary BO allocations, the command ring, fences, SQE firmware and scratch
 memory use CPU write-back mappings and coherent GPU WB/WA mappings. Imports
 retain their CPU attributes: pinned cached pages use GPU WB/WA; Normal NC
@@ -46,17 +83,17 @@ generations remain mapped; the VM unmap callback releases the last matching
 descriptor reference. Repeated captures use those identities without another
 physical-page walk. New aliases invalidate only the matching source key.
 First-match work is bounded and reported by `matchCacheHit`, `matchSegments`
-and `matchUs`. No frame-path allocation, console output or CPU cache-line
-maintenance is added.
+and `matchUs`. The profiling history uses fixed storage; console output is
+produced only when the diagnostic dump is requested.
 
 Frame timestamps use continuous-clock microseconds, including the CPU's first
 observation that the last direct writer's GPU fence completed. That observation
 is an upper bound on GPU completion. The display's DPU timing supplies the
 presentation interval. Missing composition timestamps, overwritten history,
 released backing, conservative legacy resource access, missing completion and
-bounded match/list capacity are explicit profile flags. The global fence remains
-the readiness barrier; its full submission range is never reported as the
-surface's writer list.
+bounded match/list capacity are explicit profile flags. Readiness comes from the
+surface's retained writer objects. The hardware fence reported with a read is
+used only to delimit the diagnostic writer history.
 
 ## Board interface
 

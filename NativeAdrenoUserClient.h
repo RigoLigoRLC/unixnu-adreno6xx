@@ -81,6 +81,7 @@ public:
     uint64_t windowPeak() const {return window_peak_;}
     /* Whether any job is unobserved in the range this client owns (never, while it owns none). */
     bool ownRangeOutstanding() const;
+    void beginClose();
     /* Refuses while any object is live or any of this client's jobs is unobserved. */
     IOReturn close();
     /* Connection teardown requires the IOKit wrapper to remove every CPU view
@@ -106,7 +107,9 @@ public:
     IOReturn freeBo(const NativeAdrenoAbiBoFree *);
     IOReturn submit(const NativeAdrenoAbiSubmit *,NativeAdrenoAbiSubmitReply *,
         const NativeAdrenoRingClock *);
-    IOReturn submitV2(const void *,size_t,NativeAdrenoAbiSubmitV2Reply *);
+    IOReturn submitV2(const void *,size_t,NativeAdrenoAbiSubmitV2Reply *,
+        const NativeAdrenoAbiSubmitAsync *async=nullptr);
+    IOReturn submitAsync(const void *,size_t,NativeAdrenoAbiAsyncReply *);
     IOReturn submitCaps(NativeAdrenoAbiSubmitCaps *);
     IOReturn resourceBudget(NativeAdrenoAbiResourceBudget *) const;
     IOReturn cpuMap(const NativeAdrenoAbiBoCpuMap *,NativeAdrenoAbiBoCpuMapReply *,bool controlled=false);

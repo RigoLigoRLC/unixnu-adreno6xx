@@ -329,10 +329,6 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
         memory->cpuCacheCoherent()?1u:0u;
     PhaseClock clock;
     IOReturn checked=preflight(memory,upper,iova,permissions,writeback,shareability);if(checked)return checked;
-    if(activeAlias(memory,0)) {
-        map_busy_alias_=true;
-        return kIOReturnBusy;
-    }
     if(next_handle_>(UINT64_MAX>>12) || free_head_>=mapping_capacity_) {
         return kIOReturnNoResources;
     }
@@ -425,6 +421,13 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
         linkMappingAlias(aliases[at]);
     }
     --reserved_objects_;
+    if(mapping_added_) {
+        const IOReturn observed=mapping_added_(mapping_observer_context_,record->handle);
+        if(observed) {
+            poisoned_=true;
+            return observed;
+        }
+    }
     clock.lap(0,4);clock.done(0,memory->bytes());
     *handle=record->handle;result_.complete=true;return kIOReturnSuccess;
 }
@@ -462,6 +465,9 @@ IOReturn NativeAdrenoVm::unmap(uint64_t handle)
     clock.lap(1,4);
     if(backing_release_observer_) {
         backing_release_observer_(handle);
+    }
+    if(mapping_removed_) {
+        mapping_removed_(mapping_observer_context_,handle);
     }
     if(record->memory->retireAfterQuiescence()!=kIOReturnSuccess)return fail(ArmSmmu4KStateMismatch);
     IODeleteData(record->ranges,ArmSmmu4KRange,spans);
@@ -797,6 +803,39 @@ IOReturn NativeAdrenoVm::visitResourceAliases(uint64_t handle,size_t offset,size
     return kIOReturnSuccess;
 }
 
+bool NativeAdrenoVm::visitPhysical(const PhysicalRange *range,uint64_t first,uint64_t end,
+    bool (*visit)(void *,uint64_t,size_t,size_t),void *context)
+{
+    if(!range || range->subtree_end<=first) {
+        return false;
+    }
+    if(visitPhysical(RB_LEFT(range,link),first,end,visit,context)) {
+        return true;
+    }
+    if(range->physical>=end) {
+        return false;
+    }
+    if(range->end>first) {
+        const uint64_t begin=range->physical>first?range->physical:first;
+        const uint64_t limit=range->end<end?range->end:end;
+        if(visit(context,range->mapping->handle,
+            range->offset+size_t(begin-range->physical),size_t(limit-begin))) {
+            return true;
+        }
+    }
+    return visitPhysical(RB_RIGHT(range,link),first,end,visit,context);
+}
+
+IOReturn NativeAdrenoVm::visitPhysicalAliases(uint64_t physical,size_t bytes,
+    bool (*visit)(void *,uint64_t,size_t,size_t),void *context) const
+{
+    if(!physical || !bytes || physical>UINT64_MAX-bytes || !visit) {
+        return kIOReturnBadArgument;
+    }
+    return visitPhysical(RB_ROOT(&physical_.root),physical,physical+bytes,visit,context)?
+        kIOReturnNoResources:kIOReturnSuccess;
+}
+
 IOReturn NativeAdrenoVm::holdJob(uint64_t handle)
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
@@ -804,6 +843,11 @@ IOReturn NativeAdrenoVm::holdJob(uint64_t handle)
     if(record->jobs==UINT32_MAX)return kIOReturnNoResources;
     IOReturn status=record->memory->holdForDevice();if(status)return status;
     ++record->jobs;return kIOReturnSuccess;
+}
+bool NativeAdrenoVm::resourceBusy(uint64_t handle) const
+{
+    const Mapping *record=find(handle);
+    return record && record->jobs;
 }
 IOReturn NativeAdrenoVm::retireJobAfterCompletion(uint64_t handle)
 {

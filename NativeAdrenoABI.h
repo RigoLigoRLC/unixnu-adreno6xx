@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #ifndef NATIVE_ADRENO_ABI_H
 #define NATIVE_ADRENO_ABI_H
+#define NATIVE_ADRENO_ASYNC_ABI 1
 #include <stdint.h>
 
 /* NativeAdreno wire records carry BO, mapping and submission requests through
@@ -33,6 +34,17 @@ enum {
     NativeAdrenoMethodQuerySubmitV2 = 20,
     NativeAdrenoMethodSubmitV2 = 21,
     NativeAdrenoMethodGetResourceBudget = 22,
+    NativeAdrenoMethodQueryAsync = 23,
+    NativeAdrenoMethodSyncCreate = 24,
+    NativeAdrenoMethodSyncRelease = 25,
+    NativeAdrenoMethodSyncSignal = 26,
+    NativeAdrenoMethodSyncQuery = 27,
+    NativeAdrenoMethodSyncWait = 28,
+    NativeAdrenoMethodSubmitAsync = 29,
+    NativeAdrenoMethodWaitCompletion = 30,
+    NativeAdrenoMethodWaitCapacity = 31,
+    NativeAdrenoMethodWaitBoIdle = 32,
+    NativeAdrenoMethodLast = NativeAdrenoMethodWaitBoIdle,
     NativeAdrenoAbiMetadataBytes = 64,
     NativeAdrenoAbiMaxQueues = 8
 };
@@ -230,6 +242,59 @@ struct NativeAdrenoAbiSubmitIbV2 {
 };
 struct NativeAdrenoAbiSubmitV2Reply {
     uint64_t fence,epoch;
+};
+
+enum {
+    NativeAdrenoAsyncVersion = 1,
+    NativeAdrenoAsyncMaxJobs = 64,
+    NativeAdrenoAsyncMaxSyncs = 4096,
+    NativeAdrenoAsyncMaxWaits = 128,
+    NativeAdrenoAsyncMaxSignals = 128,
+    NativeAdrenoAsyncTimeline = 1,
+    NativeAdrenoAsyncWaitAny = 1,
+    NativeAdrenoAsyncWaitPending = 2,
+};
+struct NativeAdrenoAbiAsyncCaps {
+    uint32_t version,max_jobs,max_waits,max_signals;
+    uint64_t epoch;
+};
+struct NativeAdrenoAbiSyncCreate {
+    uint64_t initial_value;
+    uint32_t flags,reserved;
+};
+struct NativeAdrenoAbiSyncHandle {
+    uint64_t handle;
+};
+struct NativeAdrenoAbiSyncPoint {
+    uint64_t handle,value;
+};
+struct NativeAdrenoAbiSyncValue {
+    uint64_t value;
+};
+/* NativeAdrenoAbiSubmitAsync appends dependency arrays to the established
+ * resource packet. The embedded packet uses its own byte offsets. The outer
+ * offsets name NativeAdrenoAbiSyncPoint arrays. No pointer crosses the ABI. */
+struct NativeAdrenoAbiSubmitAsync {
+    uint32_t version,total_bytes,submit_offset,submit_bytes;
+    uint32_t wait_offset,wait_count,signal_offset,signal_count;
+    uint64_t epoch;
+};
+struct NativeAdrenoAbiAsyncReply {
+    uint64_t completion,epoch;
+};
+struct NativeAdrenoAbiSyncWait {
+    uint32_t version,count,flags,reserved;
+    uint64_t timeout_ns,epoch;
+    NativeAdrenoAbiSyncPoint points[NativeAdrenoAsyncMaxWaits];
+};
+struct NativeAdrenoAbiCompletionWait {
+    uint64_t completion,timeout_ns,epoch;
+};
+struct NativeAdrenoAbiCapacityWait {
+    uint64_t timeout_ns,epoch;
+};
+struct NativeAdrenoAbiBoWait {
+    uint64_t handle,timeout_ns,epoch;
 };
 /* NativeAdrenoAbiResourceBudget reports the shared mapping table and this
  * connection's share. connection_target is a fair cache target, not an

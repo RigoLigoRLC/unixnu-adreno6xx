@@ -21,6 +21,7 @@ struct NativeAdrenoA6xxResources {
     uint32_t smmuTbuSidStart[2];
     uint32_t smmuTbuSidCount[2];
     uint32_t smmuGlobalInterrupt; // Raw GIC INTID, including the SPI base of 32.
+    uint32_t gpuInterrupt; // CP CACHE_FLUSH_TS and GPU fault interrupt.
     uint32_t smmuContextInterrupts[10]; // Hardware context-bank order.
     uint32_t chipId,gmemBytes,frequencyHz,highestBankBit;
     uint32_t gpuBank,gpuAsid,gpuSlot,gpuSid,gpuSidMask;
@@ -37,6 +38,8 @@ extern "C" IOReturn native_adreno_smmu_register_irq(uint32_t interrupt,
     void (*callback)(void *), void *context);
 extern "C" IOReturn native_adreno_smmu_enable_irq(uint32_t interrupt);
 extern "C" IOReturn native_adreno_smmu_disable_irq(uint32_t interrupt);
+extern "C" void native_adreno_gpu_interrupt(bool failed);
+extern "C" void native_adreno_dma_stopped(void);
 extern "C" void native_adreno_a6xx_start(void);
 extern "C" void native_adreno_a6xx_dump_stats(void);
 extern "C" IOReturn native_adreno_a6xx_request_start(void);
