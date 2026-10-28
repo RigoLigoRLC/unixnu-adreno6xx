@@ -12,13 +12,13 @@
  * USB exports the fixed arrays after sampling and pending jobs have finished. */
 class NativeAdrenoGpuProfile final {
 public:
-    static IOReturn initialize(const NativeAdrenoRingIo *,bool (*accessible)(void *));
+    static IOReturn initialize(const NativeAdrenoRingIo *, bool (*accessible)(void *));
     static void poll();
     static void fault();
     static bool active();
     static uint32_t beginJob();
-    static void finishJob(uint32_t window,uint32_t fence,uint32_t queue,
-        uint32_t issue,uint32_t cp,uint32_t rb,bool valid);
+    static void finishJob(uint32_t window, uint32_t fence, uint32_t queue,
+        uint32_t issue, uint32_t cp, uint32_t rb, bool valid);
 };
 
 extern "C" uint32_t native_adreno_gpu_profile_start(uint32_t duration_ms);

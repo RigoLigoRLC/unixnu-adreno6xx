@@ -140,11 +140,12 @@ IOReturn NativeAdrenoRing::commit(uint32_t end,uint32_t serial)
     if(cache_.publish(cache_.cookie,ring_,ring_bytes_) || io_.barrier(io_.cookie)) {
         return poison();
     }
-    const uint32_t profileSlot=serial%RingProfileSlots;
-    if(profileWindows_[profileSlot] && profileFences_[profileSlot]==serial) {
-        profileIssueValid_[profileSlot]=
-            io_.read32(io_.cookie,0x980,&profileIssueTicks_[profileSlot])==0;
+    const uint32_t profileSlot = serial % RingProfileSlots;
+    if (profileWindows_[profileSlot] && profileFences_[profileSlot] == serial) {
+        profileIssueValid_[profileSlot] =
+            io_.read32(io_.cookie, 0x980, &profileIssueTicks_[profileSlot]) == 0;
     }
+
     if(generation_==NativeAdrenoA642L) {
         if(!io_.writeWptr || io_.writeWptr(io_.cookie,end)) {
             return poison();
@@ -465,120 +466,151 @@ IOReturn NativeAdrenoRing::submitFramed(const uint32_t *words,size_t word_count,
 {
     return submitWords(words,word_count,fence,true);
 }
-IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,uint32_t *fence,bool framed)
+IOReturn NativeAdrenoRing::submitWords(const uint32_t *words, size_t word_count, uint32_t *fence, bool framed)
 {
-    if(!fence)return kIOReturnBadArgument;*fence=0;
-    if(!attached_ || poisoned_ || bootstrap_pending_)return kIOReturnNotReady;
-    if((word_count && !words) || (!word_count && !framed) ||
-        word_count>SIZE_MAX/sizeof(uint32_t))return kIOReturnBadArgument;
-    const uint32_t size_words=(uint32_t)(ring_bytes_/4),mask=size_words-1;
-    const bool reset=framed && reset_pending_;
-    const uint32_t serial=seqno_+1;
-    const uint32_t profileSlot=serial%RingProfileSlots;
-    const bool profiling=framed && generation_==NativeAdrenoA642L &&
-        fence_bytes_>=RingProfileOffset+RingProfileSlotBytes*RingProfileSlots &&
+    if (!fence) {
+        return kIOReturnBadArgument;
+    }
+
+    *fence = 0;
+    if (!attached_ || poisoned_ || bootstrap_pending_) {
+        return kIOReturnNotReady;
+    }
+    if ((word_count && !words) || (!word_count && !framed) ||
+        word_count > SIZE_MAX / sizeof(uint32_t)) {
+        return kIOReturnBadArgument;
+    }
+
+    const uint32_t size_words = (uint32_t)(ring_bytes_ / 4);
+    const uint32_t mask = size_words - 1;
+    const bool reset = framed && reset_pending_;
+    const uint32_t serial = seqno_ + 1;
+    const uint32_t profileSlot = serial % RingProfileSlots;
+    const bool profiling = framed && generation_ == NativeAdrenoA642L &&
+        fence_bytes_ >= RingProfileOffset + RingProfileSlotBytes * RingProfileSlots &&
         !profileWindows_[profileSlot] && NativeAdrenoGpuProfile::active();
-    const uint32_t frameExtra=generation_==NativeAdrenoA642L?
-        (framed?4+(reset?1:0)+RingFenceWords+8:RingFenceWords):
-        (framed?RingPrologueWords+(reset?RingResetWords:0)+RingFramedFenceWords:RingFenceWords);
-    const uint32_t extra=frameExtra+(profiling?RingProfileWords:0);
-    if(word_count>size_words-extra-8)return kIOReturnBadArgument;
-    uint32_t at=next_;
-    IOReturn status=kIOReturnSuccess;
-    if(generation_==NativeAdrenoA642L) {
-        status=reserveA6xx(uint32_t(word_count)+extra,&at);
-        if(status) {
+    const uint32_t frameExtra = generation_ == NativeAdrenoA642L ?
+        (framed ? 4 + (reset ? 1 : 0) + RingFenceWords + 8 : RingFenceWords) :
+        (framed ? RingPrologueWords + (reset ? RingResetWords : 0) + RingFramedFenceWords : RingFenceWords);
+    const uint32_t extra = frameExtra + (profiling ? RingProfileWords : 0);
+    if (word_count > size_words - extra - 8) {
+        return kIOReturnBadArgument;
+    }
+
+    uint32_t at = next_;
+    IOReturn status = kIOReturnSuccess;
+    if (generation_ == NativeAdrenoA642L) {
+        status = reserveA6xx(uint32_t(word_count) + extra, &at);
+        if (status) {
             return status;
         }
     } else {
-        uint32_t rptr=0;
-        status=readRptr(&rptr);
-        if(status) {
+        uint32_t rptr = 0;
+        status = readRptr(&rptr);
+        if (status) {
             return status;
         }
-        const uint32_t used=(next_-rptr)&mask;
-        if(word_count+extra+8>size_words-used) {
+
+        const uint32_t used = (next_ - rptr) & mask;
+        if (word_count + extra + 8 > size_words - used) {
             return kIOReturnNoResources;
         }
     }
-    if(framed) {
-        status=emitPrologue(at,reset,&at);
-        if(status)return status;
+
+    if (framed) {
+        status = emitPrologue(at, reset, &at);
+        if (status) {
+            return status;
+        }
     }
 
-    const uint32_t profileWindow=profiling?NativeAdrenoGpuProfile::beginJob():0;
-    const uint32_t profileOffset=RingProfileOffset+profileSlot*RingProfileSlotBytes;
-    if(profileWindow) {
-        profileWindows_[profileSlot]=profileWindow;
-        profileFences_[profileSlot]=serial;
-        profileIssueValid_[profileSlot]=false;
-        volatile uint32_t *destination=fence_+profileOffset/4;
-        destination[0]=0;
-        destination[1]=0;
-        destination[2]=0;
-        destination[3]=0;
+    const uint32_t profileWindow = profiling ? NativeAdrenoGpuProfile::beginJob() : 0;
+    const uint32_t profileOffset = RingProfileOffset + profileSlot * RingProfileSlotBytes;
+    if (profileWindow) {
+        profileWindows_[profileSlot] = profileWindow;
+        profileFences_[profileSlot] = serial;
+        profileIssueValid_[profileSlot] = false;
+
+        volatile uint32_t *destination = fence_ + profileOffset / 4;
+        destination[0] = 0;
+        destination[1] = 0;
+        destination[2] = 0;
+        destination[3] = 0;
 
         // REG_TO_MEM reads CP's clock when CP reaches this IB list.
-        uint32_t header=0;
-        AdrenoPM4Type7(0x3e,3,&header);
-        const uint64_t address=fence_iova_+profileOffset;
-        ring_[at]=header;
-        ring_[(at+1)&mask]=0x980u|(2u<<18)|(1u<<30);
-        ring_[(at+2)&mask]=uint32_t(address);
-        ring_[(at+3)&mask]=uint32_t(address>>32);
-        at=(at+4)&mask;
+        uint32_t header = 0;
+        AdrenoPM4Type7(0x3e, 3, &header);
+
+        const uint64_t address = fence_iova_ + profileOffset;
+        ring_[at] = header;
+        ring_[(at + 1) & mask] = 0x980u | (2u << 18) | (1u << 30);
+        ring_[(at + 2) & mask] = uint32_t(address);
+        ring_[(at + 3) & mask] = uint32_t(address >> 32);
+        at = (at + 4) & mask;
     }
 
-    for(size_t i=0;i<word_count;++i)ring_[(at+i)&mask]=words[i];
-    at=(at+(uint32_t)word_count)&mask;
-    if(profileWindow) {
+    for (size_t i = 0; i < word_count; ++i) {
+        ring_[(at + i) & mask] = words[i];
+    }
+    at = (at + (uint32_t)word_count) & mask;
+
+    if (profileWindow) {
         // Turnip's A6xx u_trace uses RB_DONE_TS with bit 30 for the GPU clock.
         // Its low 32 bits complete before the existing CACHE_FLUSH_TS fence.
-        uint32_t header=0;
-        AdrenoPM4Type7(0x46,4,&header);
-        const uint64_t address=fence_iova_+profileOffset+8;
-        ring_[at]=header;
-        ring_[(at+1)&mask]=0x16u|(1u<<30);
-        ring_[(at+2)&mask]=uint32_t(address);
-        ring_[(at+3)&mask]=uint32_t(address>>32);
-        ring_[(at+4)&mask]=0;
-        at=(at+5)&mask;
+        uint32_t header = 0;
+        AdrenoPM4Type7(0x46, 4, &header);
+
+        const uint64_t address = fence_iova_ + profileOffset + 8;
+        ring_[at] = header;
+        ring_[(at + 1) & mask] = 0x16u | (1u << 30);
+        ring_[(at + 2) & mask] = uint32_t(address);
+        ring_[(at + 3) & mask] = uint32_t(address >> 32);
+        ring_[(at + 4) & mask] = 0;
+        at = (at + 5) & mask;
     }
 
-    uint32_t end=0;
-    status=framed?emitFramedFence(at,seqno_+1,&end):emitFence(at,seqno_+1,&end);
-    if(status) {
-        collectGpuProfile(serial,0,false);
+    uint32_t end = 0;
+    status = framed ? emitFramedFence(at, seqno_ + 1, &end) : emitFence(at, seqno_ + 1, &end);
+    if (status) {
+        collectGpuProfile(serial, 0, false);
         return status;
     }
-    if(commit(end,seqno_+1)) {
-        collectGpuProfile(serial,0,false);
+    if (commit(end, seqno_ + 1)) {
+        collectGpuProfile(serial, 0, false);
         return poison();
     }
-    *fence=++seqno_;++submissions_;
-    if(reset)reset_pending_=false;
+
+    *fence = ++seqno_;
+    ++submissions_;
+    if (reset) {
+        reset_pending_ = false;
+    }
+
     return kIOReturnSuccess;
 }
 
-void NativeAdrenoRing::collectGpuProfile(uint32_t fence,uint32_t queue,bool complete)
+void NativeAdrenoRing::collectGpuProfile(uint32_t fence, uint32_t queue, bool complete)
 {
-    const uint32_t slot=fence%RingProfileSlots;
-    const uint32_t capturedWindow=profileWindows_[slot];
-    if(!capturedWindow || profileFences_[slot]!=fence) {
+    const uint32_t slot = fence % RingProfileSlots;
+    const uint32_t capturedWindow = profileWindows_[slot];
+    if (!capturedWindow || profileFences_[slot] != fence) {
         return;
     }
 
-    uint32_t cp=0,rb=0;
-    if(complete) {
+    uint32_t cp = 0;
+    uint32_t rb = 0;
+    if (complete) {
         __asm__ volatile("dsb ld" ::: "memory");
-        const volatile uint32_t *source=fence_+(RingProfileOffset+slot*RingProfileSlotBytes)/4;
-        cp=source[0];
-        rb=source[2];
+
+        const volatile uint32_t *source = fence_ + (RingProfileOffset + slot * RingProfileSlotBytes) / 4;
+        cp = source[0];
+        rb = source[2];
     }
-    NativeAdrenoGpuProfile::finishJob(capturedWindow,fence,queue,profileIssueTicks_[slot],
-        cp,rb,complete && profileIssueValid_[slot] && (cp || rb));
-    profileWindows_[slot]=0;
-    profileFences_[slot]=0;
+
+    NativeAdrenoGpuProfile::finishJob(capturedWindow, fence, queue, profileIssueTicks_[slot],
+        cp, rb, complete && profileIssueValid_[slot] && (cp || rb));
+    profileWindows_[slot] = 0;
+    profileFences_[slot] = 0;
 }
 
 NativeAdrenoRingFence NativeAdrenoRing::observeFence(uint32_t fence,
