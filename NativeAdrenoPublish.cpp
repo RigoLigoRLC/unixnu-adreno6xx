@@ -1259,9 +1259,9 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
             }
         }
         const uint64_t waited=g.clock.now_us(g.clock.cookie)-entered;
-        ++native_adreno_wait_outer[0];
-        native_adreno_wait_outer[1]+=waited;
-        native_adreno_wait_outer[2]+=pauses;
+        native_adreno_wait_outer[0]=native_adreno_wait_outer[0]+1;
+        native_adreno_wait_outer[1]=native_adreno_wait_outer[1]+waited;
+        native_adreno_wait_outer[2]=native_adreno_wait_outer[2]+pauses;
         if(waited>native_adreno_wait_outer[3]) {
             native_adreno_wait_outer[3]=waited;
         }
