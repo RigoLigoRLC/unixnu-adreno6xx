@@ -57,6 +57,10 @@ class NativeAdrenoRing final {
     uint32_t next_=0,rptr_shadow_=0,seqno_=0,completed_=0,submissions_=0;
     bool attached_=false,poisoned_=false,reset_pending_=false;
     bool bootstrap_pending_=false;
+    uint32_t profileWindows_[16]{};
+    uint32_t profileFences_[16]{};
+    uint32_t profileIssueTicks_[16]{};
+    bool profileIssueValid_[16]{};
     NativeAdrenoGeneration generation_=NativeAdrenoA740;
     IOReturn poison();
     IOReturn readRptr(uint32_t *);
@@ -95,6 +99,9 @@ public:
     /* A642L user buffers receive A6xx IB-list markers and CACHE_FLUSH_TS.
      * A740 user buffers receive its BR/BV thread synchronization packets. */
     IOReturn submitFramed(const uint32_t *words,size_t word_count,uint32_t *fence);
+    /* The submission owner calls this after a normal fence observation, or
+     * with complete=false after stopping DMA for a failed job. */
+    void collectGpuProfile(uint32_t fence,uint32_t queue,bool complete);
     /* The next user submission waits for idle on A642L or clears the A740
      * thread counters, timestamps and resource table between thread syncs. */
     void requestContextReset() {reset_pending_=true;}

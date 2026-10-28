@@ -1222,6 +1222,7 @@ IOReturn NativeAdrenoSubmit::retireCompleted()
         }
 
         profileNoteComplete(job.fence);
+        ring_->collectGpuProfile(job.fence,job.queue,true);
         completed[count++] = &job;
     }
     if (!count) {
@@ -1247,6 +1248,7 @@ IOReturn NativeAdrenoSubmit::releaseAfterDmaStopped()
     }
     for(Job &job:jobs_) {
         if(job.active) {
+            ring_->collectGpuProfile(job.fence,job.queue,false);
             const IOReturn status=release(job);
             if(status) {
                 return status;

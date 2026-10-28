@@ -66,6 +66,38 @@ transitions during allocation and release. BO allocation has no WC option.
 Imported Device or unrecognized page attributes are refused at import; RT pages
 are accepted as Normal NC only under the board's managed-RT boot policy.
 
+## Bounded GPU hardware capture
+
+`native_adreno_gpu_profile_start(20000)` starts a 20-second window.
+`native_adreno_gpu_profile_stop()` closes it early. The service reads 29 fixed
+A6xx counters every 20 ms while the window is active, retaining at most 4096
+samples. Each sample contains the GPU always-on clock before and after the
+reads, the raw 64-bit values and a selector-validity mask. Definitions name
+the selected events and their units. Adjacent valid samples supply the event
+increments; the first sample establishes each window's starting values.
+The registers are configured once before SQE starts. During capture the
+service checks GX power and the GMU AHB fence before reading GPU registers.
+
+Each submitted job in the window receives a CP_REG_TO_MEM read of the GPU
+clock before its first IB, followed by a Turnip-style RB_DONE_TS timestamp
+after its final IB. The ordinary CACHE_FLUSH_TS fence follows both writes.
+The submission retirement path copies completed values from the existing
+coherent fence allocation into a second fixed array. The issue clock is read
+immediately before the WPTR write. Queue ticks measure issue to CP arrival;
+RB ticks measure CP arrival to RB completion, including overlap with other
+pipeline work. These values use the common 19.2 MHz clock and its low 32 bits,
+with modular differences below 2^31 ticks. The capture inserts no WFI.
+Inactive capture adds no GPU packets or periodic register reads.
+
+`native_adreno_gpu_profile_dump()` reports status while work remains, then
+exports at most 64 counter samples and 128 jobs per call. Repeated calls
+produce one `kind=begin`, counter definitions, numbered records and one
+`kind=end`. The arrays remain stable during export and logging occurs outside
+the profile lock. Capture retains raw event counts: SP counters aggregate
+activity across shader processors, and ALU/TEX events count instructions for
+their named shader stage. These records do not assign events to individual
+shader programs or sample shader instruction addresses.
+
 ## Frame timing
 
 The existing `gpu` query also requests NativeMobileDisplay's bounded frame
