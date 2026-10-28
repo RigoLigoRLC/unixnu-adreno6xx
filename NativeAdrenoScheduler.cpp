@@ -154,7 +154,7 @@ void NativeAdrenoScheduler::putSync(Sync *object)
 IOReturn NativeAdrenoScheduler::createSync(uint32_t owner,
     const NativeAdrenoAbiSyncCreate &request, uint64_t *handle)
 {
-    if (!handle || request.reserved || (request.flags & ~NativeAdrenoAsyncTimeline) ||
+    if (!handle || request.reserved || (request.flags & ~uint32_t(NativeAdrenoAsyncTimeline)) ||
         (!(request.flags & NativeAdrenoAsyncTimeline) && request.initial_value > 1)) {
         return kIOReturnBadArgument;
     }
@@ -235,7 +235,7 @@ IOReturn NativeAdrenoScheduler::waitSyncs(uint32_t owner,
 {
     if (request.version != NativeAdrenoAsyncVersion || request.epoch != epoch_ ||
         request.reserved || request.count > NativeAdrenoAsyncMaxWaits ||
-        (request.flags & ~(NativeAdrenoAsyncWaitAny | NativeAdrenoAsyncWaitPending))) {
+        (request.flags & ~uint32_t(NativeAdrenoAsyncWaitAny | NativeAdrenoAsyncWaitPending))) {
         return kIOReturnBadArgument;
     }
     if (failure_) {
@@ -697,7 +697,8 @@ void NativeAdrenoScheduler::closeOwner(uint32_t owner)
         heads_[queue]=nullptr;
         tails_[queue]=nullptr;
     }
-    for (Sync &object : syncs_) {
+    for (uint32_t at = 0; at < NativeAdrenoAsyncMaxSyncs; ++at) {
+        Sync &object = syncs_[at];
         if (object.references && object.leased && object.owner == owner) {
             object.leased = false;
             putSync(&object);
