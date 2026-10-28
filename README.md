@@ -68,26 +68,61 @@ are accepted as Normal NC only under the board's managed-RT boot policy.
 
 ## Bounded GPU hardware capture
 
-`native_adreno_gpu_profile_start(20000)` starts a 20-second window.
-`native_adreno_gpu_profile_stop()` closes it early. The service reads 29 fixed
+`native_adreno_gpu_profile_start(20000)` requests a 20-second window.
+The service worker acquires the GMU performance-counter OOB request before
+starting the window or accepting profiled jobs. A642L uses request bit 28 at
+`0x1f994`, acknowledgement bit 30 at `0x1f992`, and acknowledgement clear bit
+30 at `0x1f991`. The worker polls for at most 100 ms at 100 us intervals. A
+failed acknowledgement stops capture before any counter read and enters the
+service's existing hardware fault handling. The request remains held across
+samples and jobs, then release writes bit 29 at `0x1f994` after all registered
+jobs have retired. `native_adreno_gpu_profile_stop()` closes the window early;
+the worker performs its release. Array capacity also closes a window.
+
+The service reads 29 fixed
 A6xx counters every 20 ms while the window is active, retaining at most 4096
-samples. Each sample contains the GPU always-on clock before and after the
-reads, the raw 64-bit values and a selector-validity mask. Definitions name
+samples. Each sample contains the GMU always-on clock before and after the
+reads, the raw 64-bit values and a measurement-validity mask. Definitions name
 the selected events and their units. Adjacent valid samples supply the event
 increments; the first sample establishes each window's starting values.
-The registers are configured once before SQE starts. During capture the
-service checks GX power and the GMU AHB fence before reading GPU registers.
+The selectors are configured once before SQE starts, while the worker holds
+the same OOB request. During capture it reads only the RBBM counter values;
+SP, TP, RB and other unit selectors are not reread. The GX power and AHB fence
+checks reject inaccessible hardware while the acknowledged request remains
+held. This window prevents autonomous GPU power collapse; it retains the
+existing fixed GPU frequency.
+
+USB and submission callbacks only update the recorder's bounded state under
+its lock. That lock is released before GMU handshakes, sampling, hardware
+fault handling or logging. The service worker also owns hardware shutdown.
+On a fault it first disables new capture, synchronizes with the submission
+owner and stops CP before clearing the OOB request. Successful GMU reset
+revokes any remaining request; the normal DMA-stopped path retires pending
+jobs as invalid. Failed hardware shutdown retains pending resources and keeps
+capture disabled.
 
 Each submitted job in the window receives a CP_REG_TO_MEM read of the GPU
 clock before its first IB, followed by a Turnip-style RB_DONE_TS timestamp
 after its final IB. The ordinary CACHE_FLUSH_TS fence follows both writes.
 The submission retirement path copies completed values from the existing
-coherent fence allocation into a second fixed array. The issue clock is read
-immediately before the WPTR write. Queue ticks measure issue to CP arrival;
+coherent fence allocation into a second fixed array. The CPU reads the GMU AO
+clock at `0x1f888/0x1f889` immediately before the WPTR write; GPU packets read
+the CP clock at `0x980`. Queue ticks measure issue to CP arrival;
 RB ticks measure CP arrival to RB completion, including overlap with other
 pipeline work. These values use the common 19.2 MHz clock and its low 32 bits,
 with modular differences below 2^31 ticks. The capture inserts no WFI.
 Inactive capture adds no GPU packets or periodic register reads.
+
+These operations follow the Samsung SM7325 kernel's
+`drivers/gpu/msm/adreno_perfcounter.c:adreno_perfcounter_read_group`,
+`adreno.h:adreno_perfcntr_active_oob_get`, and
+`adreno_a6xx_gmu.c:a6xx_gmu_oob_set/a6xx_gmu_oob_clear`. The A642L device entry
+selects `adreno_a6xx_gmu_gpudev`, whose probe installs `a6xx_gmudev` and this
+OOB implementation. CPU clock selection follows
+`adreno_a6xx.c:a6xx_read_alwayson`. The clock domains are paired in the stock
+`adreno_ringbuffer.c:adreno_get_submit_time` and `_get_alwayson_counter`:
+the former reads GMU AO, the latter emits the GPU CP read, and
+`adreno_dispatch.c` records `end - cmdobj->submit_ticks` on retirement.
 
 `native_adreno_gpu_profile_dump()` reports status while work remains, then
 exports at most 64 counter samples and 128 jobs per call. Repeated calls
@@ -97,6 +132,12 @@ the profile lock. Capture retains raw event counts: SP counters aggregate
 activity across shader processors, and ALU/TEX events count instructions for
 their named shader stage. These records do not assign events to individual
 shader programs or sample shader instruction addresses.
+`kind=access` records acquisition, release and status with the window number,
+ownership and error state. Jobs export independent `queue_valid` and
+`rb_valid` fields; a failed CPU issue-clock read preserves valid GPU CP-to-RB
+measurements. The compatibility `valid` field requires both values to be
+valid. The finite rollover-read attempts establish a coherent counter value;
+they do not time out a stalled Device MMIO transaction.
 
 ## Frame timing
 

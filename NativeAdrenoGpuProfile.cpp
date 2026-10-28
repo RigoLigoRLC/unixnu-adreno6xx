@@ -67,24 +67,33 @@ struct JobSample {
     uint32_t issue = 0;
     uint32_t cp = 0;
     uint32_t rb = 0;
-    uint32_t valid = 0;
+    uint32_t queueValid = 0;
+    uint32_t rbValid = 0;
 };
 
 NativeAdrenoRingIo profileIo{};
-bool (*gpuAccessible)(void *) = nullptr;
+NativeAdrenoGpuProfileAccess profileAccess{};
 IOLock *profileLock = nullptr;
 CounterSample samples[SampleCapacity];
 JobSample jobs[JobCapacity];
 uint32_t initialized = 0;
 uint32_t running = 0;
+uint32_t workerNeeded = 0;
 uint32_t window = 0;
 uint32_t sampleCount = 0;
 uint32_t jobCount = 0;
 uint32_t pendingJobs = 0;
 uint32_t sampleDropped = 0;
 uint32_t jobDropped = 0;
+uint32_t requestedDurationMs = 0;
+uint32_t accessError = 0;
 uint64_t deadlineUs = 0;
 uint64_t nextSampleUs = 0;
+bool requested = false;
+bool acquiring = false;
+bool releasing = false;
+bool hardwareOwned = false;
+bool stopRequested = false;
 bool sampling = false;
 bool dumping = false;
 bool dumpBegun = false;
@@ -120,11 +129,67 @@ bool read64(uint32_t reg, uint64_t *value)
 
     return false;
 }
+
+IOReturn configureCounters()
+{
+    // CP is stopped; only the listed counters receive the zero load value.
+    if (!profileAccess.accessible(profileIo.cookie) ||
+        profileIo.write32(profileIo.cookie, 0x505, 0) ||
+        profileIo.write32(profileIo.cookie, 0x506, 0)) {
+        return kIOReturnIOError;
+    }
+    for (const Counter &counter : counters) {
+        if (profileIo.write32(profileIo.cookie, 0x501 + counter.loadBit / 32,
+                1u << (counter.loadBit % 32)) ||
+            profileIo.write32(profileIo.cookie, counter.selector, counter.event)) {
+            return kIOReturnIOError;
+        }
+    }
+    if (profileIo.write32(profileIo.cookie, 0x500, 1) || profileIo.barrier(profileIo.cookie)) {
+        return kIOReturnIOError;
+    }
+
+    return kIOReturnSuccess;
 }
 
-IOReturn NativeAdrenoGpuProfile::initialize(const NativeAdrenoRingIo *io, bool (*accessible)(void *))
+IOReturn releaseFinishedWindow()
 {
-    if (!io || !io->read32 || !io->write32 || !io->barrier || !accessible || initialized) {
+    IOLockLock(profileLock);
+    const uint32_t capturedWindow = window;
+    const bool release = hardwareOwned && !__atomic_load_n(&running, __ATOMIC_ACQUIRE) &&
+        !sampling && !pendingJobs;
+    releasing = release;
+    if (!hardwareOwned && !requested && !acquiring) {
+        __atomic_store_n(&workerNeeded, 0, __ATOMIC_RELEASE);
+    }
+    IOLockUnlock(profileLock);
+    if (!release) {
+        return kIOReturnSuccess;
+    }
+
+    const IOReturn status = profileAccess.release(profileIo.cookie);
+    IOLockLock(profileLock);
+    releasing = false;
+    if (!status) {
+        hardwareOwned = false;
+        __atomic_store_n(&workerNeeded, 0, __ATOMIC_RELEASE);
+    } else {
+        accessError = uint32_t(status);
+    }
+    IOLockUnlock(profileLock);
+
+    IOLog("NativeAdrenoGpuProfile: kind=access window=%u phase=release status=%08x owned=%u\n",
+        capturedWindow, uint32_t(status), status ? 1u : 0u);
+
+    return status;
+}
+}
+
+IOReturn NativeAdrenoGpuProfile::initialize(const NativeAdrenoRingIo *io,
+    const NativeAdrenoGpuProfileAccess &access)
+{
+    if (!io || !io->read32 || !io->write32 || !io->barrier || !io->readAlwaysOn ||
+        !access.acquire || !access.release || !access.accessible || initialized) {
         return kIOReturnBadArgument;
     }
 
@@ -133,20 +198,23 @@ IOReturn NativeAdrenoGpuProfile::initialize(const NativeAdrenoRingIo *io, bool (
         return kIOReturnNoMemory;
     }
     profileIo = *io;
-    gpuAccessible = accessible;
+    profileAccess = access;
 
-    // CP is stopped; only the listed counters receive the zero load value.
-    if (io->write32(io->cookie, 0x505, 0) || io->write32(io->cookie, 0x506, 0)) {
-        return kIOReturnIOError;
+    IOReturn status = profileAccess.acquire(profileIo.cookie);
+    if (status) {
+        IOLog("NativeAdrenoGpuProfile: kind=error phase=initialize_acquire status=%08x\n",
+            uint32_t(status));
+        return status;
     }
-    for (const Counter &counter : counters) {
-        if (io->write32(io->cookie, 0x501 + counter.loadBit / 32, 1u << (counter.loadBit % 32)) ||
-            io->write32(io->cookie, counter.selector, counter.event)) {
-            return kIOReturnIOError;
-        }
+    status = configureCounters();
+    const IOReturn releaseStatus = profileAccess.release(profileIo.cookie);
+    if (!status) {
+        status = releaseStatus;
     }
-    if (io->write32(io->cookie, 0x500, 1) || io->barrier(io->cookie)) {
-        return kIOReturnIOError;
+    if (status) {
+        IOLog("NativeAdrenoGpuProfile: kind=error phase=initialize_configure status=%08x\n",
+            uint32_t(status));
+        return status;
     }
 
     __atomic_store_n(&initialized, 1, __ATOMIC_RELEASE);
@@ -156,38 +224,83 @@ IOReturn NativeAdrenoGpuProfile::initialize(const NativeAdrenoRingIo *io, bool (
     return kIOReturnSuccess;
 }
 
-void NativeAdrenoGpuProfile::poll()
+IOReturn NativeAdrenoGpuProfile::poll()
 {
-    if (!__atomic_load_n(&running, __ATOMIC_ACQUIRE)) {
-        return;
+    if (!__atomic_load_n(&workerNeeded, __ATOMIC_ACQUIRE)) {
+        return kIOReturnSuccess;
+    }
+
+    IOLockLock(profileLock);
+    const uint32_t capturedWindow = window;
+    const bool acquire = requested;
+    if (acquire) {
+        requested = false;
+        acquiring = true;
+    }
+    IOLockUnlock(profileLock);
+
+    // Only the service worker changes GMU ownership; no recorder lock spans MMIO.
+    if (acquire) {
+        const IOReturn status = profileAccess.acquire(profileIo.cookie);
+        const uint64_t started = nowUs();
+        IOLockLock(profileLock);
+        acquiring = false;
+        hardwareOwned = status == kIOReturnSuccess;
+        accessError = uint32_t(status);
+        if (!status && !stopRequested) {
+            nextSampleUs = started;
+            deadlineUs = started + uint64_t(requestedDurationMs) * 1000;
+            __atomic_store_n(&running, 1, __ATOMIC_RELEASE);
+        }
+        if (status) {
+            __atomic_store_n(&initialized, 0, __ATOMIC_RELEASE);
+            __atomic_store_n(&workerNeeded, 0, __ATOMIC_RELEASE);
+        }
+        IOLockUnlock(profileLock);
+
+        IOLog("NativeAdrenoGpuProfile: kind=access window=%u phase=acquire status=%08x owned=%u\n",
+            capturedWindow, uint32_t(status), status ? 0u : 1u);
+        if (status) {
+            return status;
+        }
     }
 
     const uint64_t current = nowUs();
     IOLockLock(profileLock);
-    if (!__atomic_load_n(&running, __ATOMIC_ACQUIRE) || current < nextSampleUs || sampling) {
-        IOLockUnlock(profileLock);
-        return;
+    if (__atomic_load_n(&running, __ATOMIC_ACQUIRE) && current >= deadlineUs) {
+        __atomic_store_n(&running, 0, __ATOMIC_RELEASE);
+    }
+    const bool takeSample = __atomic_load_n(&running, __ATOMIC_ACQUIRE) && hardwareOwned &&
+        current >= nextSampleUs && !sampling;
+    if (takeSample) {
+        sampling = true;
+        nextSampleUs = current + SampleIntervalUs;
+    }
+    IOLockUnlock(profileLock);
+    if (!takeSample) {
+        return releaseFinishedWindow();
     }
 
-    sampling = true;
-    const uint32_t capturedWindow = window;
-    nextSampleUs = current + SampleIntervalUs;
-    IOLockUnlock(profileLock);
-
     CounterSample sample{};
-    if (gpuAccessible(profileIo.cookie)) {
-        const bool began = read64(0x980, &sample.begin);
+    IOReturn sampleStatus = kIOReturnSuccess;
+    if (!profileAccess.accessible(profileIo.cookie) ||
+        profileIo.readAlwaysOn(profileIo.cookie, &sample.begin)) {
+        sampleStatus = kIOReturnNotReady;
+    } else {
+        // The stock read path reads RBBM values, without rereading unit selectors.
         for (unsigned index = 0; index < CounterCount; ++index) {
             const Counter &counter = counters[index];
-            uint32_t selected = 0;
-            if (!profileIo.read32(profileIo.cookie, counter.selector, &selected) &&
-                selected == counter.event && read64(counter.low, &sample.values[index])) {
-                sample.validMask |= 1u << index;
+            if (!read64(counter.low, &sample.values[index])) {
+                sampleStatus = kIOReturnIOError;
+                break;
             }
+
+            sample.validMask |= 1u << index;
         }
 
-        if (!began || !read64(0x980, &sample.end)) {
+        if (profileIo.readAlwaysOn(profileIo.cookie, &sample.end)) {
             sample.validMask = 0;
+            sampleStatus = kIOReturnIOError;
         }
     }
 
@@ -197,14 +310,23 @@ void NativeAdrenoGpuProfile::poll()
             samples[sampleCount++] = sample;
         } else {
             ++sampleDropped;
+            __atomic_store_n(&running, 0, __ATOMIC_RELEASE);
         }
-
-        if (current >= deadlineUs) {
+        if (sampleStatus) {
+            accessError = uint32_t(sampleStatus);
             __atomic_store_n(&running, 0, __ATOMIC_RELEASE);
         }
     }
     sampling = false;
     IOLockUnlock(profileLock);
+
+    if (sampleStatus) {
+        IOLog("NativeAdrenoGpuProfile: kind=error window=%u phase=sample status=%08x\n",
+            capturedWindow, uint32_t(sampleStatus));
+        return sampleStatus;
+    }
+
+    return releaseFinishedWindow();
 }
 
 void NativeAdrenoGpuProfile::fault()
@@ -215,9 +337,34 @@ void NativeAdrenoGpuProfile::fault()
 
     __atomic_store_n(&running, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&initialized, 0, __ATOMIC_RELEASE);
+    requested = false;
+    stopRequested = true;
+    if (!accessError) {
+        accessError = uint32_t(kIOReturnIOError);
+    }
 
     if (profileLock) {
         IOLockUnlock(profileLock);
+    }
+}
+
+void NativeAdrenoGpuProfile::hardwareStopped()
+{
+    if (!profileLock) {
+        return;
+    }
+
+    IOLockLock(profileLock);
+    const uint32_t capturedWindow = window;
+    hardwareOwned = false;
+    acquiring = false;
+    releasing = false;
+    __atomic_store_n(&workerNeeded, 0, __ATOMIC_RELEASE);
+    IOLockUnlock(profileLock);
+
+    if (capturedWindow) {
+        IOLog("NativeAdrenoGpuProfile: kind=access window=%u phase=hardware_stopped owned=0\n",
+            capturedWindow);
     }
 }
 
@@ -234,9 +381,13 @@ uint32_t NativeAdrenoGpuProfile::beginJob()
 
     IOLockLock(profileLock);
     uint32_t capturedWindow = 0;
-    if (__atomic_load_n(&running, __ATOMIC_ACQUIRE)) {
+    if (__atomic_load_n(&running, __ATOMIC_ACQUIRE) && hardwareOwned &&
+        jobCount + pendingJobs < JobCapacity) {
         capturedWindow = window;
         ++pendingJobs;
+    } else if (__atomic_load_n(&running, __ATOMIC_ACQUIRE)) {
+        ++jobDropped;
+        __atomic_store_n(&running, 0, __ATOMIC_RELEASE);
     }
     IOLockUnlock(profileLock);
 
@@ -244,7 +395,7 @@ uint32_t NativeAdrenoGpuProfile::beginJob()
 }
 
 void NativeAdrenoGpuProfile::finishJob(uint32_t capturedWindow, uint32_t fence, uint32_t queue,
-    uint32_t issue, uint32_t cp, uint32_t rb, bool valid)
+    uint32_t issue, uint32_t cp, uint32_t rb, bool valid, bool issueValid)
 {
     if (!capturedWindow) {
         return;
@@ -252,12 +403,15 @@ void NativeAdrenoGpuProfile::finishJob(uint32_t capturedWindow, uint32_t fence, 
 
     const uint32_t queueTicks = cp - issue;
     const uint32_t rbTicks = rb - cp;
-    valid = valid && queueTicks < 0x80000000u && rbTicks < 0x80000000u;
+    // Stock adreno_dispatch subtracts GMU AO submit_ticks from CP retired ticks.
+    const bool rbValid = valid && rbTicks < 0x80000000u;
+    const bool queueValid = rbValid && issueValid && queueTicks < 0x80000000u;
 
     IOLockLock(profileLock);
     if (capturedWindow == window) {
         if (jobCount < JobCapacity) {
-            jobs[jobCount++] = {fence, queue, issue, cp, rb, valid ? 1u : 0u};
+            jobs[jobCount++] = {fence, queue, issue, cp, rb,
+                queueValid ? 1u : 0u, rbValid ? 1u : 0u};
         } else {
             ++jobDropped;
         }
@@ -283,7 +437,8 @@ extern "C" uint32_t native_adreno_gpu_profile_start(uint32_t duration_ms)
         IOLockUnlock(profileLock);
         return uint32_t(kIOReturnNotReady);
     }
-    if (__atomic_load_n(&running, __ATOMIC_ACQUIRE) || sampling || dumping || pendingJobs ||
+    if (__atomic_load_n(&workerNeeded, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&running, __ATOMIC_ACQUIRE) || sampling || dumping || pendingJobs ||
         (dumpBegun && (dumpSampleAt < sampleCount || dumpJobAt < jobCount))) {
         IOLockUnlock(profileLock);
         return uint32_t(kIOReturnBusy);
@@ -301,10 +456,12 @@ extern "C" uint32_t native_adreno_gpu_profile_start(uint32_t duration_ms)
     dumpBegun = false;
     dumpSampleAt = 0;
     dumpJobAt = 0;
-    nextSampleUs = nowUs();
-    deadlineUs = nextSampleUs + uint64_t(duration_ms) * 1000;
+    accessError = 0;
+    stopRequested = false;
+    requestedDurationMs = duration_ms;
+    requested = true;
     const uint32_t capturedWindow = window;
-    __atomic_store_n(&running, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&workerNeeded, 1, __ATOMIC_RELEASE);
     IOLockUnlock(profileLock);
 
     IOLog("NativeAdrenoGpuProfile: kind=start window=%u duration_ms=%u interval_us=20000\n",
@@ -320,6 +477,8 @@ extern "C" void native_adreno_gpu_profile_stop(void)
     }
 
     __atomic_store_n(&running, 0, __ATOMIC_RELEASE);
+    requested = false;
+    stopRequested = true;
 
     if (profileLock) {
         IOLockUnlock(profileLock);
@@ -339,12 +498,18 @@ extern "C" void native_adreno_gpu_profile_dump(void)
     const uint32_t capturedJobs = jobCount;
     const uint32_t pending = pendingJobs;
     const uint32_t active = __atomic_load_n(&running, __ATOMIC_ACQUIRE);
+    const bool requestPending = requested;
+    const bool requestAcquiring = acquiring;
+    const bool requestReleasing = releasing;
+    const bool owned = hardwareOwned;
+    const uint32_t error = accessError;
     const uint32_t droppedSamples = sampleDropped;
     const uint32_t droppedJobs = jobDropped;
     const uint32_t firstSample = dumpSampleAt;
     const uint32_t firstJob = dumpJobAt;
     const bool begin = !dumpBegun;
-    const bool complete = window && !active && !sampling && !pending && !dumping;
+    const bool complete = window && !active && !sampling && !pending && !dumping &&
+        !requested && !acquiring && !releasing && !hardwareOwned;
     if (complete) {
         dumping = true;
         dumpBegun = true;
@@ -352,8 +517,12 @@ extern "C" void native_adreno_gpu_profile_dump(void)
     IOLockUnlock(profileLock);
 
     IOLog("NativeAdrenoGpuProfile: kind=status window=%u running=%u complete=%u samples=%u jobs=%u pending_jobs=%u sample_dropped=%u job_dropped=%u\n",
-        capturedWindow, active, complete ? 1u : 0u, capturedSamples, capturedJobs,
+        capturedWindow, active || requestPending || requestAcquiring ? 1u : 0u,
+        complete ? 1u : 0u, capturedSamples, capturedJobs,
         pending, droppedSamples, droppedJobs);
+    IOLog("NativeAdrenoGpuProfile: kind=access window=%u phase=status requested=%u acquiring=%u releasing=%u owned=%u error=%08x\n",
+        capturedWindow, requestPending ? 1u : 0u, requestAcquiring ? 1u : 0u,
+        requestReleasing ? 1u : 0u, owned ? 1u : 0u, error);
     if (!complete) {
         return;
     }
@@ -392,9 +561,10 @@ extern "C" void native_adreno_gpu_profile_dump(void)
 
     for (unsigned index = firstJob; index < untilJob; ++index) {
         const JobSample &job = jobs[index];
-        IOLog("NativeAdrenoGpuProfile: kind=job window=%u seq=%u fence=%u queue=%u issue=%u cp=%u rb=%u queue_ticks=%u rb_ticks=%u valid=%u\n",
+        IOLog("NativeAdrenoGpuProfile: kind=job window=%u seq=%u fence=%u queue=%u issue=%u cp=%u rb=%u queue_ticks=%u rb_ticks=%u valid=%u queue_valid=%u rb_valid=%u\n",
             capturedWindow, index + 1, job.fence, job.queue, job.issue, job.cp, job.rb,
-            job.cp - job.issue, job.rb - job.cp, job.valid);
+            job.queueValid ? job.cp - job.issue : 0, job.rbValid ? job.rb - job.cp : 0,
+            job.queueValid && job.rbValid ? 1u : 0u, job.queueValid, job.rbValid);
     }
 
     if (untilSample == capturedSamples && untilJob == capturedJobs) {

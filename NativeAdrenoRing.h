@@ -28,6 +28,8 @@ struct NativeAdrenoRingIo {
     int (*writeWptr)(void *,uint32_t value);
     /* The GMU AO status uses bit 23 for GPU busy excluding AHB accesses. */
     int (*readGpuBusy)(void *,uint32_t *status);
+    /* CPU timestamp reads use the GMU AO registers on GMU-equipped GPUs. */
+    int (*readAlwaysOn)(void *, uint64_t *ticks);
 };
 struct NativeAdrenoRingCache {
     void *cookie;

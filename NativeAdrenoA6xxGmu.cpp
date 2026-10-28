@@ -736,6 +736,69 @@ IOReturn NativeAdrenoA6xxGmu::keepAlive(bool enabled)
     return result;
 }
 
+IOReturn NativeAdrenoA6xxGmu::acquirePerformanceCounters()
+{
+    if (report_.status) {
+        return report_.status;
+    }
+    if (!running_) {
+        return kIOReturnNotReady;
+    }
+    if (performanceCountersRequested_) {
+        return kIOReturnBusy;
+    }
+
+    // A642L uses a6xx_gmu_oob_set's newer-target bits for oob_perfcntr = 1.
+    constexpr uint32_t request = 1u << 28;
+    constexpr uint32_t acknowledge = 1u << 30;
+    performanceCountersRequested_ = true;
+    IOReturn result = gmuWrite(0x1f994, request);
+    if (!result) {
+        result = kIOReturnTimeout;
+        for (unsigned attempt = 0; attempt < 1000; ++attempt) {
+            uint32_t value = 0;
+            const IOReturn readStatus = read(NativeAdrenoA6xxGmuRegisters,
+                gmuOffset(0x1f992), &value);
+            if (readStatus) {
+                result = readStatus;
+                break;
+            }
+            if (value & acknowledge) {
+                result = kIOReturnSuccess;
+                break;
+            }
+
+            config_.io.delayUs(config_.io.cookie, 100);
+        }
+    }
+
+    const IOReturn clearStatus = gmuWrite(0x1f991, acknowledge);
+    if (!result) {
+        result = clearStatus;
+    }
+    if (result) {
+        releasePerformanceCounters();
+        report_.status = result;
+    }
+
+    return result;
+}
+
+IOReturn NativeAdrenoA6xxGmu::releasePerformanceCounters()
+{
+    if (!performanceCountersRequested_) {
+        return kIOReturnSuccess;
+    }
+
+    // The newer-target oob_perfcntr clear request has no firmware ACK poll.
+    const IOReturn result = gmuWrite(0x1f994, 1u << 29);
+    if (!result) {
+        performanceCountersRequested_ = false;
+    }
+
+    return result;
+}
+
 IOReturn NativeAdrenoA6xxGmu::poll()
 {
     if (report_.status) {
@@ -798,6 +861,7 @@ IOReturn NativeAdrenoA6xxGmu::stop()
     }
 
     running_ = false;
+    performanceCountersRequested_ = false;
     report_.status = kIOReturnSuccess;
     return complete(kIOReturnSuccess);
 }

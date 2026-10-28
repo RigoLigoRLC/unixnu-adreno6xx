@@ -84,6 +84,9 @@ class A642LState final {
     static int gpuWrite(void *,uint32_t,uint32_t);
     static int writeWptr(void *,uint32_t);
     static int readGpuBusy(void *,uint32_t *);
+    static int readAlwaysOn(void *, uint64_t *);
+    static IOReturn acquireProfileAccess(void *);
+    static IOReturn releaseProfileAccess(void *);
     static bool profileAccessible(void *);
     static int barrier(void *);
     static int publishRing(void *,const volatile uint32_t *,size_t);
@@ -226,6 +229,41 @@ bool A642LState::profileAccessible(void *cookie)
     return !read(cookie,NativeAdrenoA6xxGmuRegisters,0x1f8d0*4-0x6a000,&gx) &&
         !read(cookie,NativeAdrenoA6xxGmuRegisters,0x23b10*4-0x6a000,&fence) &&
         !(gx&0xc0) && !fence;
+}
+
+int A642LState::readAlwaysOn(void *cookie, uint64_t *ticks)
+{
+    if (!ticks) {
+        return 1;
+    }
+
+    // Samsung a6xx_read_alwayson uses GMU AO for CPU AHB reads on this target.
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        uint32_t before = 0;
+        uint32_t low = 0;
+        uint32_t after = 0;
+        if (read(cookie, NativeAdrenoA6xxGmuRegisters, 0x1f889 * 4 - 0x6a000, &before) ||
+            read(cookie, NativeAdrenoA6xxGmuRegisters, 0x1f888 * 4 - 0x6a000, &low) ||
+            read(cookie, NativeAdrenoA6xxGmuRegisters, 0x1f889 * 4 - 0x6a000, &after)) {
+            return 1;
+        }
+        if (before == after) {
+            *ticks = (uint64_t(after) << 32) | low;
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+IOReturn A642LState::acquireProfileAccess(void *cookie)
+{
+    return static_cast<A642LState *>(cookie)->gmu_.acquirePerformanceCounters();
+}
+
+IOReturn A642LState::releaseProfileAccess(void *cookie)
+{
+    return static_cast<A642LState *>(cookie)->gmu_.releasePerformanceCounters();
 }
 
 int A642LState::barrier(void *)
@@ -598,7 +636,7 @@ IOReturn A642LState::contexts()
 
 IOReturn A642LState::startCp()
 {
-    ringIo_={this,gpuWrite,gpuRead,barrier,writeWptr,readGpuBusy};
+    ringIo_={this,gpuWrite,gpuRead,barrier,writeWptr,readGpuBusy,readAlwaysOn};
     IOLog("NativeAdrenoCp: checking GMU keepalive and full AHB fence before GX registers\n");
     IOReturn status=gmu_.keepAlive(true);
     if(status) {
@@ -624,7 +662,10 @@ IOReturn A642LState::startCp()
         return status;
     }
 
-    status=NativeAdrenoGpuProfile::initialize(&ringIo_,profileAccessible);
+    const NativeAdrenoGpuProfileAccess profileAccess{
+        acquireProfileAccess, releaseProfileAccess, profileAccessible
+    };
+    status=NativeAdrenoGpuProfile::initialize(&ringIo_,profileAccess);
     if(status) {
         return status;
     }
@@ -851,6 +892,7 @@ IOReturn A642LState::startCp()
 
 IOReturn A642LState::fail(IOReturn status)
 {
+    NativeAdrenoGpuProfile::fault();
     if(hardwareIrqEnabled_) {
         native_adreno_smmu_disable_irq(resources_.gpuInterrupt);
         hardwareIrqEnabled_=false;
@@ -867,7 +909,17 @@ IOReturn A642LState::fail(IOReturn status)
     if(cpTouched_) {
         stopped=NativeAdrenoA6xxHwInit::stop(&ringIo_,1000)==kIOReturnSuccess;
     }
+    if (stopped) {
+        const IOReturn releaseStatus = gmu_.releasePerformanceCounters();
+        if (releaseStatus) {
+            IOLog("NativeAdrenoGpuProfile: kind=error phase=fault_release status=%08x\n",
+                uint32_t(releaseStatus));
+        }
+    }
     const IOReturn gmuStopped=gmu_.stop();
+    if (!gmuStopped) {
+        NativeAdrenoGpuProfile::hardwareStopped();
+    }
     native_adreno_a6xx_stats[20]=stopped;
     native_adreno_a6xx_stats[21]=uint32_t(gmuStopped);
     if(stopped && !gmuStopped) {
@@ -965,7 +1017,6 @@ void A642LState::poll()
         gmuStatus=gmu_.poll();
     }
     if(gmuStatus) {
-        NativeAdrenoGpuProfile::fault();
         ready_=false;
         native_adreno_a6xx_stats[0]=8;
         fail(gmuStatus);
@@ -983,14 +1034,18 @@ void A642LState::poll()
     }
     const bool timeout=submitted!=completed && current-watchedSince_>500000;
     if(status || progress || timeout) {
-        NativeAdrenoGpuProfile::fault();
         ready_=false;
         native_adreno_a6xx_stats[0]=8;
         fail(status?status:(timeout?kIOReturnTimeout:kIOReturnIOError));
         return;
     }
 
-    NativeAdrenoGpuProfile::poll();
+    const IOReturn profileStatus = NativeAdrenoGpuProfile::poll();
+    if (profileStatus) {
+        ready_ = false;
+        native_adreno_a6xx_stats[0] = 8;
+        fail(profileStatus);
+    }
 }
 
 void A642LState::dump() const

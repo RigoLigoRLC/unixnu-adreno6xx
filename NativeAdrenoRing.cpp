@@ -142,8 +142,10 @@ IOReturn NativeAdrenoRing::commit(uint32_t end,uint32_t serial)
     }
     const uint32_t profileSlot = serial % RingProfileSlots;
     if (profileWindows_[profileSlot] && profileFences_[profileSlot] == serial) {
-        profileIssueValid_[profileSlot] =
-            io_.read32(io_.cookie, 0x980, &profileIssueTicks_[profileSlot]) == 0;
+        uint64_t ticks = 0;
+        profileIssueValid_[profileSlot] = io_.readAlwaysOn &&
+            io_.readAlwaysOn(io_.cookie, &ticks) == 0;
+        profileIssueTicks_[profileSlot] = uint32_t(ticks);
     }
 
     if(generation_==NativeAdrenoA642L) {
@@ -608,7 +610,7 @@ void NativeAdrenoRing::collectGpuProfile(uint32_t fence, uint32_t queue, bool co
     }
 
     NativeAdrenoGpuProfile::finishJob(capturedWindow, fence, queue, profileIssueTicks_[slot],
-        cp, rb, complete && profileIssueValid_[slot] && (cp || rb));
+        cp, rb, complete && (cp || rb), profileIssueValid_[slot]);
     profileWindows_[slot] = 0;
     profileFences_[slot] = 0;
 }

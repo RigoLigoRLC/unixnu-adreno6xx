@@ -34,6 +34,7 @@ class NativeAdrenoA6xxGmu final {
     uint32_t sequence_ = 0;
     bool attempted_ = false;
     bool running_ = false;
+    bool performanceCountersRequested_ = false;
 
     IOReturn read(uint32_t, uint32_t, uint32_t *);
     IOReturn write(uint32_t, uint32_t, uint32_t);
@@ -59,6 +60,9 @@ public:
 
     IOReturn start(const NativeAdrenoA6xxGmuConfig &);
     IOReturn keepAlive(bool);
+    /* The service worker owns the request from acknowledgement through release. */
+    IOReturn acquirePerformanceCounters();
+    IOReturn releasePerformanceCounters();
     IOReturn poll();
     IOReturn stop();
     bool running() const { return running_; }
