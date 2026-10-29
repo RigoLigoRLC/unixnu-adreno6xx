@@ -20,6 +20,7 @@
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOBSD.h>
 #include <string.h>
+#include <sys/proc.h>
 #include <kern/thread.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
