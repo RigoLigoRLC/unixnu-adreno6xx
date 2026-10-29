@@ -290,7 +290,10 @@ enum {
     NativeAdrenoTraceArgDestinationFormat = 30,
     NativeAdrenoTraceArgBytes = 31,
     NativeAdrenoTraceArgReservedBytesHighWater = 32,
-    NativeAdrenoTraceArgBudgetBytes = 33
+    NativeAdrenoTraceArgBudgetBytes = 33,
+    NativeAdrenoTraceArgSourceBuffer = 34,
+    NativeAdrenoTraceArgDestinationImage = 35,
+    NativeAdrenoTraceArgCopyOperation = 36
 };
 
 #endif
