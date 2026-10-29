@@ -100,6 +100,11 @@ uint32_t producerDropped = 0;
 uint32_t producerCount = 0;
 uint32_t producerFailed = 0;
 bool traceSealed = false;
+bool traceStreaming = false;
+uint64_t traceFirstSequence = 0;
+uint64_t traceWriteSequence = 0;
+uint64_t traceAckSequence = 0;
+uint64_t traceReadSequence = 0;
 uint32_t initialized = 0;
 uint32_t running = 0;
 uint32_t workerNeeded = 0;
@@ -180,6 +185,8 @@ void fillTraceStatus(NativeAdrenoTraceStatus &status)
     status.definition_bytes = sizeof(NativeAdrenoTraceCounterDefinition);
     status.producer_count = producerCount;
     status.producer_failed = producerFailed;
+    status.streaming = traceStreaming;
+    status.retained_events = traceStreaming ? uint32_t(traceWriteSequence - traceFirstSequence) : traceEventCount;
 }
 
 void addDropped(uint32_t &total, uint32_t count)
@@ -520,7 +527,7 @@ void NativeAdrenoGpuProfile::finishJob(uint32_t capturedWindow, uint32_t fence, 
     IOLockUnlock(profileLock);
 }
 
-extern "C" uint32_t native_adreno_gpu_profile_start(uint32_t duration_ms)
+static uint32_t startTraceCapture(uint32_t duration_ms, bool streaming)
 {
     if (duration_ms < 100 || duration_ms > 60000) {
         return uint32_t(kIOReturnBadArgument);
@@ -552,6 +559,11 @@ extern "C" uint32_t native_adreno_gpu_profile_start(uint32_t duration_ms)
     jobDropped = 0;
     traceEventCount = 0;
     traceEventDropped = 0;
+    traceStreaming = streaming;
+    traceFirstSequence = 0;
+    traceWriteSequence = 0;
+    traceAckSequence = 0;
+    traceReadSequence = 0;
     producerDropped = 0;
     producerFailed = 0;
     startedNs = 0;
@@ -572,6 +584,11 @@ extern "C" uint32_t native_adreno_gpu_profile_start(uint32_t duration_ms)
         capturedWindow, duration_ms);
 
     return uint32_t(kIOReturnSuccess);
+}
+
+extern "C" uint32_t native_adreno_gpu_profile_start(uint32_t duration_ms)
+{
+    return startTraceCapture(duration_ms, false);
 }
 
 extern "C" void native_adreno_gpu_profile_stop(void)
@@ -706,12 +723,14 @@ IOReturn NativeAdrenoGpuProfile::controlTrace(const NativeAdrenoTraceControl *re
         return kIOReturnBadArgument;
     }
 
-    if (request->operation == NativeAdrenoTraceStart) {
+    if (request->operation == NativeAdrenoTraceStart ||
+        request->operation == NativeAdrenoTraceStartStream) {
         if (request->generation) {
             return kIOReturnBadArgument;
         }
 
-        const IOReturn result = native_adreno_gpu_profile_start(request->duration_ms);
+        const IOReturn result = startTraceCapture(request->duration_ms,
+            request->operation == NativeAdrenoTraceStartStream);
         queryTrace(status);
 
         return result;
@@ -823,12 +842,22 @@ IOReturn NativeAdrenoGpuProfile::appendTrace(uint64_t owner, uint32_t process,
 
     addDropped(producerDropped, batch->dropped);
     for (uint32_t index = 0; index < batch->count; ++index) {
-        if (traceEventCount == NativeAdrenoTraceEventCapacity) {
+        if (!traceStreaming && traceEventCount == NativeAdrenoTraceEventCapacity) {
             addDropped(traceEventDropped, batch->count - index);
             break;
         }
 
-        NativeAdrenoTraceEvent &destination = traceEvents[traceEventCount++];
+        uint32_t destinationIndex = traceEventCount;
+        if (traceStreaming) {
+            if (traceWriteSequence - traceFirstSequence == NativeAdrenoTraceEventCapacity) {
+                ++traceFirstSequence;
+                addDropped(traceEventDropped, 1);
+            }
+            destinationIndex = uint32_t(traceWriteSequence % NativeAdrenoTraceEventCapacity);
+            ++traceWriteSequence;
+        }
+        addDropped(traceEventCount, 1);
+        NativeAdrenoTraceEvent &destination = traceEvents[destinationIndex];
         destination = batch->events[index];
         destination.process_id = process;
         destination.name[sizeof(destination.name) - 1] = 0;
@@ -887,6 +916,85 @@ void NativeAdrenoGpuProfile::closeProducers(uint64_t owner)
     IOLockUnlock(profileLock);
 }
 
+IOReturn NativeAdrenoGpuProfile::readTraceStream(const NativeAdrenoTraceStreamRead *request,
+    NativeAdrenoTraceStreamChunk *reply)
+{
+    if (!request || !reply || !profileLock || request->version != NativeAdrenoTraceVersion) {
+        return kIOReturnBadArgument;
+    }
+
+    IOLockLock(profileLock);
+    if (!traceStreaming || request->generation != window) {
+        IOLockUnlock(profileLock);
+
+        return kIOReturnNotReady;
+    }
+    if (request->next_sequence > traceWriteSequence) {
+        IOLockUnlock(profileLock);
+
+        return kIOReturnBadArgument;
+    }
+
+    *reply = {};
+    reply->version = NativeAdrenoTraceVersion;
+    reply->generation = window;
+    reply->flags = (traceSealed ? NativeAdrenoTraceStreamSealed : 0) |
+        (hardwareComplete() ? NativeAdrenoTraceStreamHardwareComplete : 0) |
+        (!producerCount ? NativeAdrenoTraceStreamProducersEnded : 0);
+    reply->first_sequence = request->next_sequence < traceFirstSequence ?
+        traceFirstSequence : request->next_sequence;
+    reply->write_sequence = traceWriteSequence;
+    reply->ack_sequence = traceAckSequence;
+    const uint64_t missing = request->next_sequence > traceAckSequence ?
+        request->next_sequence : traceAckSequence;
+    if (missing < traceFirstSequence) {
+        reply->lost_begin = missing;
+        reply->lost_end = traceFirstSequence;
+    }
+    const uint64_t available = traceWriteSequence - reply->first_sequence;
+    reply->count = available > NativeAdrenoTraceBatchEvents ?
+        NativeAdrenoTraceBatchEvents : uint32_t(available);
+    reply->next_sequence = reply->first_sequence + reply->count;
+    for (uint32_t index = 0; index < reply->count; ++index) {
+        const uint64_t sequence = reply->first_sequence + index;
+        reply->events[index] = traceEvents[sequence % NativeAdrenoTraceEventCapacity];
+    }
+    if (reply->next_sequence > traceReadSequence) {
+        traceReadSequence = reply->next_sequence;
+    }
+    IOLockUnlock(profileLock);
+
+    return kIOReturnSuccess;
+}
+
+IOReturn NativeAdrenoGpuProfile::ackTraceStream(const NativeAdrenoTraceStreamRead *request)
+{
+    if (!request || !profileLock || request->version != NativeAdrenoTraceVersion) {
+        return kIOReturnBadArgument;
+    }
+
+    IOLockLock(profileLock);
+    if (!traceStreaming || request->generation != window) {
+        IOLockUnlock(profileLock);
+
+        return kIOReturnNotReady;
+    }
+    if (request->next_sequence > traceReadSequence) {
+        IOLockUnlock(profileLock);
+
+        return kIOReturnBadArgument;
+    }
+    if (request->next_sequence > traceAckSequence) {
+        traceAckSequence = request->next_sequence;
+        if (traceFirstSequence < traceAckSequence) {
+            traceFirstSequence = traceAckSequence;
+        }
+    }
+    IOLockUnlock(profileLock);
+
+    return kIOReturnSuccess;
+}
+
 IOReturn NativeAdrenoGpuProfile::readTrace(const NativeAdrenoTraceRead *request,
     NativeAdrenoTraceChunk *reply)
 {
@@ -896,10 +1004,15 @@ IOReturn NativeAdrenoGpuProfile::readTrace(const NativeAdrenoTraceRead *request,
     }
 
     IOLockLock(profileLock);
-    if (!traceSealed || request->generation != window) {
+    if ((!traceSealed && !traceStreaming) || request->generation != window) {
         IOLockUnlock(profileLock);
 
         return kIOReturnNotReady;
+    }
+    if (traceStreaming && request->section == NativeAdrenoTraceSectionEvents) {
+        IOLockUnlock(profileLock);
+
+        return kIOReturnUnsupported;
     }
 
     const uint32_t sizes[] = {sizeof(NativeAdrenoTraceStatus),

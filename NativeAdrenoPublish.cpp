@@ -1323,7 +1323,7 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
 }
 IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size)
 {
-    if (method >= NativeAdrenoMethodQueryTrace && method <= NativeAdrenoMethodEndTraceProducer) {
+    if (method >= NativeAdrenoMethodQueryTrace && method <= NativeAdrenoMethodAckTraceStream) {
         struct TraceConnectionLock {
             IOLock *lock;
 
@@ -1382,6 +1382,20 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
                 }
                 return NativeAdrenoGpuProfile::endProducer(uint64_t(this),
                     static_cast<const NativeAdrenoTraceProducer *>(input));
+            case NativeAdrenoMethodReadTraceStream:
+                if (!input || input_size != sizeof(NativeAdrenoTraceStreamRead) ||
+                    !output || output_size != sizeof(NativeAdrenoTraceStreamChunk)) {
+                    return kIOReturnBadArgument;
+                }
+                return NativeAdrenoGpuProfile::readTraceStream(
+                    static_cast<const NativeAdrenoTraceStreamRead *>(input),
+                    static_cast<NativeAdrenoTraceStreamChunk *>(output));
+            case NativeAdrenoMethodAckTraceStream:
+                if (!input || input_size != sizeof(NativeAdrenoTraceStreamRead) || output_size) {
+                    return kIOReturnBadArgument;
+                }
+                return NativeAdrenoGpuProfile::ackTraceStream(
+                    static_cast<const NativeAdrenoTraceStreamRead *>(input));
         }
     }
     if(method==NativeAdrenoMethodBoCpuMapV2) {
@@ -1643,7 +1657,9 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
         {&action,0,sizeof(NativeAdrenoTraceRead),0,sizeof(NativeAdrenoTraceChunk)},
         {&action,0,sizeof(NativeAdrenoTraceBatch),0,0},
         {&action,0,sizeof(NativeAdrenoTraceProducer),0,sizeof(NativeAdrenoTraceProducer)},
-        {&action,0,sizeof(NativeAdrenoTraceProducer),0,0}};
+        {&action,0,sizeof(NativeAdrenoTraceProducer),0,0},
+        {&action,0,sizeof(NativeAdrenoTraceStreamRead),0,sizeof(NativeAdrenoTraceStreamChunk)},
+        {&action,0,sizeof(NativeAdrenoTraceStreamRead),0,0}};
     __atomic_fetch_add(&native_adreno_metal_diag.ext_entries,1,__ATOMIC_RELAXED);
     if(selector<256) {
         __atomic_fetch_or(&native_adreno_metal_diag.sel_bits[selector>>5],1u<<(selector&31),__ATOMIC_RELAXED);

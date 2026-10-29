@@ -21,7 +21,8 @@ struct NativeAdrenoGpuProfileAccess {
  * or sampling, then retains permission until sampling and pending jobs finish.
  * The ring records CP arrival and RB completion in its coherent fence allocation;
  * the submission owner delivers those values after observing the normal fence.
- * USB exports the fixed arrays after sampling and pending jobs have finished. */
+ * USB reads committed counter/job arrays and drains the optional event stream;
+ * acknowledgements reclaim stream slots after the host saves their contents. */
 class NativeAdrenoGpuProfile final {
 public:
     static IOReturn initialize(const NativeAdrenoRingIo *, const NativeAdrenoGpuProfileAccess &);
@@ -37,6 +38,8 @@ public:
     static IOReturn queryTrace(NativeAdrenoTraceStatus *);
     static IOReturn controlTrace(const NativeAdrenoTraceControl *, NativeAdrenoTraceStatus *);
     static IOReturn readTrace(const NativeAdrenoTraceRead *, NativeAdrenoTraceChunk *);
+    static IOReturn readTraceStream(const NativeAdrenoTraceStreamRead *, NativeAdrenoTraceStreamChunk *);
+    static IOReturn ackTraceStream(const NativeAdrenoTraceStreamRead *);
     static IOReturn appendTrace(uint64_t owner, uint32_t process,
         const NativeAdrenoTraceBatch *);
     static IOReturn registerProducer(uint64_t owner, const NativeAdrenoTraceProducer *,

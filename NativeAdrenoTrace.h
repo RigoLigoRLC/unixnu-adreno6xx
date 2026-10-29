@@ -12,6 +12,8 @@ enum {
     NativeAdrenoMethodAppendTrace = 36,
     NativeAdrenoMethodRegisterTraceProducer = 37,
     NativeAdrenoMethodEndTraceProducer = 38,
+    NativeAdrenoMethodReadTraceStream = 39,
+    NativeAdrenoMethodAckTraceStream = 40,
     NativeAdrenoTraceEventCapacity = 131072,
     NativeAdrenoTraceBatchEvents = 8,
     NativeAdrenoTraceChunkBytes = 1536,
@@ -27,6 +29,10 @@ enum {
     NativeAdrenoTraceStart = 1,
     NativeAdrenoTraceStop = 2,
     NativeAdrenoTraceSeal = 3,
+    NativeAdrenoTraceStartStream = 4,
+    NativeAdrenoTraceStreamSealed = 1,
+    NativeAdrenoTraceStreamHardwareComplete = 2,
+    NativeAdrenoTraceStreamProducersEnded = 4,
     NativeAdrenoTraceIdle = 0,
     NativeAdrenoTraceRequested = 1,
     NativeAdrenoTraceRunning = 2,
@@ -96,7 +102,7 @@ typedef struct NativeAdrenoTraceBatch {
 
 /* NativeAdrenoTraceStatus describes one retained capture. Complete means the
  * hardware window and OOB ownership have ended; producers may still append.
- * Seal freezes all records for deterministic reads. CPU times use
+ * Seal ends appends; a stream still permits reads and acknowledgements. CPU times use
  * mach_absolute_time converted to nanoseconds, without suspend time. */
 typedef struct NativeAdrenoTraceStatus {
     uint32_t version;
@@ -108,7 +114,7 @@ typedef struct NativeAdrenoTraceStatus {
     uint32_t counter_count;
     uint32_t sample_count;
     uint32_t job_count;
-    uint32_t event_count;
+    uint32_t event_count;        /* Total appended events for a stream; retained count otherwise. */
     uint32_t sample_dropped;
     uint32_t job_dropped;
     uint32_t event_dropped;
@@ -126,7 +132,9 @@ typedef struct NativeAdrenoTraceStatus {
     uint32_t definition_bytes;
     uint32_t producer_count;
     uint32_t producer_failed;
-    uint32_t reserved[3];
+    uint32_t streaming;          /* StartStream enables live reads and acknowledgement reclamation. */
+    uint32_t retained_events;    /* Events currently available in the fixed array or stream ring. */
+    uint32_t reserved;
 } NativeAdrenoTraceStatus;
 
 typedef struct NativeAdrenoTraceProducer {
@@ -163,6 +171,31 @@ typedef struct NativeAdrenoTraceChunk {
     uint32_t reserved[2];
     uint8_t data[NativeAdrenoTraceChunkBytes];
 } NativeAdrenoTraceChunk;
+
+/* NativeAdrenoTraceStreamRead requests events starting at an absolute sequence
+ * within one capture. Ack uses the same layout after the host saves the events. */
+typedef struct NativeAdrenoTraceStreamRead {
+    uint32_t version;
+    uint32_t generation;
+    uint64_t next_sequence;
+} NativeAdrenoTraceStreamRead;
+
+/* NativeAdrenoTraceStreamChunk contains up to eight consecutive events.
+ * Sequence values start at zero for each generation; all end values are
+ * exclusive. Reads preserve the data until Ack or an overwrite advances it. */
+typedef struct NativeAdrenoTraceStreamChunk {
+    uint32_t version;
+    uint32_t generation;
+    uint32_t count;
+    uint32_t flags;
+    uint64_t first_sequence;     /* Sequence of events[0], including an empty reply. */
+    uint64_t next_sequence;      /* Sequence immediately after the returned events. */
+    uint64_t write_sequence;     /* Sequence that the next appended event receives. */
+    uint64_t ack_sequence;       /* Host-confirmed prefix already reclaimed. */
+    uint64_t lost_begin;         /* Missing unacknowledged range, or zero when empty. */
+    uint64_t lost_end;
+    NativeAdrenoTraceEvent events[NativeAdrenoTraceBatchEvents];
+} NativeAdrenoTraceStreamChunk;
 
 typedef struct NativeAdrenoTraceCounterDefinition {
     char name[48];
@@ -255,7 +288,9 @@ enum {
     NativeAdrenoTraceArgUnexecutedGmemPoints = 28,
     NativeAdrenoTraceArgSourceFormat = 29,
     NativeAdrenoTraceArgDestinationFormat = 30,
-    NativeAdrenoTraceArgBytes = 31
+    NativeAdrenoTraceArgBytes = 31,
+    NativeAdrenoTraceArgReservedBytesHighWater = 32,
+    NativeAdrenoTraceArgBudgetBytes = 33
 };
 
 #endif
