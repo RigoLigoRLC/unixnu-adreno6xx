@@ -591,6 +591,7 @@ IOReturn NativeAdrenoScheduler::advance()
             if (status) {
                 break;
             }
+            submit_->associateGpuProfileCompletion(job.hardware, job.completion);
             heads_[job.queue] = job.next;
             if (!job.next) {
                 tails_[job.queue] = nullptr;

@@ -3,6 +3,7 @@
 #include "NativeAdrenoKernelTime.h"
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
+#include <kern/clock.h>
 
 namespace {
 constexpr unsigned CounterCount = 29;
@@ -59,6 +60,8 @@ struct CounterSample {
     uint64_t end = 0;
     uint64_t values[CounterCount]{};
     uint32_t validMask = 0;
+    uint64_t cpuBeginNs = 0;
+    uint64_t cpuEndNs = 0;
 };
 
 struct JobSample {
@@ -69,6 +72,16 @@ struct JobSample {
     uint32_t rb = 0;
     uint32_t queueValid = 0;
     uint32_t rbValid = 0;
+    uint64_t completion = 0;
+    uint64_t retiredNs = 0;
+};
+
+/* TraceProducer retains a connection's right to append a capture's completed
+ * user events. End or connection close releases the right before Seal. */
+struct TraceProducer {
+    uint64_t owner = 0;
+    uint64_t identifier = 0;
+    uint32_t source = 0;
 };
 
 NativeAdrenoRingIo profileIo{};
@@ -76,6 +89,17 @@ NativeAdrenoGpuProfileAccess profileAccess{};
 IOLock *profileLock = nullptr;
 CounterSample samples[SampleCapacity];
 JobSample jobs[JobCapacity];
+NativeAdrenoTraceEvent traceEvents[NativeAdrenoTraceEventCapacity];
+TraceProducer traceProducers[16];
+uint64_t nextProducer = 0;
+uint64_t startedNs = 0;
+uint64_t stoppedNs = 0;
+uint32_t traceEventCount = 0;
+uint32_t traceEventDropped = 0;
+uint32_t producerDropped = 0;
+uint32_t producerCount = 0;
+uint32_t producerFailed = 0;
+bool traceSealed = false;
 uint32_t initialized = 0;
 uint32_t running = 0;
 uint32_t workerNeeded = 0;
@@ -106,6 +130,61 @@ uint64_t nowUs()
     NativeAdrenoKernelTime::now_us(nullptr, &value);
 
     return value;
+}
+
+uint64_t nowNs()
+{
+    uint64_t value = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &value);
+
+    return value;
+}
+
+bool hardwareComplete()
+{
+    return window && !running && !requested && !acquiring && !releasing &&
+        !hardwareOwned && !sampling && !pendingJobs;
+}
+
+void fillTraceStatus(NativeAdrenoTraceStatus &status)
+{
+    status = {};
+    status.version = NativeAdrenoTraceVersion;
+    status.generation = window;
+    status.state = !window ? NativeAdrenoTraceIdle :
+        traceSealed ? NativeAdrenoTraceSealed :
+        requested || acquiring ? NativeAdrenoTraceRequested :
+        running ? NativeAdrenoTraceRunning :
+        hardwareComplete() ? NativeAdrenoTraceComplete : NativeAdrenoTraceDraining;
+    status.access_error = accessError;
+    status.started_ns = startedNs;
+    status.stopped_ns = stoppedNs;
+    status.counter_count = CounterCount;
+    status.sample_count = sampleCount;
+    status.job_count = jobCount;
+    status.event_count = traceEventCount;
+    status.sample_dropped = sampleDropped;
+    status.job_dropped = jobDropped;
+    status.event_dropped = traceEventDropped;
+    status.producer_dropped = producerDropped;
+    status.pending_jobs = pendingJobs;
+    status.hardware_owned = hardwareOwned;
+    status.gpu_clock_hz = NativeAdrenoTraceGpuClockHz;
+    status.sample_interval_us = SampleIntervalUs;
+    status.sample_capacity = SampleCapacity;
+    status.job_capacity = JobCapacity;
+    status.event_capacity = NativeAdrenoTraceEventCapacity;
+    status.event_bytes = sizeof(NativeAdrenoTraceEvent);
+    status.sample_bytes = sizeof(NativeAdrenoTraceCounterSample);
+    status.job_bytes = sizeof(NativeAdrenoTraceJob);
+    status.definition_bytes = sizeof(NativeAdrenoTraceCounterDefinition);
+    status.producer_count = producerCount;
+    status.producer_failed = producerFailed;
+}
+
+void addDropped(uint32_t &total, uint32_t count)
+{
+    total = count > UINT32_MAX - total ? UINT32_MAX : total + count;
 }
 
 bool read64(uint32_t reg, uint64_t *value)
@@ -172,6 +251,9 @@ IOReturn releaseFinishedWindow()
     releasing = false;
     if (!status) {
         hardwareOwned = false;
+        if (!stoppedNs) {
+            stoppedNs = nowNs();
+        }
         __atomic_store_n(&workerNeeded, 0, __ATOMIC_RELEASE);
     } else {
         accessError = uint32_t(status);
@@ -248,6 +330,7 @@ IOReturn NativeAdrenoGpuProfile::poll()
         hardwareOwned = status == kIOReturnSuccess;
         accessError = uint32_t(status);
         if (!status && !stopRequested) {
+            startedNs = nowNs();
             nextSampleUs = started;
             deadlineUs = started + uint64_t(requestedDurationMs) * 1000;
             __atomic_store_n(&running, 1, __ATOMIC_RELEASE);
@@ -269,6 +352,7 @@ IOReturn NativeAdrenoGpuProfile::poll()
     IOLockLock(profileLock);
     if (__atomic_load_n(&running, __ATOMIC_ACQUIRE) && current >= deadlineUs) {
         __atomic_store_n(&running, 0, __ATOMIC_RELEASE);
+        stoppedNs = nowNs();
     }
     const bool takeSample = __atomic_load_n(&running, __ATOMIC_ACQUIRE) && hardwareOwned &&
         current >= nextSampleUs && !sampling;
@@ -282,6 +366,7 @@ IOReturn NativeAdrenoGpuProfile::poll()
     }
 
     CounterSample sample{};
+    sample.cpuBeginNs = nowNs();
     IOReturn sampleStatus = kIOReturnSuccess;
     if (!profileAccess.accessible(profileIo.cookie) ||
         profileIo.readAlwaysOn(profileIo.cookie, &sample.begin)) {
@@ -304,6 +389,7 @@ IOReturn NativeAdrenoGpuProfile::poll()
         }
     }
 
+    sample.cpuEndNs = nowNs();
     IOLockLock(profileLock);
     if (capturedWindow == window) {
         if (sampleCount < SampleCapacity) {
@@ -311,10 +397,16 @@ IOReturn NativeAdrenoGpuProfile::poll()
         } else {
             ++sampleDropped;
             __atomic_store_n(&running, 0, __ATOMIC_RELEASE);
+            if (!stoppedNs) {
+                stoppedNs = nowNs();
+            }
         }
         if (sampleStatus) {
             accessError = uint32_t(sampleStatus);
             __atomic_store_n(&running, 0, __ATOMIC_RELEASE);
+            if (!stoppedNs) {
+                stoppedNs = nowNs();
+            }
         }
     }
     sampling = false;
@@ -339,6 +431,9 @@ void NativeAdrenoGpuProfile::fault()
     __atomic_store_n(&initialized, 0, __ATOMIC_RELEASE);
     requested = false;
     stopRequested = true;
+    if (!stoppedNs) {
+        stoppedNs = nowNs();
+    }
     if (!accessError) {
         accessError = uint32_t(kIOReturnIOError);
     }
@@ -388,6 +483,7 @@ uint32_t NativeAdrenoGpuProfile::beginJob()
     } else if (__atomic_load_n(&running, __ATOMIC_ACQUIRE)) {
         ++jobDropped;
         __atomic_store_n(&running, 0, __ATOMIC_RELEASE);
+        stoppedNs = nowNs();
     }
     IOLockUnlock(profileLock);
 
@@ -395,7 +491,8 @@ uint32_t NativeAdrenoGpuProfile::beginJob()
 }
 
 void NativeAdrenoGpuProfile::finishJob(uint32_t capturedWindow, uint32_t fence, uint32_t queue,
-    uint32_t issue, uint32_t cp, uint32_t rb, bool valid, bool issueValid)
+    uint32_t issue, uint32_t cp, uint32_t rb, bool valid, bool issueValid,
+    uint64_t completion)
 {
     if (!capturedWindow) {
         return;
@@ -411,7 +508,7 @@ void NativeAdrenoGpuProfile::finishJob(uint32_t capturedWindow, uint32_t fence, 
     if (capturedWindow == window) {
         if (jobCount < JobCapacity) {
             jobs[jobCount++] = {fence, queue, issue, cp, rb,
-                queueValid ? 1u : 0u, rbValid ? 1u : 0u};
+                queueValid ? 1u : 0u, rbValid ? 1u : 0u, completion, nowNs()};
         } else {
             ++jobDropped;
         }
@@ -438,7 +535,7 @@ extern "C" uint32_t native_adreno_gpu_profile_start(uint32_t duration_ms)
         return uint32_t(kIOReturnNotReady);
     }
     if (__atomic_load_n(&workerNeeded, __ATOMIC_ACQUIRE) ||
-        __atomic_load_n(&running, __ATOMIC_ACQUIRE) || sampling || dumping || pendingJobs ||
+        __atomic_load_n(&running, __ATOMIC_ACQUIRE) || sampling || dumping || pendingJobs || producerCount ||
         (dumpBegun && (dumpSampleAt < sampleCount || dumpJobAt < jobCount))) {
         IOLockUnlock(profileLock);
         return uint32_t(kIOReturnBusy);
@@ -453,6 +550,13 @@ extern "C" uint32_t native_adreno_gpu_profile_start(uint32_t duration_ms)
     jobCount = 0;
     sampleDropped = 0;
     jobDropped = 0;
+    traceEventCount = 0;
+    traceEventDropped = 0;
+    producerDropped = 0;
+    producerFailed = 0;
+    startedNs = 0;
+    stoppedNs = 0;
+    traceSealed = false;
     dumpBegun = false;
     dumpSampleAt = 0;
     dumpJobAt = 0;
@@ -479,6 +583,9 @@ extern "C" void native_adreno_gpu_profile_stop(void)
     __atomic_store_n(&running, 0, __ATOMIC_RELEASE);
     requested = false;
     stopRequested = true;
+    if (!stoppedNs) {
+        stoppedNs = nowNs();
+    }
 
     if (profileLock) {
         IOLockUnlock(profileLock);
@@ -577,4 +684,311 @@ extern "C" void native_adreno_gpu_profile_dump(void)
     dumpJobAt = untilJob;
     dumping = false;
     IOLockUnlock(profileLock);
+}
+
+IOReturn NativeAdrenoGpuProfile::queryTrace(NativeAdrenoTraceStatus *status)
+{
+    if (!status || !profileLock) {
+        return kIOReturnNotReady;
+    }
+
+    IOLockLock(profileLock);
+    fillTraceStatus(*status);
+    IOLockUnlock(profileLock);
+
+    return kIOReturnSuccess;
+}
+
+IOReturn NativeAdrenoGpuProfile::controlTrace(const NativeAdrenoTraceControl *request,
+    NativeAdrenoTraceStatus *status)
+{
+    if (!request || !status || request->version != NativeAdrenoTraceVersion || !profileLock) {
+        return kIOReturnBadArgument;
+    }
+
+    if (request->operation == NativeAdrenoTraceStart) {
+        if (request->generation) {
+            return kIOReturnBadArgument;
+        }
+
+        const IOReturn result = native_adreno_gpu_profile_start(request->duration_ms);
+        queryTrace(status);
+
+        return result;
+    }
+
+    IOLockLock(profileLock);
+    IOReturn result = kIOReturnSuccess;
+    if (!window || request->generation != window || request->duration_ms) {
+        result = kIOReturnBadArgument;
+    } else if (request->operation == NativeAdrenoTraceStop) {
+        __atomic_store_n(&running, 0, __ATOMIC_RELEASE);
+        requested = false;
+        stopRequested = true;
+        if (!stoppedNs) {
+            stoppedNs = nowNs();
+        }
+    } else if (request->operation == NativeAdrenoTraceSeal) {
+        if (!hardwareComplete() || producerCount) {
+            result = kIOReturnBusy;
+        } else {
+            traceSealed = true;
+        }
+    } else {
+        result = kIOReturnBadArgument;
+    }
+    fillTraceStatus(*status);
+    IOLockUnlock(profileLock);
+
+    return result;
+}
+
+IOReturn NativeAdrenoGpuProfile::registerProducer(uint64_t owner,
+    const NativeAdrenoTraceProducer *request, NativeAdrenoTraceProducer *reply)
+{
+    if (!owner || !request || !reply || !profileLock ||
+        request->version != NativeAdrenoTraceVersion || request->producer_id ||
+        request->flags || request->dropped || request->reserved ||
+        (request->source != NativeAdrenoTraceSourceMetal &&
+         request->source != NativeAdrenoTraceSourceTurnip)) {
+        return kIOReturnBadArgument;
+    }
+
+    IOLockLock(profileLock);
+    IOReturn result = kIOReturnNotReady;
+    if (request->generation == window && !traceSealed &&
+        (running || requested || acquiring)) {
+        result = kIOReturnNoResources;
+        for (TraceProducer &producer : traceProducers) {
+            if (producer.identifier) {
+                continue;
+            }
+
+            ++nextProducer;
+            if (!nextProducer) {
+                ++nextProducer;
+            }
+            producer = {owner, nextProducer, request->source};
+            ++producerCount;
+            *reply = *request;
+            reply->producer_id = nextProducer;
+            result = kIOReturnSuccess;
+            break;
+        }
+    }
+    IOLockUnlock(profileLock);
+
+    return result;
+}
+
+IOReturn NativeAdrenoGpuProfile::appendTrace(uint64_t owner, uint32_t process,
+    const NativeAdrenoTraceBatch *batch)
+{
+    if (!owner || !batch || !profileLock || batch->version != NativeAdrenoTraceVersion ||
+        batch->count > NativeAdrenoTraceBatchEvents || batch->reserved) {
+        return kIOReturnBadArgument;
+    }
+    for (uint32_t index = 0; index < batch->count; ++index) {
+        const NativeAdrenoTraceEvent &event = batch->events[index];
+        if ((event.source != NativeAdrenoTraceSourceMetal &&
+             event.source != NativeAdrenoTraceSourceTurnip) ||
+            event.phase < NativeAdrenoTracePhaseBegin || event.phase > NativeAdrenoTracePhaseInstant ||
+            event.clock_domain < NativeAdrenoTraceClockGpuNanoseconds ||
+            event.clock_domain > NativeAdrenoTraceClockMonotonicNanoseconds ||
+            event.argument_count > 4 ||
+            (event.flags & ~(NativeAdrenoTraceEventInvalid | NativeAdrenoTraceEventSourceFlagsMask))) {
+            return kIOReturnBadArgument;
+        }
+        for (uint32_t argument = 0; argument < event.argument_count; ++argument) {
+            if (event.args[argument].type < NativeAdrenoTraceArgumentUnsigned ||
+                event.args[argument].type > NativeAdrenoTraceArgumentFloatBits) {
+                return kIOReturnBadArgument;
+            }
+        }
+    }
+
+    IOLockLock(profileLock);
+    bool ownsProducer = false;
+    for (const TraceProducer &producer : traceProducers) {
+        if (producer.owner == owner && producer.identifier == batch->producer_id) {
+            ownsProducer = true;
+            break;
+        }
+    }
+    if (batch->generation != window || traceSealed || !ownsProducer) {
+        IOLockUnlock(profileLock);
+
+        return kIOReturnNotReady;
+    }
+
+    addDropped(producerDropped, batch->dropped);
+    for (uint32_t index = 0; index < batch->count; ++index) {
+        if (traceEventCount == NativeAdrenoTraceEventCapacity) {
+            addDropped(traceEventDropped, batch->count - index);
+            break;
+        }
+
+        NativeAdrenoTraceEvent &destination = traceEvents[traceEventCount++];
+        destination = batch->events[index];
+        destination.process_id = process;
+        destination.name[sizeof(destination.name) - 1] = 0;
+    }
+    IOLockUnlock(profileLock);
+
+    return kIOReturnSuccess;
+}
+
+IOReturn NativeAdrenoGpuProfile::endProducer(uint64_t owner,
+    const NativeAdrenoTraceProducer *request)
+{
+    if (!owner || !request || !profileLock || request->version != NativeAdrenoTraceVersion ||
+        !request->producer_id || request->reserved ||
+        (request->flags & ~NativeAdrenoTraceProducerIncomplete)) {
+        return kIOReturnBadArgument;
+    }
+
+    IOLockLock(profileLock);
+    IOReturn result = kIOReturnNotFound;
+    if (request->generation == window && !traceSealed) {
+        for (TraceProducer &producer : traceProducers) {
+            if (producer.owner != owner || producer.identifier != request->producer_id) {
+                continue;
+            }
+
+            addDropped(producerDropped, request->dropped);
+            if (request->flags & NativeAdrenoTraceProducerIncomplete) {
+                ++producerFailed;
+            }
+            producer = {};
+            --producerCount;
+            result = kIOReturnSuccess;
+            break;
+        }
+    }
+    IOLockUnlock(profileLock);
+
+    return result;
+}
+
+void NativeAdrenoGpuProfile::closeProducers(uint64_t owner)
+{
+    if (!profileLock) {
+        return;
+    }
+
+    IOLockLock(profileLock);
+    for (TraceProducer &producer : traceProducers) {
+        if (producer.owner == owner && producer.identifier) {
+            producer = {};
+            --producerCount;
+            ++producerFailed;
+        }
+    }
+    IOLockUnlock(profileLock);
+}
+
+IOReturn NativeAdrenoGpuProfile::readTrace(const NativeAdrenoTraceRead *request,
+    NativeAdrenoTraceChunk *reply)
+{
+    if (!request || !reply || !profileLock || request->version != NativeAdrenoTraceVersion ||
+        request->section > NativeAdrenoTraceSectionEvents) {
+        return kIOReturnBadArgument;
+    }
+
+    IOLockLock(profileLock);
+    if (!traceSealed || request->generation != window) {
+        IOLockUnlock(profileLock);
+
+        return kIOReturnNotReady;
+    }
+
+    const uint32_t sizes[] = {sizeof(NativeAdrenoTraceStatus),
+        sizeof(NativeAdrenoTraceCounterDefinition), sizeof(NativeAdrenoTraceCounterSample),
+        sizeof(NativeAdrenoTraceJob), sizeof(NativeAdrenoTraceEvent)};
+    const uint32_t counts[] = {1, CounterCount, sampleCount, jobCount, traceEventCount};
+    const uint32_t recordBytes = sizes[request->section];
+    const uint32_t total = recordBytes * counts[request->section];
+    if (request->offset > total) {
+        IOLockUnlock(profileLock);
+
+        return kIOReturnBadArgument;
+    }
+
+    *reply = {};
+    reply->version = NativeAdrenoTraceVersion;
+    reply->generation = window;
+    reply->section = request->section;
+    reply->offset = request->offset;
+    reply->total_bytes = total;
+    reply->bytes = total - request->offset;
+    if (reply->bytes > NativeAdrenoTraceChunkBytes) {
+        reply->bytes = NativeAdrenoTraceChunkBytes;
+    }
+
+    uint32_t written = 0;
+    while (written < reply->bytes) {
+        const uint32_t position = request->offset + written;
+        const uint32_t index = position / recordBytes;
+        const uint32_t within = position % recordBytes;
+        uint32_t bytes = recordBytes - within;
+        if (bytes > reply->bytes - written) {
+            bytes = reply->bytes - written;
+        }
+
+        union {
+            NativeAdrenoTraceStatus status;
+            NativeAdrenoTraceCounterDefinition definition;
+            NativeAdrenoTraceCounterSample sample;
+            NativeAdrenoTraceJob job;
+        } record{};
+        const uint8_t *source = reinterpret_cast<const uint8_t *>(&record);
+        switch (request->section) {
+            case NativeAdrenoTraceSectionStatus:
+                fillTraceStatus(record.status);
+                break;
+            case NativeAdrenoTraceSectionDefinitions: {
+                const Counter &counter = counters[index];
+                strlcpy(record.definition.name, counter.name, sizeof(record.definition.name));
+                strlcpy(record.definition.unit, counter.unit, sizeof(record.definition.unit));
+                record.definition.index = index;
+                record.definition.selector = counter.selector;
+                record.definition.event = counter.event;
+                record.definition.low_register = counter.low;
+                record.definition.load_bit = counter.loadBit;
+                break;
+            }
+            case NativeAdrenoTraceSectionCounters: {
+                const CounterSample &sample = samples[index];
+                record.sample.cpu_begin_ns = sample.cpuBeginNs;
+                record.sample.cpu_end_ns = sample.cpuEndNs;
+                record.sample.gpu_begin_ticks = sample.begin;
+                record.sample.gpu_end_ticks = sample.end;
+                memcpy(record.sample.values, sample.values, sizeof(sample.values));
+                record.sample.valid_mask = sample.validMask;
+                break;
+            }
+            case NativeAdrenoTraceSectionJobs: {
+                const JobSample &job = jobs[index];
+                record.job.completion = job.completion;
+                record.job.retired_ns = job.retiredNs;
+                record.job.fence = job.fence;
+                record.job.queue = job.queue;
+                record.job.issue_ticks = job.issue;
+                record.job.cp_ticks = job.cp;
+                record.job.rb_ticks = job.rb;
+                record.job.valid_flags = (job.queueValid ? NativeAdrenoTraceJobQueueValid : 0) |
+                    (job.rbValid ? NativeAdrenoTraceJobRbValid : 0);
+                record.job.generation = window;
+                break;
+            }
+            case NativeAdrenoTraceSectionEvents:
+                source = reinterpret_cast<const uint8_t *>(&traceEvents[index]);
+                break;
+        }
+        memcpy(reply->data + written, source + within, bytes);
+        written += bytes;
+    }
+    IOLockUnlock(profileLock);
+
+    return kIOReturnSuccess;
 }

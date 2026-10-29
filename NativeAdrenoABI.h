@@ -3,6 +3,7 @@
 #define NATIVE_ADRENO_ABI_H
 #define NATIVE_ADRENO_ASYNC_ABI 1
 #include <stdint.h>
+#include "NativeAdrenoTrace.h"
 
 /* NativeAdreno wire records carry BO, mapping and submission requests through
  * IOKit external methods. Fixed records have exact lengths; SubmitV2 carries
@@ -44,7 +45,7 @@ enum {
     NativeAdrenoMethodWaitCompletion = 30,
     NativeAdrenoMethodWaitCapacity = 31,
     NativeAdrenoMethodWaitBoIdle = 32,
-    NativeAdrenoMethodLast = NativeAdrenoMethodWaitBoIdle,
+    NativeAdrenoMethodLast = NativeAdrenoMethodEndTraceProducer,
     NativeAdrenoAbiMetadataBytes = 64,
     NativeAdrenoAbiMaxQueues = 8
 };

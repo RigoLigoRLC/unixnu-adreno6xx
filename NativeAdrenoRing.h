@@ -103,7 +103,8 @@ public:
     IOReturn submitFramed(const uint32_t *words,size_t word_count,uint32_t *fence);
     /* The submission owner calls this after a normal fence observation, or
      * with complete=false after stopping DMA for a failed job. */
-    void collectGpuProfile(uint32_t fence, uint32_t queue, bool complete);
+    void collectGpuProfile(uint32_t fence, uint32_t queue, bool complete,
+        uint64_t completion = 0);
     /* The next user submission waits for idle on A642L or clears the A740
      * thread counters, timestamps and resource table between thread syncs. */
     void requestContextReset() {reset_pending_=true;}

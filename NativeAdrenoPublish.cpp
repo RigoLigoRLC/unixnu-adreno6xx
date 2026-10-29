@@ -30,6 +30,7 @@
 #include "NativeAdrenoA6xxService.h"
 #include "NativeAdrenoDisplay.h"
 #include "NativeAdrenoScheduler.h"
+#include "NativeAdrenoGpuProfile.h"
 
 static NativeAdrenoIntegration integration = {};
 extern "C" kmod_info_t g_kernel_kmod_info;
@@ -529,6 +530,7 @@ class AGXDeviceUserClient : public IOUserClient {
     NativeAdrenoUserClient *core_=nullptr;   /* own core; deleted in free(), so a call that raced the close sees live_ false, never freed memory */
     unsigned slot_=NativeAdrenoMaxClients;
     uint64_t profileGeneration_=0;
+    uint32_t traceProcessId_=0; // The opener owns mailbox requests executed by a kernel worker.
     char name_[20]{};
     IOLock *legacyCpuLock_=nullptr; /* Serializes legacy lease changes and cached-view teardown. */
     /* One user-view descriptor per BO token, reused by every clientMemoryForType call. IOConnectUnmapMemory64 asks clientMemoryForType for
@@ -805,6 +807,7 @@ IOReturn AGXDeviceUserClient::mount(bool kernel,unsigned connection_limit)
 }
 bool AGXDeviceUserClient::initializeMethodLocks()
 {
+    traceProcessId_ = uint32_t(proc_selfpid());
     legacyCpuLock_=IOLockAlloc();
     return legacyCpuLock_!=nullptr;
 }
@@ -1012,6 +1015,7 @@ IOReturn AGXDeviceUserClient::clientClose()
 {
     IOLockLock(g.lock);
     closing_=true;
+    NativeAdrenoGpuProfile::closeProducers(uint64_t(this));
     if(live_) {
         core_->beginClose();
         thread_call_enter(g.completionCall);
@@ -1072,6 +1076,7 @@ IOReturn AGXDeviceUserClient::clientClose()
 }
 void AGXDeviceUserClient::free()
 {
+    NativeAdrenoGpuProfile::closeProducers(uint64_t(this));
     IOReturn status=dropCpuMappings();
     if(!status) {
         status=dropViews(0);
@@ -1317,6 +1322,67 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
 }
 IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size)
 {
+    if (method >= NativeAdrenoMethodQueryTrace && method <= NativeAdrenoMethodEndTraceProducer) {
+        struct TraceConnectionLock {
+            IOLock *lock;
+
+            explicit TraceConnectionLock(IOLock *value) : lock(value)
+            {
+                IOLockLock(lock);
+            }
+
+            ~TraceConnectionLock()
+            {
+                IOLockUnlock(lock);
+            }
+        } traceConnection(g.lock);
+
+        if (closing_) {
+            return kIOReturnNotReady;
+        }
+
+        switch (method) {
+            case NativeAdrenoMethodQueryTrace:
+                if (input_size || !output || output_size != sizeof(NativeAdrenoTraceStatus)) {
+                    return kIOReturnBadArgument;
+                }
+                return NativeAdrenoGpuProfile::queryTrace(static_cast<NativeAdrenoTraceStatus *>(output));
+            case NativeAdrenoMethodControlTrace:
+                if (!input || input_size != sizeof(NativeAdrenoTraceControl) ||
+                    !output || output_size != sizeof(NativeAdrenoTraceStatus)) {
+                    return kIOReturnBadArgument;
+                }
+                return NativeAdrenoGpuProfile::controlTrace(static_cast<const NativeAdrenoTraceControl *>(input),
+                    static_cast<NativeAdrenoTraceStatus *>(output));
+            case NativeAdrenoMethodReadTrace:
+                if (!input || input_size != sizeof(NativeAdrenoTraceRead) ||
+                    !output || output_size != sizeof(NativeAdrenoTraceChunk)) {
+                    return kIOReturnBadArgument;
+                }
+                return NativeAdrenoGpuProfile::readTrace(static_cast<const NativeAdrenoTraceRead *>(input),
+                    static_cast<NativeAdrenoTraceChunk *>(output));
+            case NativeAdrenoMethodAppendTrace:
+                if (!input || input_size != sizeof(NativeAdrenoTraceBatch) || output_size) {
+                    return kIOReturnBadArgument;
+                }
+                return NativeAdrenoGpuProfile::appendTrace(uint64_t(this), traceProcessId_,
+                    static_cast<const NativeAdrenoTraceBatch *>(input));
+            case NativeAdrenoMethodRegisterTraceProducer:
+                if (!input || input_size != sizeof(NativeAdrenoTraceProducer) ||
+                    !output || output_size != sizeof(NativeAdrenoTraceProducer)) {
+                    return kIOReturnBadArgument;
+                }
+                return NativeAdrenoGpuProfile::registerProducer(uint64_t(this),
+                    static_cast<const NativeAdrenoTraceProducer *>(input),
+                    static_cast<NativeAdrenoTraceProducer *>(output));
+            case NativeAdrenoMethodEndTraceProducer:
+                if (!input || input_size != sizeof(NativeAdrenoTraceProducer) || output_size) {
+                    return kIOReturnBadArgument;
+                }
+                return NativeAdrenoGpuProfile::endProducer(uint64_t(this),
+                    static_cast<const NativeAdrenoTraceProducer *>(input));
+        }
+    }
     if(method==NativeAdrenoMethodBoCpuMapV2) {
         if(!input || input_size!=sizeof(NativeAdrenoAbiBoCpuMapV2) ||
             !output || output_size!=sizeof(NativeAdrenoAbiBoCpuMapV2Reply)) {
@@ -1570,7 +1636,13 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
         {&action,0,kIOUCVariableStructureSize,0,sizeof(NativeAdrenoAbiAsyncReply)},
         {&action,0,sizeof(NativeAdrenoAbiCompletionWait),0,0},
         {&action,0,sizeof(NativeAdrenoAbiCapacityWait),0,0},
-        {&action,0,sizeof(NativeAdrenoAbiBoWait),0,0}};
+        {&action,0,sizeof(NativeAdrenoAbiBoWait),0,0},
+        {&action,0,0,0,sizeof(NativeAdrenoTraceStatus)},
+        {&action,0,sizeof(NativeAdrenoTraceControl),0,sizeof(NativeAdrenoTraceStatus)},
+        {&action,0,sizeof(NativeAdrenoTraceRead),0,sizeof(NativeAdrenoTraceChunk)},
+        {&action,0,sizeof(NativeAdrenoTraceBatch),0,0},
+        {&action,0,sizeof(NativeAdrenoTraceProducer),0,sizeof(NativeAdrenoTraceProducer)},
+        {&action,0,sizeof(NativeAdrenoTraceProducer),0,0}};
     __atomic_fetch_add(&native_adreno_metal_diag.ext_entries,1,__ATOMIC_RELAXED);
     if(selector<256) {
         __atomic_fetch_or(&native_adreno_metal_diag.sel_bits[selector>>5],1u<<(selector&31),__ATOMIC_RELAXED);

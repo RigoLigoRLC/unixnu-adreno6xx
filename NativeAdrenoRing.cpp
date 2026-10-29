@@ -591,7 +591,8 @@ IOReturn NativeAdrenoRing::submitWords(const uint32_t *words, size_t word_count,
     return kIOReturnSuccess;
 }
 
-void NativeAdrenoRing::collectGpuProfile(uint32_t fence, uint32_t queue, bool complete)
+void NativeAdrenoRing::collectGpuProfile(uint32_t fence, uint32_t queue, bool complete,
+    uint64_t completion)
 {
     const uint32_t slot = fence % RingProfileSlots;
     const uint32_t capturedWindow = profileWindows_[slot];
@@ -610,7 +611,7 @@ void NativeAdrenoRing::collectGpuProfile(uint32_t fence, uint32_t queue, bool co
     }
 
     NativeAdrenoGpuProfile::finishJob(capturedWindow, fence, queue, profileIssueTicks_[slot],
-        cp, rb, complete && (cp || rb), profileIssueValid_[slot]);
+        cp, rb, complete && (cp || rb), profileIssueValid_[slot], completion);
     profileWindows_[slot] = 0;
     profileFences_[slot] = 0;
 }

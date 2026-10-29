@@ -3,6 +3,7 @@
 #define NATIVE_ADRENO_GPU_PROFILE_H
 
 #include "NativeAdrenoRing.h"
+#include "NativeAdrenoTrace.h"
 
 /* NativeAdrenoGpuProfileAccess connects the recorder to the service worker's
  * GMU ownership. acquire waits for the performance-counter OOB acknowledgement;
@@ -31,7 +32,17 @@ public:
     static bool active();
     static uint32_t beginJob();
     static void finishJob(uint32_t window, uint32_t fence, uint32_t queue,
-        uint32_t issue, uint32_t cp, uint32_t rb, bool valid, bool issueValid);
+        uint32_t issue, uint32_t cp, uint32_t rb, bool valid, bool issueValid,
+        uint64_t completion);
+    static IOReturn queryTrace(NativeAdrenoTraceStatus *);
+    static IOReturn controlTrace(const NativeAdrenoTraceControl *, NativeAdrenoTraceStatus *);
+    static IOReturn readTrace(const NativeAdrenoTraceRead *, NativeAdrenoTraceChunk *);
+    static IOReturn appendTrace(uint64_t owner, uint32_t process,
+        const NativeAdrenoTraceBatch *);
+    static IOReturn registerProducer(uint64_t owner, const NativeAdrenoTraceProducer *,
+        NativeAdrenoTraceProducer *);
+    static IOReturn endProducer(uint64_t owner, const NativeAdrenoTraceProducer *);
+    static void closeProducers(uint64_t owner);
 };
 
 extern "C" uint32_t native_adreno_gpu_profile_start(uint32_t duration_ms);

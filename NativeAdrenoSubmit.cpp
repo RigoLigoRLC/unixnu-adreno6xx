@@ -1200,6 +1200,14 @@ IOReturn NativeAdrenoSubmit::waitRange(uint32_t first,uint32_t count,const Nativ
     }
     return kIOReturnSuccess;
 }
+void NativeAdrenoSubmit::associateGpuProfileCompletion(uint32_t fence, uint64_t completion)
+{
+    Job *job = find(fence);
+    if (job) {
+        job->completion = completion;
+    }
+}
+
 IOReturn NativeAdrenoSubmit::retireCompleted()
 {
     if (!attached_ || poisoned_) {
@@ -1222,7 +1230,7 @@ IOReturn NativeAdrenoSubmit::retireCompleted()
         }
 
         profileNoteComplete(job.fence);
-        ring_->collectGpuProfile(job.fence,job.queue,true);
+        ring_->collectGpuProfile(job.fence,job.queue,true,job.completion);
         completed[count++] = &job;
     }
     if (!count) {
@@ -1248,7 +1256,7 @@ IOReturn NativeAdrenoSubmit::releaseAfterDmaStopped()
     }
     for(Job &job:jobs_) {
         if(job.active) {
-            ring_->collectGpuProfile(job.fence,job.queue,false);
+            ring_->collectGpuProfile(job.fence,job.queue,false,job.completion);
             const IOReturn status=release(job);
             if(status) {
                 return status;

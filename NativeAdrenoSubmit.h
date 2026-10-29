@@ -60,6 +60,7 @@ struct NativeAdrenoSubmitStats {
 class NativeAdrenoSubmit final {
     struct Job {
         uint32_t fence=0;
+        uint64_t completion=0;
         size_t count=0;
         uint64_t handles[16]{};
         uint32_t queue=0;
@@ -100,6 +101,7 @@ public:
         uint32_t *fence);
     IOReturn submitResources(const NativeAdrenoSubmitBuffer *,size_t,
         const NativeAdrenoSubmitResource *,size_t,uint32_t queue,uint32_t fallback_reason,uint32_t *fence);
+    void associateGpuProfileCompletion(uint32_t fence, uint64_t completion);
     void captureSurfaceProfile(IOMemoryDescriptor *,uint32_t,uint64_t,NativeAdrenoSurfaceProfile *);
     bool queueOutstanding(uint32_t queue) const;
     /* Queues [first, first+count): whether any of their jobs is outstanding, and a wait for every one of them (oldest first) that

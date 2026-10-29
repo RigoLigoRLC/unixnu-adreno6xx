@@ -139,6 +139,31 @@ measurements. The compatibility `valid` field requires both values to be
 valid. The finite rollover-read attempts establish a coherent counter value;
 they do not time out a stalled Device MMIO transaction.
 
+## Binary capture and user events
+
+`NativeAdrenoTrace.h` defines the fixed little-endian trace records and methods
+33 through 38. Query reports the hardware window generation and state. Control
+starts or stops that same window, and Seal freezes it after captured GPU jobs
+have retired, the worker has released the performance OOB, and every registered
+user producer has ended. The recorder retains 32768 user events in addition to
+4096 hardware samples and 4096 jobs. Full arrays preserve earlier records and
+increment explicit loss counts.
+
+Metal and Turnip register a producer on their IOKit connection for each capture.
+They append up to eight 176-byte events per call, including real tracepoint
+names, typed arguments and asynchronous completion receipts. Stop still permits
+that generation's registered producers to append completed events. Each producer
+flushes its local records and ends its registration; connection close releases
+remaining registrations and records an incomplete producer. Read returns at most
+1536 bytes from one frozen section, without logging its contents.
+
+The device's USB network helper exposes Query, Control and Read on
+`192.168.73.2:1235`, admitting only the USB host at `192.168.73.1`. Its IOKit
+handoff connection does not allocate rendering resources. Counter samples retain
+CPU `mach_absolute_time` converted to nanoseconds around the GMU clock and
+counter reads. GPU timestamps retain the 19.2 MHz clock; hardware job records
+include both the ring fence and the scheduler's global completion receipt.
+
 ## Frame timing
 
 The existing `gpu` query also requests NativeMobileDisplay's bounded frame
