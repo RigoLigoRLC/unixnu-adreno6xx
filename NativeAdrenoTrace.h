@@ -12,7 +12,7 @@ enum {
     NativeAdrenoMethodAppendTrace = 36,
     NativeAdrenoMethodRegisterTraceProducer = 37,
     NativeAdrenoMethodEndTraceProducer = 38,
-    NativeAdrenoTraceEventCapacity = 32768,
+    NativeAdrenoTraceEventCapacity = 131072,
     NativeAdrenoTraceBatchEvents = 8,
     NativeAdrenoTraceChunkBytes = 1536,
     NativeAdrenoTraceCounterCount = 29,
@@ -226,6 +226,7 @@ enum {
     NativeAdrenoTraceTurnipSubmit = 65536,
     NativeAdrenoTraceTurnipExecute = 65537,
     NativeAdrenoTraceTurnipInstrumentation = 65538,
+    NativeAdrenoTraceTurnipRecordCounts = 65539,
     NativeAdrenoTraceArgWidth = 1,
     NativeAdrenoTraceArgHeight = 2,
     NativeAdrenoTraceArgBins = 3,
@@ -246,7 +247,15 @@ enum {
     NativeAdrenoTraceArgTimestampDwords = 20,
     NativeAdrenoTraceArgCopyDwords = 21,
     NativeAdrenoTraceArgWaitForMeDwords = 22,
-    NativeAdrenoTraceArgExtraWaitForIdleDwords = 23
+    NativeAdrenoTraceArgExtraWaitForIdleDwords = 23,
+    NativeAdrenoTraceArgBudgetDropped = 24,
+    NativeAdrenoTraceArgQueueDropped = 25,
+    NativeAdrenoTraceArgAppendDropped = 26,
+    NativeAdrenoTraceArgUnsubmittedCommands = 27,
+    NativeAdrenoTraceArgUnexecutedGmemPoints = 28,
+    NativeAdrenoTraceArgSourceFormat = 29,
+    NativeAdrenoTraceArgDestinationFormat = 30,
+    NativeAdrenoTraceArgBytes = 31
 };
 
 #endif

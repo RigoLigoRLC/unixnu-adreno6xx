@@ -145,7 +145,7 @@ they do not time out a stalled Device MMIO transaction.
 33 through 38. Query reports the hardware window generation and state. Control
 starts or stops that same window, and Seal freezes it after captured GPU jobs
 have retired, the worker has released the performance OOB, and every registered
-user producer has ended. The recorder retains 32768 user events in addition to
+user producer has ended. The recorder retains 131072 user events in addition to
 4096 hardware samples and 4096 jobs. Full arrays preserve earlier records and
 increment explicit loss counts.
 
@@ -156,6 +156,14 @@ that generation's registered producers to append completed events. Each producer
 flushes its local records and ends its registration; connection close releases
 remaining registrations and records an incomplete producer. Read returns at most
 1536 bytes from one frozen section, without logging its contents.
+
+Turnip reserves space for both ends of each GPU stage and returns that budget
+when the corresponding u_trace buffers are freed. Stop ends new submission
+admission under the device submission mutex, then waits for admitted submission
+traces to retire and flush. Recorded commands that were never submitted are
+counted separately. GMEM points copied during binning or sysmem execution are
+excluded using the recorded execution mode. Other missing timestamps retain
+the Invalid flag. Final records distinguish budget, queue and append losses.
 
 The device's USB network helper exposes Query, Control and Read on
 `192.168.73.2:1235`, admitting only the USB host at `192.168.73.1`. Its IOKit
