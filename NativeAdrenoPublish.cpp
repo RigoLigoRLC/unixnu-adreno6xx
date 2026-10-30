@@ -100,8 +100,6 @@ volatile bool gPollerStarted=false;
 class AGXDeviceUserClient;
 /* The render server's connection serves the mailbox; it is retained while set (under g.lock), so the poller never runs on a freed object. */
 static AGXDeviceUserClient *gMailboxOwner=nullptr;
-// Each queued client owns a retain until its GPU and scanout references retire.
-static AGXDeviceUserClient *closingClients[NativeAdrenoMaxClients + 1]{};
 static void retryClosingClients();
 void nativeAdrenoMailboxPoller(void *,wait_result_t);
 static IOReturn runCore(AGXDeviceUserClient *,uint32_t method,const void *input,size_t input_size,void *output,size_t output_size);
@@ -140,6 +138,10 @@ struct NativeAdrenoAskerRecord native_adreno_metal_askers[12];
  * boxes, none of which had a native device), 170 MiB each (page aligned). int-198: iconservicesagent reached 128 MiB into its window and then lost its
  * Metal device; whether the window is the cause is what the [gpu windows] log row decides before these sizes change. */
 enum : unsigned {NativeAdrenoMaxClients=4};
+
+// Each queued client owns a retain until its GPU and scanout references retire.
+static AGXDeviceUserClient *closingClients[NativeAdrenoMaxClients + 1]{};
+
 static NativeAdrenoAbiResourceBudget resourceBudgets[NativeAdrenoMaxClients]{};
 static const struct {uint64_t start,bytes;} kClientWindows[NativeAdrenoMaxClients]={
     {0x20000000ull,0x40000000ull},{0x60000000ull,0x0AAA9000ull},{0x6AAA9000ull,0x0AAA9000ull},{0x75552000ull,0x0AAA9000ull}};
