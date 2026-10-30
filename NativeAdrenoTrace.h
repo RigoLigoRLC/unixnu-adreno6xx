@@ -20,6 +20,7 @@ enum {
     NativeAdrenoTraceCounterCount = 29,
     NativeAdrenoTraceCounterCapacity = 4096,
     NativeAdrenoTraceJobCapacity = 4096,
+    NativeAdrenoTracePerformanceCapacity = 4096,
     NativeAdrenoTraceGpuClockHz = 19200000,
     NativeAdrenoTraceTcpPort = 1235,
     NativeAdrenoTraceTcpMagic = 0x43525441
@@ -58,7 +59,14 @@ enum {
     NativeAdrenoTraceSectionDefinitions = 1,
     NativeAdrenoTraceSectionCounters = 2,
     NativeAdrenoTraceSectionJobs = 3,
-    NativeAdrenoTraceSectionEvents = 4
+    NativeAdrenoTraceSectionEvents = 4,
+    NativeAdrenoTraceSectionPerformance = 5,
+    NativeAdrenoTracePerformanceBusyValid = 1,
+    NativeAdrenoTracePerformanceBoost = 2,
+    NativeAdrenoTracePerformanceFixedFrequency = 4,
+    NativeAdrenoTracePerformancePendingWork = 8,
+    NativeAdrenoTracePerformanceVoteChanged = 16,
+    NativeAdrenoTracePerformanceThermalLimited = 32
 };
 
 /* NativeAdrenoTraceArgument carries a source-defined parameter key, its
@@ -115,7 +123,7 @@ typedef struct NativeAdrenoTraceStatus {
     uint32_t sample_count;
     uint32_t job_count;
     uint32_t event_count;        /* Total appended events for a stream; retained count otherwise. */
-    uint32_t sample_dropped;
+    uint32_t sample_dropped;     /* Counter and performance samples rejected at capacity. */
     uint32_t job_dropped;
     uint32_t event_dropped;
     uint32_t producer_dropped;
@@ -134,7 +142,7 @@ typedef struct NativeAdrenoTraceStatus {
     uint32_t producer_failed;
     uint32_t streaming;          /* StartStream enables live reads and acknowledgement reclamation. */
     uint32_t retained_events;    /* Events currently available in the fixed array or stream ring. */
-    uint32_t reserved;
+    uint32_t performance_count;  /* Section 5 has fixed 64-byte records; zero on older kernels. */
 } NativeAdrenoTraceStatus;
 
 typedef struct NativeAdrenoTraceProducer {
@@ -230,6 +238,26 @@ typedef struct NativeAdrenoTraceJob {
     uint32_t generation;
     uint32_t reserved;
 } NativeAdrenoTraceJob;
+
+/* NativeAdrenoTracePerformance records the service worker's completed busy
+ * window and frequency decision. timestamp_ns follows the HFI acknowledgement;
+ * busy_ticks and interval_ns describe the preceding counter-read interval.
+ * Capture endpoints repeat the current state with BusyValid cleared. */
+typedef struct NativeAdrenoTracePerformance {
+    uint64_t timestamp_ns;
+    uint64_t busy_ticks;
+    uint64_t interval_ns;
+    uint32_t acknowledged_hz;
+    uint32_t requested_hz;
+    uint32_t bandwidth_index;
+    uint32_t thermal_cap_hz;
+    int32_t temperature_millic;
+    uint32_t thermal_valid_mask;
+    uint32_t thermal_flags;
+    uint32_t busy_permille;
+    uint32_t flags;
+    uint32_t vote_status;
+} NativeAdrenoTracePerformance;
 
 /* NativeAdrenoTraceTcpHeader prefixes each request and response. All wire
  * integers are little endian. Requests use an ABI method and its exact input;

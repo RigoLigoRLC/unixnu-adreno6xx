@@ -3,6 +3,7 @@
 #define NATIVE_ADRENO_A6XX_GMU_H
 
 #include "NativeAdrenoA6xxPower.h"
+#include <IOKit/IOLocks.h>
 
 struct NativeAdrenoA6xxGmuBuffer {
     void *cpu;
@@ -23,15 +24,20 @@ struct NativeAdrenoA6xxGmuConfig {
  * start holds CM3 in reset while loading its TCM and mapped firmware segments,
  * initializes the A6xx HFI queues, configures the A660 RSCC program and the
  * AOP-owned PDC handoff, then requires real firmware acknowledgements for the
- * performance table, bandwidth table and core start. The final HFI vote fixes
- * the GPU at 315 MHz. poll reads the GMU fault registers and consumes bounded
- * response/debug queue contents while the service owns the running device.
+ * performance table, bandwidth table and core start. The boot vote requests
+ * 315 MHz. The service worker subsequently submits paired frequency and DDR
+ * votes through setPerformance. A mutex serializes votes, response draining,
+ * keepalive, performance OOB changes and shutdown. Each reply must echo the
+ * complete request header before the acknowledged level changes. poll reads
+ * GMU faults and consumes bounded response/debug queue contents.
  * The caller owns GPU/SMMU setup and retains every buffer until stop has
  * halted CM3 and GPU DMA has separately stopped. */
 class NativeAdrenoA6xxGmu final {
     NativeAdrenoA6xxGmuConfig config_{};
     NativeAdrenoA6xxReport report_{};
+    IOLock *lock_ = nullptr;
     uint32_t sequence_ = 0;
+    uint32_t acknowledgedPerformance_ = 0;
     bool attempted_ = false;
     bool running_ = false;
     bool performanceCountersRequested_ = false;
@@ -50,6 +56,7 @@ class NativeAdrenoA6xxGmu final {
     IOReturn health();
     void captureFaultQueue();
     void logGpuAccessState(const char *) const;
+    IOReturn releasePerformanceCountersLocked();
 
 public:
     enum Phase : uint32_t {
@@ -60,12 +67,14 @@ public:
 
     IOReturn start(const NativeAdrenoA6xxGmuConfig &);
     IOReturn keepAlive(bool);
+    IOReturn setPerformance(uint32_t level);
     /* The service worker owns the request from acknowledgement through release. */
     IOReturn acquirePerformanceCounters();
     IOReturn releasePerformanceCounters();
     IOReturn poll();
     IOReturn stop();
     bool running() const { return running_; }
+    uint32_t acknowledgedPerformance() const { return acknowledgedPerformance_; }
     const NativeAdrenoA6xxReport &report() const { return report_; }
 };
 

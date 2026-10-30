@@ -24,12 +24,17 @@ struct NativeAdrenoA6xxResources {
     uint32_t gpuInterrupt; // CP CACHE_FLUSH_TS and GPU fault interrupt.
     uint32_t smmuContextInterrupts[10]; // Hardware context-bank order.
     uint32_t chipId,gmemBytes,frequencyHz,highestBankBit;
+    uint32_t ddrType; // Firmware-reported DDR type selects the stock bandwidth table.
     uint32_t gpuBank,gpuAsid,gpuSlot,gpuSid,gpuSidMask;
     uint32_t gmuBank,gmuAsid,gmuSlot,gmuSid,gmuSidMask;
     uint32_t lpacBank,lpacAsid,lpacSlot,lpacSid,lpacSidMask;
 };
 
 extern "C" int native_adreno_a6xx_resources(NativeAdrenoA6xxResources *);
+/* The board returns its current GPU frequency cap and both TSENS readings'
+ * validity. The temperature is the hottest valid GPU sensor, in millidegrees C. */
+extern "C" uint32_t native_adreno_thermal_cap_hz(int32_t *temperatureMilliC,
+    uint32_t *validMask, uint32_t *flags);
 /* Registration keeps the GIC line disabled. The callback runs on the boot CPU
  * in primary interrupt context before EOI and must acknowledge its source.
  * The callback and context remain owned by the caller for the boot lifetime.

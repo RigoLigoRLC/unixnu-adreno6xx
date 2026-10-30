@@ -54,8 +54,23 @@ struct NativeAdrenoA6xxReport {
     uint32_t gmuFenceStatus;
 };
 
+/* NativeAdrenoA6xxOperatingPoint pairs each SM7325 speed-bin 117 frequency
+ * with its command-db voltage level and DDR7 bandwidth-table index. */
+struct NativeAdrenoA6xxOperatingPoint {
+    uint32_t frequencyHz;
+    uint32_t arcLevel;
+    uint32_t bandwidthIndex;
+};
+
+constexpr unsigned NativeAdrenoA6xxOperatingPointCount = 3;
+constexpr NativeAdrenoA6xxOperatingPoint NativeAdrenoA6xxOperatingPoints[] = {
+    {315000000, 64, 3},
+    {450000000, 128, 6},
+    {550000000, 192, 9}
+};
+
 /* NativeAdrenoA6xxTables contains the A660 HFI wire payloads. GPU entry zero
- * requests the off level; entry one requests 315 MHz at LOW_SVS. GMU entry one
+ * requests off; entries one through three request 315, 450 and 550 MHz. GMU entry one
  * requests 200 MHz at MIN_SVS. Power builds the ARC indexes and BCM commands
  * from the running SM7325 command database before changing a power register. */
 struct NativeAdrenoA6xxTables {
@@ -73,7 +88,7 @@ struct NativeAdrenoA6xxTables {
 /* NativeAdrenoA6xxPower owns the host votes that keep the GMU and SMMU alive.
  * enableCx reads command-db, disables ACD through AOP QMP, raises the parent
  * rails through an unused APPS DRV2 active TCS, and enables the Yupik clocks
- * and CX domain. The GMU subsequently controls the 315 MHz GPU clock through
+ * and CX domain. The GMU subsequently controls the GPU clock through
  * HFI. enableGx observes the GX power, GMU fence and GX clock state after the
  * GMU wake request. stop requires the caller to have stopped GPU and GMU DMA
  * first; host votes and mappings remain owned throughout this one-shot run. */
@@ -102,7 +117,7 @@ public:
         GmuClock, HubClock, GpuCcClocks, CxReady, GxDomain, GxReady, Stopped
     };
 
-    IOReturn enableCx(const NativeAdrenoA6xxIo &);
+    IOReturn enableCx(const NativeAdrenoA6xxIo &, uint32_t ddrType = 7);
     IOReturn enableGx();
     IOReturn stop(bool dmaStopped);
     const NativeAdrenoA6xxTables &tables() const { return tables_; }

@@ -17,6 +17,7 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOService.h>
 #include <kern/thread.h>
+#include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include <string.h>
 
@@ -37,9 +38,29 @@ volatile uint32_t native_adreno_a6xx_stats[24];
 }
 
 namespace {
+uint32_t performanceWake = 0;
+
+uint32_t performanceLevelFor(uint64_t frequencyHz)
+{
+    uint32_t level = 1;
+    while (level < NativeAdrenoA6xxOperatingPointCount &&
+        NativeAdrenoA6xxOperatingPoints[level - 1].frequencyHz < frequencyHz) {
+        ++level;
+    }
+
+    return level;
+}
+
 /* A642LState owns all mappings, contexts and DMA allocations for this boot.
  * A failed attempt retains them while the GMU and CP are stopped. The CPU
- * framebuffer continues independently of whether this object publishes a GPU. */
+ * framebuffer continues independently of whether this object publishes a GPU.
+ *
+ * Its hardware worker reads the GMU AO busy counter and selects an operating
+ * point every 16 ms. Ring publication only records submission time and wakes
+ * that worker after a 50 ms gap. The worker applies the board's temperature
+ * cap, waits for the paired frequency/DDR HFI acknowledgement, and sends the
+ * resulting state to the bounded capture recorder. The same worker owns fault
+ * shutdown and performance-counter OOB acquisition and release. */
 class A642LState final {
     OSSharedPtr<IOMemoryMap> maps_[NativeAdrenoA6xxDomains];
     OSSharedPtr<IOMemoryMap> zapMap_;
@@ -75,6 +96,20 @@ class A642LState final {
     uint32_t hardwareIrqFailed_=0;
     uint32_t watchedFence_=0;
     uint64_t watchedSince_=0;
+    uint64_t nextHealthPollUs_ = 0;
+    uint64_t nextPerformancePollUs_ = 0;
+    uint64_t lastPerformanceUs_ = 0;
+    uint64_t lastBusyTicks_ = 0;
+    uint64_t lastActiveUs_ = 0;
+    uint64_t continuousBusyUs_ = 0;
+    uint64_t boostUntilUs_ = 0;
+    uint64_t lastSubmissionUs_ = 0; // Ring publisher writes; hardware worker reads atomically.
+    uint32_t activityKick_ = 0;
+    uint32_t boostLevel_ = 1;
+    uint32_t fixedPerformanceLevel_ = 0;
+    uint32_t downWindows_ = 0;
+    uint32_t downHold_ = 0;
+    NativeAdrenoTracePerformance performance_{};
     unsigned gpuSlots_[2]{},gmuSlots_[2]{},lpacSlots_[2]{};
 
     static int read(void *,uint32_t,uint32_t,uint32_t *);
@@ -85,6 +120,8 @@ class A642LState final {
     static int writeWptr(void *,uint32_t);
     static int readGpuBusy(void *,uint32_t *);
     static int readAlwaysOn(void *, uint64_t *);
+    IOReturn readBusyTicks(uint64_t *);
+    IOReturn pollPerformance(bool pending);
     static IOReturn acquireProfileAccess(void *);
     static IOReturn releaseProfileAccess(void *);
     static bool profileAccessible(void *);
@@ -104,6 +141,8 @@ class A642LState final {
 public:
     IOReturn start();
     void poll();
+    uint32_t waitMilliseconds() const;
+    bool activityPending() const;
     void dump() const;
 };
 
@@ -208,6 +247,14 @@ int A642LState::writeWptr(void *cookie,uint32_t value)
                 IOLog("NativeAdrenoCp: WPTR acknowledged attempts=%u fence=%08x\n",attempt+1,fence);
             }
 
+            const uint64_t submittedUs = now(nullptr);
+            const uint64_t previousUs = __atomic_exchange_n(&self->lastSubmissionUs_,
+                submittedUs, __ATOMIC_RELAXED);
+            if (!previousUs || submittedUs - previousUs >= 50000) {
+                __atomic_store_n(&self->activityKick_, 1, __ATOMIC_RELEASE);
+                thread_wakeup(&performanceWake);
+            }
+
             return 0;
         }
 
@@ -221,6 +268,138 @@ int A642LState::writeWptr(void *cookie,uint32_t value)
 int A642LState::readGpuBusy(void *cookie,uint32_t *value)
 {
     return read(cookie,NativeAdrenoA6xxGmuRegisters,0x23b0c*4-0x6a000,value);
+}
+
+IOReturn A642LState::readBusyTicks(uint64_t *ticks)
+{
+    // XOCLK0 belongs to GMU AO and counts busy time at 19.2 MHz.
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        uint32_t before = 0;
+        uint32_t low = 0;
+        uint32_t after = 0;
+        if (read(this, NativeAdrenoA6xxGmuRegisters, 0x1f845 * 4 - 0x6a000, &before) ||
+            read(this, NativeAdrenoA6xxGmuRegisters, 0x1f844 * 4 - 0x6a000, &low) ||
+            read(this, NativeAdrenoA6xxGmuRegisters, 0x1f845 * 4 - 0x6a000, &after)) {
+            return kIOReturnIOError;
+        }
+        if (before == after) {
+            *ticks = uint64_t(after) << 32 | low;
+            return kIOReturnSuccess;
+        }
+    }
+
+    return kIOReturnIOError;
+}
+
+/* pollPerformance applies pandora_gpu.c's 16 ms, 50-percent busy policy to
+ * SM7325's three stock operating points. It raises to the lowest sufficient
+ * frequency with ten-percent headroom, delays a one-level decrease for four
+ * low-load windows, and preserves the activity boost for 50 ms. */
+IOReturn A642LState::pollPerformance(bool pending)
+{
+    uint64_t busyTicks = 0;
+    IOReturn status = readBusyTicks(&busyTicks);
+    if (status) {
+        return status;
+    }
+
+    const uint64_t currentUs = now(nullptr);
+    const uint64_t intervalNs = (currentUs - lastPerformanceUs_) * 1000;
+    const bool busyValid = lastPerformanceUs_ && intervalNs && busyTicks >= lastBusyTicks_;
+    const uint64_t deltaTicks = busyValid ? busyTicks - lastBusyTicks_ : 0;
+    const uint64_t busyNs = deltaTicks > intervalNs * 12 / 625 ?
+        intervalNs : deltaTicks * 625 / 12;
+    const uint32_t busyPermille = busyValid ? uint32_t(busyNs * 1000 / intervalNs) : 0;
+    const uint32_t currentLevel = gmu_.acknowledgedPerformance();
+    const uint32_t currentHz = NativeAdrenoA6xxOperatingPoints[currentLevel - 1].frequencyHz;
+    uint32_t wantedLevel = currentLevel;
+
+    const bool kicked = __atomic_exchange_n(&activityKick_, 0, __ATOMIC_ACQ_REL) != 0;
+    if (kicked) {
+        boostLevel_ = performanceLevelFor(uint64_t(currentHz) * 2);
+        boostUntilUs_ = currentUs + 50000;
+    }
+    const bool boosted = currentUs < boostUntilUs_;
+    const bool active = busyNs || pending;
+    if (busyValid) {
+        const uint64_t neededHz = uint64_t(busyPermille) * currentHz * 2 / 1000;
+        const uint32_t sufficientLevel = performanceLevelFor(neededHz * 11 / 10);
+        continuousBusyUs_ = busyPermille >= 950 ?
+            continuousBusyUs_ + intervalNs / 1000 : 0;
+        if (busyPermille > 850 || continuousBusyUs_ >= 50000) {
+            wantedLevel = NativeAdrenoA6xxOperatingPointCount;
+            downWindows_ = 0;
+        } else if (sufficientLevel > currentLevel) {
+            wantedLevel = sufficientLevel;
+            downWindows_ = 0;
+        } else if (active) {
+            if (currentLevel > 1 && neededHz * 10 <=
+                uint64_t(NativeAdrenoA6xxOperatingPoints[currentLevel - 2].frequencyHz) * 8) {
+                if (++downWindows_ >= 4 + downHold_) {
+                    wantedLevel = currentLevel - 1;
+                }
+            } else {
+                downWindows_ = 0;
+            }
+        } else if (currentUs - lastActiveUs_ >= 80000) {
+            wantedLevel = 1;
+            downWindows_ = 0;
+        }
+    }
+    if (active) {
+        lastActiveUs_ = currentUs;
+    }
+    if (boosted && wantedLevel < boostLevel_) {
+        wantedLevel = boostLevel_;
+    }
+    if (fixedPerformanceLevel_) {
+        wantedLevel = fixedPerformanceLevel_;
+    }
+
+    NativeAdrenoTracePerformance sample{};
+    sample.thermal_cap_hz = native_adreno_thermal_cap_hz(&sample.temperature_millic,
+        &sample.thermal_valid_mask, &sample.thermal_flags);
+    uint32_t capLevel = NativeAdrenoA6xxOperatingPointCount;
+    while (capLevel > 1 &&
+        NativeAdrenoA6xxOperatingPoints[capLevel - 1].frequencyHz > sample.thermal_cap_hz) {
+        --capLevel;
+    }
+    const bool thermalLimited = wantedLevel > capLevel;
+    if (thermalLimited) {
+        wantedLevel = capLevel;
+    }
+
+    sample.busy_ticks = deltaTicks;
+    sample.interval_ns = busyValid ? intervalNs : 0;
+    sample.busy_permille = busyPermille;
+    sample.requested_hz = NativeAdrenoA6xxOperatingPoints[wantedLevel - 1].frequencyHz;
+    sample.flags = (busyValid ? NativeAdrenoTracePerformanceBusyValid : 0) |
+        (boosted && !fixedPerformanceLevel_ ? NativeAdrenoTracePerformanceBoost : 0) |
+        (fixedPerformanceLevel_ ? NativeAdrenoTracePerformanceFixedFrequency : 0) |
+        (pending ? NativeAdrenoTracePerformancePendingWork : 0) |
+        (thermalLimited ? NativeAdrenoTracePerformanceThermalLimited : 0);
+
+    if (wantedLevel != currentLevel) {
+        status = gmu_.setPerformance(wantedLevel);
+        if (!status) {
+            sample.flags |= NativeAdrenoTracePerformanceVoteChanged;
+            downHold_ = wantedLevel > currentLevel ? 1 : 0;
+        }
+        downWindows_ = 0;
+    }
+    const uint32_t acknowledgedLevel = gmu_.acknowledgedPerformance();
+    const auto &acknowledged = NativeAdrenoA6xxOperatingPoints[acknowledgedLevel - 1];
+    sample.acknowledged_hz = acknowledged.frequencyHz;
+    sample.bandwidth_index = acknowledged.bandwidthIndex;
+    sample.vote_status = uint32_t(status);
+    sample.timestamp_ns = now(nullptr) * 1000;
+    performance_ = sample;
+    NativeAdrenoGpuProfile::recordPerformance(sample);
+
+    lastPerformanceUs_ = currentUs;
+    lastBusyTicks_ = busyTicks;
+    nextPerformancePollUs_ = currentUs + 16000;
+    return status;
 }
 
 bool A642LState::profileAccessible(void *cookie)
@@ -374,7 +553,7 @@ IOReturn A642LState::checkGpuTranslations()
 IOReturn A642LState::mapWindows()
 {
     if(native_adreno_a6xx_resources(&resources_) || resources_.chipId!=0x06030500 ||
-        resources_.gmemBytes!=0x80000 || resources_.frequencyHz!=315000000 ||
+        resources_.gmemBytes!=0x80000 || resources_.frequencyHz!=315000000 || resources_.ddrType!=7 ||
         resources_.gpuSidMask!=0x400 || resources_.gmuSidMask!=0x400 || resources_.lpacSidMask!=0x400 ||
         resources_.gpuSid>0xffff || resources_.gmuSid>0xffff ||
         resources_.lpacSid!=1 || resources_.gpuSid!=0 || resources_.gmuSid!=5 ||
@@ -932,6 +1111,16 @@ IOReturn A642LState::fail(IOReturn status)
 
 IOReturn A642LState::start()
 {
+    uint32_t fixedMhz = 0;
+    PE_parse_boot_argn("native-adreno-fixed-mhz", &fixedMhz, sizeof(fixedMhz));
+    if (fixedMhz) {
+        fixedPerformanceLevel_ = performanceLevelFor(uint64_t(fixedMhz) * 1000000);
+        if (NativeAdrenoA6xxOperatingPoints[fixedPerformanceLevel_ - 1].frequencyHz !=
+            uint64_t(fixedMhz) * 1000000) {
+            return fail(kIOReturnBadArgument);
+        }
+    }
+
     native_adreno_a6xx_stats[0]=1;
     native_adreno_control_update(1,0,"starting");
     IOLog("NativeAdrenoA6xx: mapping SM7325 board resources\n");
@@ -943,7 +1132,7 @@ IOReturn A642LState::start()
     native_adreno_control_update(2,0,"starting");
     IOLog("NativeAdrenoA6xx: enabling CX clocks and parent votes\n");
     const NativeAdrenoA6xxIo io{this,read,write,delay};
-    status=power_.enableCx(io);
+    status=power_.enableCx(io, resources_.ddrType);
     if(status) {
         return fail(status);
     }
@@ -999,6 +1188,16 @@ IOReturn A642LState::start()
     if(status) {
         return fail(status);
     }
+    lastActiveUs_ = now(nullptr);
+    __atomic_store_n(&activityKick_, 0, __ATOMIC_RELEASE);
+    status = pollPerformance(false);
+    if (status) {
+        return fail(status);
+    }
+    IOLog("NativeAdrenoDvfs: ready ddr=%u levels=315,450,550 interval_us=16000 fixed_mhz=%u ack_mhz=%u cap_mhz=%u\n",
+        resources_.ddrType, fixedMhz, performance_.acknowledged_hz / 1000000,
+        performance_.thermal_cap_hz / 1000000);
+
     ready_=true;
     native_adreno_a6xx_stats[0]=7;
     native_adreno_control_update(7,0,"ready");
@@ -1012,22 +1211,25 @@ void A642LState::poll()
         return;
     }
 
-    IOReturn gmuStatus=smmuProvider_.observe();
-    if(!gmuStatus) {
-        gmuStatus=gmu_.poll();
-    }
-    if(gmuStatus) {
-        ready_=false;
-        native_adreno_a6xx_stats[0]=8;
-        fail(gmuStatus);
-        return;
+    const uint64_t current = now(nullptr);
+    if (current >= nextHealthPollUs_) {
+        nextHealthPollUs_ = current + 10000;
+        IOReturn gmuStatus = smmuProvider_.observe();
+        if (!gmuStatus) {
+            gmuStatus = gmu_.poll();
+        }
+        if (gmuStatus) {
+            ready_ = false;
+            native_adreno_a6xx_stats[0] = 8;
+            fail(gmuStatus);
+            return;
+        }
     }
 
     const IOReturn status=__atomic_load_n(&hardwareIrqFailed_,__ATOMIC_ACQUIRE)?
         kIOReturnIOError:kIOReturnSuccess;
     uint32_t submitted=0,completed=0;
     const int progress=native_adreno_progress(&submitted,&completed);
-    const uint64_t current=now(nullptr);
     if(completed!=watchedFence_ || submitted==completed) {
         watchedFence_=completed;
         watchedSince_=current;
@@ -1040,12 +1242,43 @@ void A642LState::poll()
         return;
     }
 
+    if (current >= nextPerformancePollUs_ || activityPending()) {
+        const IOReturn performanceStatus = pollPerformance(submitted != completed);
+        if (performanceStatus) {
+            ready_ = false;
+            native_adreno_a6xx_stats[0] = 8;
+            fail(performanceStatus);
+            return;
+        }
+    }
+
     const IOReturn profileStatus = NativeAdrenoGpuProfile::poll();
     if (profileStatus) {
         ready_ = false;
         native_adreno_a6xx_stats[0] = 8;
         fail(profileStatus);
     }
+}
+
+uint32_t A642LState::waitMilliseconds() const
+{
+    if (!ready_) {
+        return 10;
+    }
+
+    const uint64_t current = now(nullptr);
+    const uint64_t deadline = nextHealthPollUs_ < nextPerformancePollUs_ ?
+        nextHealthPollUs_ : nextPerformancePollUs_;
+    if (deadline <= current) {
+        return 1;
+    }
+
+    return uint32_t((deadline - current + 999) / 1000);
+}
+
+bool A642LState::activityPending() const
+{
+    return ready_ && __atomic_load_n(&activityKick_, __ATOMIC_ACQUIRE) != 0;
 }
 
 void A642LState::dump() const
@@ -1061,6 +1294,11 @@ void A642LState::dump() const
     IOLog("NativeAdrenoA6xx: gmu=%u/%08x domain=%u offset=%x value=%x hfi=%x/%x ack=%u zap=%u scm=%lld/%lld\n",
         gmu.phase,gmu.status,gmu.domain,gmu.offset,gmu.value,gmu.hfiMessage,gmu.hfiError,
         gmu.acknowledged,zap_.phase(),zap_.transport(),zap_.result());
+    IOLog("NativeAdrenoDvfs: ack_hz=%u requested_hz=%u ddr_index=%u cap_hz=%u busy_permille=%u temperature_millic=%d thermal_valid=%x thermal_flags=%x flags=%x vote_status=%08x\n",
+        performance_.acknowledged_hz, performance_.requested_hz, performance_.bandwidth_index,
+        performance_.thermal_cap_hz, performance_.busy_permille, performance_.temperature_millic,
+        performance_.thermal_valid_mask, performance_.thermal_flags, performance_.flags,
+        performance_.vote_status);
     if(gmuContextReport_.step) {
         NativeAdrenoLogSmmuReport("gmu-retained",&gmuContextReport_);
     }
@@ -1119,7 +1357,13 @@ void hardwareWorker(void *,wait_result_t)
         return;
     }
     for(;;) {
-        IOSleep(10);
+        uint64_t deadline = 0;
+        clock_interval_to_deadline(state->waitMilliseconds(), NSEC_PER_MSEC, &deadline);
+        assert_wait_deadline(&performanceWake, THREAD_UNINT, deadline);
+        if (state->activityPending()) {
+            thread_wakeup(&performanceWake);
+        }
+        thread_block(THREAD_CONTINUE_NULL);
         state->poll();
     }
 }

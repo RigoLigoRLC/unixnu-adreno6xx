@@ -305,11 +305,14 @@ IOReturn NativeAdrenoA6xxPower::buildTables()
         return reject("required-resources", kIOReturnNotFound, ResourceCount, 0, seen, 0xff);
     }
 
-    uint32_t gpuVote;
+    uint32_t gpuVotes[NativeAdrenoA6xxOperatingPointCount]{};
     uint32_t gmuVote;
-    if (!arcVote(resources[0], resources[1], 64, &gpuVote)) {
-        return reject("gpu-arc-level", kIOReturnUnsupported, 0,
-            resources[0].auxiliaryOffset, little32(resources[0].auxiliary), 64);
+    for (unsigned index = 0; index < NativeAdrenoA6xxOperatingPointCount; ++index) {
+        const uint32_t level = NativeAdrenoA6xxOperatingPoints[index].arcLevel;
+        if (!arcVote(resources[0], resources[1], level, &gpuVotes[index])) {
+            return reject("gpu-arc-level", kIOReturnUnsupported, 0,
+                resources[0].auxiliaryOffset, little32(resources[0].auxiliary), level);
+        }
     }
     if (!arcVote(resources[2], resources[1], 48, &gmuVote)) {
         return reject("gmu-arc-level", kIOReturnUnsupported, 2,
@@ -341,24 +344,30 @@ IOReturn NativeAdrenoA6xxPower::buildTables()
     tables_.gfxAddress = resources[0].address;
     tables_.xoAddress = resources[7].address;
     tables_.cxIndex = gmuVote & 0xff;
-    tables_.gfxIndex = gpuVote & 0xff;
-    tables_.mxIndex = (gpuVote >> 8) & 0xff;
+    tables_.gfxIndex = gpuVotes[0] & 0xff;
+    tables_.mxIndex = (gpuVotes[0] >> 8) & 0xff;
     if (((gmuVote >> 8) & 0xff) > tables_.mxIndex) {
         tables_.mxIndex = (gmuVote >> 8) & 0xff;
     }
 
-    tables_.performance[0] = 2;
+    tables_.performance[0] = NativeAdrenoA6xxOperatingPointCount + 1;
     tables_.performance[1] = 2;
     tables_.performance[3] = 0xffffffff;
-    tables_.performance[5] = gpuVote;
-    tables_.performance[6] = 0xffffffff;
-    tables_.performance[7] = 315000;
+    for (unsigned index = 0; index < NativeAdrenoA6xxOperatingPointCount; ++index) {
+        const unsigned offset = 5 + index * 3;
+        tables_.performance[offset] = gpuVotes[index];
+        tables_.performance[offset + 1] = 0xffffffff;
+        tables_.performance[offset + 2] = NativeAdrenoA6xxOperatingPoints[index].frequencyHz / 1000;
+    }
     tables_.performance[52] = gmuVote;
     tables_.performance[53] = 200000;
 
-    // The first four stock DDR levels are shared by the DDR7 and DDR8 tables.
-    static const uint32_t bandwidths[] = {0, 0x0bebc2, 0x1ae1b6, 0x209a8e};
-    tables_.bandwidth[0] = 4;
+    // Yupik's DDR7 table expresses four-byte transfers in KiB/s.
+    static const uint32_t ddrMegahertz[] = {
+        0, 200, 451, 547, 681, 768, 1017, 1353, 1555, 1708, 2092, 2133
+    };
+    constexpr unsigned bandwidthCount = sizeof(ddrMegahertz) / sizeof(ddrMegahertz[0]);
+    tables_.bandwidth[0] = bandwidthCount;
     tables_.bandwidth[1] = 1;
     tables_.bandwidth[2] = 3;
     tables_.bandwidth[3] = 1;
@@ -373,9 +382,10 @@ IOReturn NativeAdrenoA6xxPower::buildTables()
         if (commit) {
             tables_.bandwidth[4] |= Bit(index);
         }
-        for (unsigned level = 0; level < 4; ++level) {
+        for (unsigned level = 0; level < bandwidthCount; ++level) {
+            const uint32_t bandwidth = uint64_t(ddrMegahertz[level]) * 1000000 * 4 / 1024;
             tables_.bandwidth[31 + level * 8 + index] = bcmVote(resource,
-                index == 0 ? 16 : 4, bandwidths[level], commit, index == 2);
+                index == 0 ? 16 : 4, bandwidth, commit, index == 2);
         }
     }
 
@@ -648,9 +658,9 @@ IOReturn NativeAdrenoA6xxPower::setSource(uint32_t command, uint32_t configurati
     return poll(NativeAdrenoA6xxGpuCc, command, 1, 0, 1000);
 }
 
-IOReturn NativeAdrenoA6xxPower::enableCx(const NativeAdrenoA6xxIo &io)
+IOReturn NativeAdrenoA6xxPower::enableCx(const NativeAdrenoA6xxIo &io, uint32_t ddrType)
 {
-    if (cxReady_ || !io.read32 || !io.write32 || !io.delayUs) {
+    if (cxReady_ || !io.read32 || !io.write32 || !io.delayUs || ddrType != 7) {
         return kIOReturnBadArgument;
     }
     io_ = io;

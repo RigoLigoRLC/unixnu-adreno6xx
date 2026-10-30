@@ -10,6 +10,26 @@ constexpr uint32_t QueueOffset = 0x350;
 constexpr uint32_t QueueWords = 1024;
 constexpr uint32_t QueueTableWords = 210;
 
+/* GmuLock holds the GMU transaction mutex until the public operation returns. */
+class GmuLock final {
+    IOLock *lock_;
+
+public:
+    explicit GmuLock(IOLock *lock) : lock_(lock)
+    {
+        if (lock_) {
+            IOLockLock(lock_);
+        }
+    }
+
+    ~GmuLock()
+    {
+        if (lock_) {
+            IOLockUnlock(lock_);
+        }
+    }
+};
+
 uint32_t gmuOffset(uint32_t index)
 {
     return index * 4 - GmuWindowOffset;
@@ -359,7 +379,7 @@ IOReturn NativeAdrenoA6xxGmu::clearQueueInterrupts()
     return kIOReturnSuccess;
 }
 
-IOReturn NativeAdrenoA6xxGmu::drainQueue(unsigned queue, uint32_t expectedSequence,
+IOReturn NativeAdrenoA6xxGmu::drainQueue(unsigned queue, uint32_t expectedHeader,
     bool *acknowledged, uint32_t *returned)
 {
     if (queue < 1 || queue > 2) {
@@ -443,7 +463,7 @@ IOReturn NativeAdrenoA6xxGmu::drainQueue(unsigned queue, uint32_t expectedSequen
                     queue, messageHeader, message[1]);
                 return report_.status;
             }
-            if (expectedSequence && (message[1] >> 20) == expectedSequence) {
+            if (expectedHeader && message[1] == expectedHeader) {
                 if (acknowledged && !*acknowledged) {
                     *acknowledged = true;
                     ++report_.acknowledged;
@@ -452,8 +472,8 @@ IOReturn NativeAdrenoA6xxGmu::drainQueue(unsigned queue, uint32_t expectedSequen
                     *returned = message[3];
                 }
             } else {
-                IOLog("NativeAdrenoGmu: HFI unmatched ACK queue=%u request=%08x expected_sequence=%u\n",
-                    queue, message[1], expectedSequence);
+                IOLog("NativeAdrenoGmu: HFI unmatched ACK queue=%u request=%08x expected=%08x\n",
+                    queue, message[1], expectedHeader);
             }
         } else if (id == 101 && words >= 4) {
             IOLog("NativeAdrenoGmu: HFI debug queue=%u type=%08x timestamp=%08x data=%08x\n",
@@ -557,7 +577,7 @@ IOReturn NativeAdrenoA6xxGmu::exchange(uint32_t id, const uint32_t *payload,
             return result;
         }
         bool acknowledged = false;
-        result = drainQueue(1, sequence_, &acknowledged, returned);
+        result = drainQueue(1, sent, &acknowledged, returned);
         if (result || acknowledged) {
             return result;
         }
@@ -588,10 +608,23 @@ IOReturn NativeAdrenoA6xxGmu::start(const NativeAdrenoA6xxGmuConfig &config)
         }
     }
     if (config.buffers[4].bytes < 0x4000 || config.buffers[3].bytes > 0x100000 ||
-        config.tables->performance[0] != 2 || config.tables->performance[1] != 2 ||
-        config.tables->performance[7] != 315000 || config.tables->performance[53] != 200000) {
+        config.tables->performance[0] != NativeAdrenoA6xxOperatingPointCount + 1 ||
+        config.tables->performance[1] != 2 || config.tables->performance[53] != 200000 ||
+        config.tables->bandwidth[0] != 12) {
         return kIOReturnBadArgument;
     }
+    for (unsigned index = 0; index < NativeAdrenoA6xxOperatingPointCount; ++index) {
+        if (config.tables->performance[7 + index * 3] !=
+            NativeAdrenoA6xxOperatingPoints[index].frequencyHz / 1000) {
+            return kIOReturnBadArgument;
+        }
+    }
+
+    lock_ = IOLockAlloc();
+    if (!lock_) {
+        return kIOReturnNoMemory;
+    }
+    GmuLock lock(lock_);
 
     config_ = config;
     attempted_ = true;
@@ -679,6 +712,7 @@ IOReturn NativeAdrenoA6xxGmu::start(const NativeAdrenoA6xxGmuConfig &config)
     if (result) {
         return result;
     }
+    acknowledgedPerformance_ = 1;
     report_.phase = GpuWake;
     result = gmuWrite(0x1f994, uint32_t(1) << 30);
     if (result) {
@@ -719,6 +753,7 @@ IOReturn NativeAdrenoA6xxGmu::start(const NativeAdrenoA6xxGmuConfig &config)
 
 IOReturn NativeAdrenoA6xxGmu::keepAlive(bool enabled)
 {
+    GmuLock lock(lock_);
     if (report_.status) {
         return report_.status;
     }
@@ -736,8 +771,40 @@ IOReturn NativeAdrenoA6xxGmu::keepAlive(bool enabled)
     return result;
 }
 
+IOReturn NativeAdrenoA6xxGmu::setPerformance(uint32_t level)
+{
+    GmuLock lock(lock_);
+    if (report_.status) {
+        return report_.status;
+    }
+    if (!running_) {
+        return kIOReturnNotReady;
+    }
+    if (!level || level > NativeAdrenoA6xxOperatingPointCount) {
+        return kIOReturnBadArgument;
+    }
+    if (level == acknowledgedPerformance_) {
+        return kIOReturnSuccess;
+    }
+
+    report_.phase = PerformanceVote;
+    const uint32_t payload[] = {
+        1, level, NativeAdrenoA6xxOperatingPoints[level - 1].bandwidthIndex
+    };
+    const IOReturn result = exchange(30, payload, 3);
+    if (result) {
+        report_.status = result;
+        return result;
+    }
+
+    acknowledgedPerformance_ = level;
+    report_.phase = Ready;
+    return kIOReturnSuccess;
+}
+
 IOReturn NativeAdrenoA6xxGmu::acquirePerformanceCounters()
 {
+    GmuLock lock(lock_);
     if (report_.status) {
         return report_.status;
     }
@@ -777,7 +844,7 @@ IOReturn NativeAdrenoA6xxGmu::acquirePerformanceCounters()
         result = clearStatus;
     }
     if (result) {
-        releasePerformanceCounters();
+        releasePerformanceCountersLocked();
         report_.status = result;
     }
 
@@ -785,6 +852,12 @@ IOReturn NativeAdrenoA6xxGmu::acquirePerformanceCounters()
 }
 
 IOReturn NativeAdrenoA6xxGmu::releasePerformanceCounters()
+{
+    GmuLock lock(lock_);
+    return releasePerformanceCountersLocked();
+}
+
+IOReturn NativeAdrenoA6xxGmu::releasePerformanceCountersLocked()
 {
     if (!performanceCountersRequested_) {
         return kIOReturnSuccess;
@@ -801,6 +874,7 @@ IOReturn NativeAdrenoA6xxGmu::releasePerformanceCounters()
 
 IOReturn NativeAdrenoA6xxGmu::poll()
 {
+    GmuLock lock(lock_);
     if (report_.status) {
         return report_.status;
     }
@@ -831,6 +905,7 @@ IOReturn NativeAdrenoA6xxGmu::poll()
 
 IOReturn NativeAdrenoA6xxGmu::stop()
 {
+    GmuLock lock(lock_);
     if (!attempted_) {
         return kIOReturnNotReady;
     }

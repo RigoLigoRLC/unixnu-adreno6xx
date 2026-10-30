@@ -27,6 +27,8 @@ class NativeAdrenoGpuProfile final {
 public:
     static IOReturn initialize(const NativeAdrenoRingIo *, const NativeAdrenoGpuProfileAccess &);
     static IOReturn poll();
+    /* The service worker supplies the completed GMU vote and busy window. */
+    static void recordPerformance(const NativeAdrenoTracePerformance &);
     static void fault();
     /* The service calls this only after GMU reset has revoked hardware access. */
     static void hardwareStopped();

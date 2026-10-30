@@ -66,6 +66,35 @@ transitions during allocation and release. BO allocation has no WC option.
 Imported Device or unrecognized page attributes are refused at import; RT pages
 are accepted as Normal NC only under the board's managed-RT boot policy.
 
+## GPU frequency and bandwidth
+
+The service boots at 315 MHz and then selects 315, 450 or 550 MHz from the stock
+SM7325 speed-bin 117 table. Power resolves voltage levels 64, 128 and 192 through
+the live command database. It builds all 12 DDR7 bandwidth levels from Yupik's
+stock table and pairs GPU levels with DDR indexes 3, 6 and 9. The board supplies
+DDR type 7. Each runtime HFI vote carries both indexes; the GMU transaction mutex
+serializes that request with queue polling, OOB changes and shutdown. Only an
+ACK echoing the complete request header changes the acknowledged frequency.
+Failed votes enter the existing service hardware-fault shutdown.
+
+The hardware worker reads GMU AO XOCLK0 at `0x1f844/0x1f845` using high/low/high
+reads every 16 ms. These ticks count GPU busy time at 19.2 MHz. It targets 50%
+busy, selects the lowest sufficient frequency with 10% headroom, and delays a
+one-level decrease for four low-load windows, or five following an increase.
+A window above 85% busy, or 50 ms continuously at least 95% busy, requests 550 MHz.
+After 80 ms idle it returns to 315 MHz. A submission following a 50 ms gap wakes
+the worker and requests the lowest level at least twice the current frequency,
+capped at 550 MHz, for 50 ms. This policy follows Data A Live's
+`wsl/pandora_gpu.c` at commit `a4173581595e63808a1c8f0742e7da838ecf27f6`,
+adapted to the A642L register map and its three valid operating points.
+
+The board's `native_adreno_thermal_cap_hz` supplies the temperature cap, hottest
+GPU sensor and validity state. Its cap applies after automatic selection,
+activity boost and the `native-adreno-fixed-mhz=315`, `=450` or `=550` boot
+override. Zero or an omitted override enables automatic selection. The `gpu`
+dump prints acknowledged/requested Hz, DDR index, busy fraction and thermal
+state. The driver retains the existing GMU keepalive throughout operation.
+
 ## Bounded GPU hardware capture
 
 `native_adreno_gpu_profile_start(20000)` requests a 20-second window.
@@ -89,8 +118,8 @@ The selectors are configured once before SQE starts, while the worker holds
 the same OOB request. During capture it reads only the RBBM counter values;
 SP, TP, RB and other unit selectors are not reread. The GX power and AHB fence
 checks reject inaccessible hardware while the acknowledged request remains
-held. This window prevents autonomous GPU power collapse; it retains the
-existing fixed GPU frequency.
+held. This window prevents autonomous GPU power collapse while the frequency
+governor continues applying paired frequency and bandwidth votes.
 
 USB and submission callbacks only update the recorder's bounded state under
 its lock. That lock is released before GMU handshakes, sampling, hardware
@@ -111,7 +140,8 @@ the CP clock at `0x980`. Queue ticks measure issue to CP arrival;
 RB ticks measure CP arrival to RB completion, including overlap with other
 pipeline work. These values use the common 19.2 MHz clock and its low 32 bits,
 with modular differences below 2^31 ticks. The capture inserts no WFI.
-Inactive capture adds no GPU packets or periodic register reads.
+Inactive capture adds no GPU packets or graphics-counter reads. The governor's
+GMU AO busy reads continue independently of the capture window.
 
 These operations follow the Samsung SM7325 kernel's
 `drivers/gpu/msm/adreno_perfcounter.c:adreno_perfcounter_read_group`,
@@ -164,6 +194,14 @@ traces to retire and flush. Recorded commands that were never submitted are
 counted separately. GMEM points copied during binning or sysmem execution are
 excluded using the recorded execution mode. Other missing timestamps retain
 the Invalid flag. Final records distinguish budget, queue and append losses.
+
+Section 5 retains up to 4096 fixed 64-byte frequency records. The existing
+status record's last word is `performance_count`; earlier kernels return zero.
+Each 16 ms record contains the acknowledged/requested frequency, DDR index,
+temperature cap, sensor validity, busy ticks and interval, plus mode flags and
+the HFI result. Capture start and stop append current state with busy validity
+cleared. Capacity losses contribute to `sample_dropped`. Busy measurements end
+at the AO read; the record timestamp follows any HFI acknowledgement.
 
 The device's USB network helper exposes Query, Control and Read on
 `192.168.73.2:1235`, admitting only the USB host at `192.168.73.1`. Its IOKit
