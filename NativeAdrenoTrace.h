@@ -298,4 +298,11 @@ enum {
     NativeAdrenoTraceArgCopyBatchedDraws = 38 /* Multi-blit draws included in DrawCount. */
 };
 
+/* Copy END flags identify every execution path used across its regions. */
+enum {
+    NativeAdrenoTraceCopyLegacy = 1u << 16,
+    NativeAdrenoTraceCopyRowMultiBlit = 2u << 16,
+    NativeAdrenoTraceCopyBufferFetchRectangle = 4u << 16
+};
+
 #endif
