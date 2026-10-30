@@ -293,7 +293,9 @@ enum {
     NativeAdrenoTraceArgBudgetBytes = 33,
     NativeAdrenoTraceArgSourceBuffer = 34,
     NativeAdrenoTraceArgDestinationImage = 35,
-    NativeAdrenoTraceArgCopyOperation = 36
+    NativeAdrenoTraceArgCopyOperation = 36,
+    NativeAdrenoTraceArgCopyRows = 37, /* Total copied rows across regions and layers. */
+    NativeAdrenoTraceArgCopyBatchedDraws = 38 /* Multi-blit draws included in DrawCount. */
 };
 
 #endif
