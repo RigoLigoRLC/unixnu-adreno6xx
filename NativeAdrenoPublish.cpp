@@ -100,6 +100,9 @@ volatile bool gPollerStarted=false;
 class AGXDeviceUserClient;
 /* The render server's connection serves the mailbox; it is retained while set (under g.lock), so the poller never runs on a freed object. */
 static AGXDeviceUserClient *gMailboxOwner=nullptr;
+// Each queued client owns a retain until its GPU and scanout references retire.
+static AGXDeviceUserClient *closingClients[NativeAdrenoMaxClients + 1]{};
+static void retryClosingClients();
 void nativeAdrenoMailboxPoller(void *,wait_result_t);
 static IOReturn runCore(AGXDeviceUserClient *,uint32_t method,const void *input,size_t input_size,void *output,size_t output_size);
 static uint32_t activeCoreCalls[NativeAdrenoMethodGetResourceBudget+1]{};
@@ -201,6 +204,7 @@ void completionWorker(thread_call_param_t,thread_call_param_t)
         IOLockWakeup(g.lock,read,false);
     }
     IOLockUnlock(g.lock);
+    retryClosingClients();
 }
 
 /* BoProfileRecords retains one Vulkan device's counters, bins and slow events.
@@ -525,6 +529,9 @@ class AGXDeviceUserClient : public IOUserClient {
     OSDeclareDefaultStructors(AGXDeviceUserClient)
     bool live_=false;
     bool closing_=false;
+    bool closeDeferred_ = false;
+    bool closeRetryReported_ = false;
+    IOReturn closeStatus_ = kIOReturnSuccess;
     IOReturn viewTeardownStatus_=kIOReturnSuccess;
     bool handoffOnly_=false;
     bool kernel_=false;
@@ -559,6 +566,7 @@ class AGXDeviceUserClient : public IOUserClient {
     IOReturn mapCpu(const NativeAdrenoAbiBoCpuMapV2 &,NativeAdrenoAbiBoCpuMapV2Reply &);
     IOReturn unmapCpu(const NativeAdrenoAbiBoCpuUnmapV2 &);
     IOReturn dropCpuMappings();
+    IOReturn finishCloseLocked();
     static IOReturn action(OSObject *target,void *reference,IOExternalMethodArguments *arguments);
     IOReturn run(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size);
 public:
@@ -568,12 +576,30 @@ public:
     friend IOReturn runCore(AGXDeviceUserClient *,uint32_t,const void *,size_t,void *,size_t);
     friend void nativeAdrenoMailboxPoller(void *,wait_result_t);
     IOReturn clientClose() APPLE_KEXT_OVERRIDE;
+    void retryClose();
     void free() APPLE_KEXT_OVERRIDE;
     IOReturn clientMemoryForType(UInt32 type,IOOptionBits *options,IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
     IOReturn externalMethod(uint32_t selector,IOExternalMethodArguments *arguments,
         IOExternalMethodDispatch *dispatch,OSObject *target,void *reference) APPLE_KEXT_OVERRIDE;
 };
 OSDefineMetaClassAndStructors(AGXDeviceUserClient,IOUserClient)
+
+static void retryClosingClients()
+{
+    for (unsigned index = 0; index < NativeAdrenoMaxClients + 1; ++index) {
+        IOLockLock(g.lock);
+        AGXDeviceUserClient *client = closingClients[index];
+        if (client) {
+            client->retain();
+        }
+        IOLockUnlock(g.lock);
+
+        if (client) {
+            client->retryClose();
+            client->release();
+        }
+    }
+}
 
 /* NativeAdrenoControl accepts the administrator's first hardware start
  * request after userspace has connected USB. Its properties report progress;
@@ -1012,9 +1038,74 @@ IOReturn AGXDeviceUserClient::dropCpuMappings()
     }
 }
 
+IOReturn AGXDeviceUserClient::finishCloseLocked()
+{
+    if (!live_) {
+        return kIOReturnSuccess;
+    }
+
+    const uint64_t peak = core_->windowPeak();
+    const IOReturn status = core_->releaseAll(&g.clock, 0);
+    closeStatus_ = status;
+    if (status) {
+        return status;
+    }
+
+    live_ = false;
+    if (kernel_) {
+        g.kernel_client = false;
+    } else if (slot_ < NativeAdrenoMaxClients) {
+        g.slots[slot_] = false;
+        memset(g.slot_names[slot_], 0, sizeof(g.slot_names[slot_]));
+    }
+    ++g.closed;
+    native_adreno_metal_diag.closes = native_adreno_metal_diag.closes + 1;
+    if (NativeAdrenoClientRecord *record = kernel_ ? nullptr : clientRecord(name_)) {
+        record->closes = record->closes + 1;
+        record->slot = 0xff;
+        if ((peak >> 20) > record->peak_mib) {
+            record->peak_mib = uint32_t(peak >> 20);
+        }
+    }
+    return kIOReturnSuccess;
+}
+
+void AGXDeviceUserClient::retryClose()
+{
+    IOLockLock(g.lock);
+    const IOReturn previous = closeStatus_;
+    const bool finished = closeDeferred_ && !viewTeardownStatus_ && !finishCloseLocked();
+    const IOReturn status = closeStatus_;
+    const size_t remaining = live_ ? core_->liveObjects() : 0;
+    const bool reportFailure = !finished && status != previous && !closeRetryReported_;
+    if (reportFailure) {
+        closeRetryReported_ = true;
+    }
+    if (finished) {
+        closingClients[kernel_ ? NativeAdrenoMaxClients : slot_] = nullptr;
+        closeDeferred_ = false;
+    }
+    IOLockUnlock(g.lock);
+
+    if (finished) {
+        IOLog("NativeAdrenoClose: client=%.*s slot=%u phase=retired status=00000000 remaining=0\n",
+            20, name_, slot_);
+        terminate();
+        release();
+    } else if (reportFailure) {
+        IOLog("NativeAdrenoClose: client=%.*s slot=%u phase=retry status=%08x remaining=%zu\n",
+            20, name_, slot_, unsigned(status), remaining);
+    }
+}
+
 IOReturn AGXDeviceUserClient::clientClose()
 {
     IOLockLock(g.lock);
+    if (closing_) {
+        const IOReturn status = live_ ? kIOReturnBusy : kIOReturnSuccess;
+        IOLockUnlock(g.lock);
+        return status;
+    }
     closing_=true;
     NativeAdrenoGpuProfile::closeProducers(uint64_t(this));
     if(live_) {
@@ -1041,38 +1132,26 @@ IOReturn AGXDeviceUserClient::clientClose()
     IOLockUnlock(legacyCpuLock_);
     IOLockLock(g.lock);
     if(!status && live_) {
-        const uint64_t peak=core_->windowPeak();
-        uint64_t deadline=0;
-        clock_interval_to_deadline(2000,kMillisecondScale,&deadline);
-        for(;;) {
-            status=core_->releaseAll(&g.clock,0);
-            if((status!=kIOReturnTimeout && status!=kIOReturnBusy) || g.failed) {
-                break;
-            }
-            if(IOLockSleepDeadline(g.lock,&g.completionEvent,deadline,THREAD_ABORTSAFE)!=THREAD_AWAKENED) {
-                status=kIOReturnTimeout;
-                break;
-            }
-        }
-        /* A failed teardown leaves the objects live and the slot taken: nothing is forced or reused. */
-        if(!status) {
-            live_=false;
-            if(kernel_) {
-                g.kernel_client=false;
-            } else if(slot_<NativeAdrenoMaxClients) {
-                g.slots[slot_]=false;
-                memset(g.slot_names[slot_],0,sizeof(g.slot_names[slot_]));
-            }
-            ++g.closed;native_adreno_metal_diag.closes=native_adreno_metal_diag.closes+1;
-            if(NativeAdrenoClientRecord *record=kernel_?nullptr:clientRecord(name_)) {
-                record->closes=record->closes+1;record->slot=0xff;
-                if(peak>>20>record->peak_mib)record->peak_mib=uint32_t(peak>>20);
-            }
-        }
+        status = finishCloseLocked();
+    }
+    const bool deferred = live_;
+    const size_t remaining = deferred ? core_->liveObjects() : 0;
+    if (deferred) {
+        closeStatus_ = status;
+        retain();
+        closingClients[kernel_ ? NativeAdrenoMaxClients : slot_] = this;
+        closeDeferred_ = true;
     }
     IOLockUnlock(g.lock);
+
+    IOLog("NativeAdrenoClose: client=%.*s slot=%u phase=%s status=%08x remaining=%zu\n",
+        20, name_, slot_, deferred ? "deferred" : "closed", unsigned(status), remaining);
     if(mailbox)mailbox->release();
-    if(!status)terminate();
+    if (!status) {
+        terminate();
+    } else if (deferred) {
+        thread_call_enter(g.completionCall);
+    }
     return status;
 }
 void AGXDeviceUserClient::free()
@@ -1087,7 +1166,7 @@ void AGXDeviceUserClient::free()
         cpuMappings_=nullptr;
     }
     if(!status && views_) {IODelete(views_,View,MaxViews);views_=nullptr;}
-    /* Still live only when a teardown failed: its objects stay referenced by the VM and the ring, so the core is kept, not freed. */
+    // The deferred-close retain keeps this client alive until every BO retires.
     if(core_ && !live_) {delete core_;core_=nullptr;}
     if(legacyCpuLock_) {
         IOLockFree(legacyCpuLock_);
@@ -2245,6 +2324,7 @@ extern "C" void native_adreno_surface_release_read(NativeAdrenoSurfaceRead *read
     scheduler->releaseRead(read);
     IOLockWakeup(g.lock,&g.completionEvent,false);
     IOLockUnlock(g.lock);
+    thread_call_enter(g.completionCall);
 }
 
 static IOReturn pollSurfaceProducerLocked(uint32_t fence)

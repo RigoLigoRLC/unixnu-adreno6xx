@@ -192,20 +192,42 @@ IOReturn NativeAdrenoUserClient::close()
 }
 IOReturn NativeAdrenoUserClient::releaseAll(const NativeAdrenoRingClock *clock,uint32_t timeout_us)
 {
-    if(!open_)return kIOReturnNotReady;
-    if(!clock)return kIOReturnBadArgument;
-    IOReturn status=(scoped_ || used_)?submit_->waitRange(queue_base_,NativeAdrenoAbiMaxQueues,clock,timeout_us):kIOReturnSuccess;
-    if(status)return status;
-    for(size_t index=0;index<entry_count_;++index) {
-        Entry &entry=entries_[index];
-        if(!entry.used)continue;
-        entry.mapping_leases=0;
-        entry.controlled_mapping_leases=0;
-        NativeAdrenoAbiBoFree request{entry.handle};
-        status=freeBo(&request);
-        if(status)return status;
+    if (!open_) {
+        return kIOReturnNotReady;
     }
-    for(size_t i=1;i<NativeAdrenoAbiMaxQueues;++i)queues_[i]=Queue{};
+    if (!clock) {
+        return kIOReturnBadArgument;
+    }
+
+    IOReturn pending = (scoped_ || used_) ?
+        submit_->waitRange(queue_base_, NativeAdrenoAbiMaxQueues, clock, timeout_us) :
+        kIOReturnSuccess;
+    if (pending && pending != kIOReturnTimeout && pending != kIOReturnBusy) {
+        return pending;
+    }
+
+    // A scanout reader can keep one BO busy after the GPU has finished. Each
+    // remaining BO must still release its own descriptor and imported UPLs.
+    for (size_t index = 0; index < entry_count_; ++index) {
+        Entry &entry = entries_[index];
+        if (!entry.used) {
+            continue;
+        }
+        entry.mapping_leases = 0;
+        entry.controlled_mapping_leases = 0;
+        NativeAdrenoAbiBoFree request{entry.handle};
+        const IOReturn status = freeBo(&request);
+        if (status && (!pending || pending == kIOReturnTimeout || pending == kIOReturnBusy)) {
+            pending = status;
+        }
+    }
+
+    if (pending) {
+        return pending;
+    }
+    for (size_t index = 1; index < NativeAdrenoAbiMaxQueues; ++index) {
+        queues_[index] = Queue{};
+    }
     return close();
 }
 NativeAdrenoMemory *NativeAdrenoUserClient::memoryForToken(uint32_t token)
