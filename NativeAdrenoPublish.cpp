@@ -1754,7 +1754,9 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
         {&action,0,sizeof(NativeAdrenoTraceProducer),0,sizeof(NativeAdrenoTraceProducer)},
         {&action,0,sizeof(NativeAdrenoTraceProducer),0,0},
         {&action,0,sizeof(NativeAdrenoTraceStreamRead),0,sizeof(NativeAdrenoTraceStreamChunk)},
-        {&action,0,sizeof(NativeAdrenoTraceStreamRead),0,0}};
+        {&action,0,sizeof(NativeAdrenoTraceStreamRead),0,0},
+        {&action,0,sizeof(NativeAdrenoTraceCaptureControl),0,sizeof(NativeAdrenoTraceStatus)},
+        {&action,0,0,0,sizeof(NativeAdrenoTraceCaptureOptions)}};
     __atomic_fetch_add(&native_adreno_metal_diag.ext_entries,1,__ATOMIC_RELAXED);
     if(selector<256) {
         __atomic_fetch_or(&native_adreno_metal_diag.sel_bits[selector>>5],1u<<(selector&31),__ATOMIC_RELAXED);
