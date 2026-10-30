@@ -39,6 +39,11 @@ public:
         uint64_t completion);
     static IOReturn queryTrace(NativeAdrenoTraceStatus *);
     static IOReturn controlTrace(const NativeAdrenoTraceControl *, NativeAdrenoTraceStatus *);
+    static IOReturn controlCapture(const NativeAdrenoTraceCaptureControl *, NativeAdrenoTraceStatus *);
+    static IOReturn queryCaptureOptions(NativeAdrenoTraceCaptureOptions *);
+    /* The service worker applies this policy before starting capture and
+     * retains it until the captured jobs release their hardware ownership. */
+    static bool captureFrequency(uint32_t *frequencyHz);
     static IOReturn readTrace(const NativeAdrenoTraceRead *, NativeAdrenoTraceChunk *);
     static IOReturn readTraceStream(const NativeAdrenoTraceStreamRead *, NativeAdrenoTraceStreamChunk *);
     static IOReturn ackTraceStream(const NativeAdrenoTraceStreamRead *);

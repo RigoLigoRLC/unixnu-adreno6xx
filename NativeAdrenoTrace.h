@@ -14,10 +14,13 @@ enum {
     NativeAdrenoMethodEndTraceProducer = 38,
     NativeAdrenoMethodReadTraceStream = 39,
     NativeAdrenoMethodAckTraceStream = 40,
+    NativeAdrenoMethodControlCapture = 41,
+    NativeAdrenoMethodQueryCaptureOptions = 42,
     NativeAdrenoTraceEventCapacity = 131072,
     NativeAdrenoTraceBatchEvents = 8,
     NativeAdrenoTraceChunkBytes = 1536,
     NativeAdrenoTraceCounterCount = 29,
+    NativeAdrenoTraceAdditionalCounterCount = 1,
     NativeAdrenoTraceCounterCapacity = 4096,
     NativeAdrenoTraceJobCapacity = 4096,
     NativeAdrenoTracePerformanceCapacity = 4096,
@@ -61,6 +64,11 @@ enum {
     NativeAdrenoTraceSectionJobs = 3,
     NativeAdrenoTraceSectionEvents = 4,
     NativeAdrenoTraceSectionPerformance = 5,
+    NativeAdrenoTraceSectionAdditionalDefinitions = 6,
+    NativeAdrenoTraceSectionAdditionalCounters = 7,
+    NativeAdrenoTraceCaptureForceGmem = 1,
+    NativeAdrenoTraceCaptureForceSysmem = 2,
+    NativeAdrenoTraceCaptureDetailedTiles = 4,
     NativeAdrenoTracePerformanceBusyValid = 1,
     NativeAdrenoTracePerformanceBoost = 2,
     NativeAdrenoTracePerformanceFixedFrequency = 4,
@@ -162,6 +170,34 @@ typedef struct NativeAdrenoTraceControl {
     uint32_t duration_ms;        /* Start accepts 100 through 60000 milliseconds. */
 } NativeAdrenoTraceControl;
 
+/* NativeAdrenoTraceCaptureControl starts a bounded window with immutable
+ * recording options. Frequency zero selects the governor; 315, 450 and
+ * 550 MHz select the matching GPU/DDR operating point under the thermal cap.
+ * The worker restores its ordinary policy after captured jobs retire. */
+typedef struct NativeAdrenoTraceCaptureControl {
+    uint32_t version;
+    uint32_t operation;
+    uint32_t generation;
+    uint32_t duration_ms;
+    uint32_t frequency_hz;
+    uint32_t flags;
+    uint32_t reserved[2];
+} NativeAdrenoTraceCaptureControl;
+
+/* NativeAdrenoTraceCaptureOptions retains the requested policy for a capture.
+ * Producers read it once per generation before recording new commands. The
+ * additional counter sections preserve the original 29-counter ABI records. */
+typedef struct NativeAdrenoTraceCaptureOptions {
+    uint32_t version;
+    uint32_t generation;
+    uint32_t frequency_hz;
+    uint32_t flags;
+    uint32_t additional_counter_count;
+    uint32_t additional_definition_bytes;
+    uint32_t additional_sample_bytes;
+    uint32_t reserved;
+} NativeAdrenoTraceCaptureOptions;
+
 typedef struct NativeAdrenoTraceRead {
     uint32_t version;
     uint32_t generation;
@@ -226,6 +262,15 @@ typedef struct NativeAdrenoTraceCounterSample {
     uint32_t reserved;
 } NativeAdrenoTraceCounterSample;
 
+/* NativeAdrenoTraceAdditionalCounterSample contains the extra readings from
+ * the same sample index and clock interval in section 2. Bit zero validates
+ * values[0]; definition indexes continue after the original 29 counters. */
+typedef struct NativeAdrenoTraceAdditionalCounterSample {
+    uint64_t values[NativeAdrenoTraceAdditionalCounterCount];
+    uint32_t valid_mask;
+    uint32_t reserved;
+} NativeAdrenoTraceAdditionalCounterSample;
+
 typedef struct NativeAdrenoTraceJob {
     uint64_t completion;
     uint64_t retired_ns;
@@ -288,6 +333,10 @@ enum {
     NativeAdrenoTraceTurnipExecute = 65537,
     NativeAdrenoTraceTurnipInstrumentation = 65538,
     NativeAdrenoTraceTurnipRecordCounts = 65539,
+    NativeAdrenoTraceTurnipCommandCounts = 65540,
+    NativeAdrenoTraceTurnipPassMetadata = 65541,
+    NativeAdrenoTraceTurnipPassAttachment = 65542,
+    NativeAdrenoTraceTurnipMetadataCounts = 65543,
     NativeAdrenoTraceArgWidth = 1,
     NativeAdrenoTraceArgHeight = 2,
     NativeAdrenoTraceArgBins = 3,
@@ -323,7 +372,18 @@ enum {
     NativeAdrenoTraceArgDestinationImage = 35,
     NativeAdrenoTraceArgCopyOperation = 36,
     NativeAdrenoTraceArgCopyRows = 37, /* Total copied rows across regions and layers. */
-    NativeAdrenoTraceArgCopyBatchedDraws = 38 /* Multi-blit draws included in DrawCount. */
+    NativeAdrenoTraceArgCopyBatchedDraws = 38, /* Multi-blit draws included in DrawCount. */
+    NativeAdrenoTraceArgPassId = 39,
+    NativeAdrenoTraceArgCommandClass = 40,
+    NativeAdrenoTraceArgEmittedCount = 41,
+    NativeAdrenoTraceArgEstimatedExecutions = 42,
+    NativeAdrenoTraceArgEncoderId = 43,
+    NativeAdrenoTraceArgInternalPassIndex = 44,
+    NativeAdrenoTraceArgPassDetails = 45,
+    NativeAdrenoTraceArgImageId = 46,
+    NativeAdrenoTraceArgAttachmentDetails = 47,
+    NativeAdrenoTraceArgResourceAddress = 48,
+    NativeAdrenoTraceArgMetadataDropped = 49
 };
 
 /* Copy END flags identify every execution path used across its regions. */

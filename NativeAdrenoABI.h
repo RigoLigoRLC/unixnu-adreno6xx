@@ -45,7 +45,7 @@ enum {
     NativeAdrenoMethodWaitCompletion = 30,
     NativeAdrenoMethodWaitCapacity = 31,
     NativeAdrenoMethodWaitBoIdle = 32,
-    NativeAdrenoMethodLast = NativeAdrenoMethodAckTraceStream,
+    NativeAdrenoMethodLast = NativeAdrenoMethodQueryCaptureOptions,
     NativeAdrenoAbiMetadataBytes = 64,
     NativeAdrenoAbiMaxQueues = 8
 };

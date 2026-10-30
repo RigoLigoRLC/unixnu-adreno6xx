@@ -1404,7 +1404,7 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
 }
 IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size)
 {
-    if (method >= NativeAdrenoMethodQueryTrace && method <= NativeAdrenoMethodAckTraceStream) {
+    if (method >= NativeAdrenoMethodQueryTrace && method <= NativeAdrenoMethodQueryCaptureOptions) {
         struct TraceConnectionLock {
             IOLock *lock;
 
@@ -1436,6 +1436,20 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
                 }
                 return NativeAdrenoGpuProfile::controlTrace(static_cast<const NativeAdrenoTraceControl *>(input),
                     static_cast<NativeAdrenoTraceStatus *>(output));
+            case NativeAdrenoMethodControlCapture:
+                if (!input || input_size != sizeof(NativeAdrenoTraceCaptureControl) ||
+                    !output || output_size != sizeof(NativeAdrenoTraceStatus)) {
+                    return kIOReturnBadArgument;
+                }
+                return NativeAdrenoGpuProfile::controlCapture(
+                    static_cast<const NativeAdrenoTraceCaptureControl *>(input),
+                    static_cast<NativeAdrenoTraceStatus *>(output));
+            case NativeAdrenoMethodQueryCaptureOptions:
+                if (input_size || !output || output_size != sizeof(NativeAdrenoTraceCaptureOptions)) {
+                    return kIOReturnBadArgument;
+                }
+                return NativeAdrenoGpuProfile::queryCaptureOptions(
+                    static_cast<NativeAdrenoTraceCaptureOptions *>(output));
             case NativeAdrenoMethodReadTrace:
                 if (!input || input_size != sizeof(NativeAdrenoTraceRead) ||
                     !output || output_size != sizeof(NativeAdrenoTraceChunk)) {

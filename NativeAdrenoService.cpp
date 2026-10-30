@@ -107,6 +107,8 @@ class A642LState final {
     uint32_t activityKick_ = 0;
     uint32_t boostLevel_ = 1;
     uint32_t fixedPerformanceLevel_ = 0;
+    bool capturePerformanceEnabled_ = false;
+    uint32_t capturePerformanceHz_ = 0;
     uint32_t downWindows_ = 0;
     uint32_t downHold_ = 0;
     NativeAdrenoTracePerformance performance_{};
@@ -352,8 +354,12 @@ IOReturn A642LState::pollPerformance(bool pending)
     if (boosted && wantedLevel < boostLevel_) {
         wantedLevel = boostLevel_;
     }
-    if (fixedPerformanceLevel_) {
-        wantedLevel = fixedPerformanceLevel_;
+    uint32_t captureHz = 0;
+    const bool captureEnabled = NativeAdrenoGpuProfile::captureFrequency(&captureHz);
+    const uint32_t fixedLevel = captureEnabled ?
+        (captureHz ? performanceLevelFor(captureHz) : 0) : fixedPerformanceLevel_;
+    if (fixedLevel) {
+        wantedLevel = fixedLevel;
     }
 
     NativeAdrenoTracePerformance sample{};
@@ -374,8 +380,8 @@ IOReturn A642LState::pollPerformance(bool pending)
     sample.busy_permille = busyPermille;
     sample.requested_hz = NativeAdrenoA6xxOperatingPoints[wantedLevel - 1].frequencyHz;
     sample.flags = (busyValid ? NativeAdrenoTracePerformanceBusyValid : 0) |
-        (boosted && !fixedPerformanceLevel_ ? NativeAdrenoTracePerformanceBoost : 0) |
-        (fixedPerformanceLevel_ ? NativeAdrenoTracePerformanceFixedFrequency : 0) |
+        (boosted && !fixedLevel ? NativeAdrenoTracePerformanceBoost : 0) |
+        (fixedLevel ? NativeAdrenoTracePerformanceFixedFrequency : 0) |
         (pending ? NativeAdrenoTracePerformancePendingWork : 0) |
         (thermalLimited ? NativeAdrenoTracePerformanceThermalLimited : 0);
 
@@ -394,6 +400,8 @@ IOReturn A642LState::pollPerformance(bool pending)
     sample.vote_status = uint32_t(status);
     sample.timestamp_ns = now(nullptr) * 1000;
     performance_ = sample;
+    capturePerformanceEnabled_ = captureEnabled;
+    capturePerformanceHz_ = captureHz;
     NativeAdrenoGpuProfile::recordPerformance(sample);
 
     lastPerformanceUs_ = currentUs;
@@ -1242,7 +1250,10 @@ void A642LState::poll()
         return;
     }
 
-    if (current >= nextPerformancePollUs_ || activityPending()) {
+    uint32_t captureHz = 0;
+    bool captureEnabled = NativeAdrenoGpuProfile::captureFrequency(&captureHz);
+    if (current >= nextPerformancePollUs_ || activityPending() ||
+        captureEnabled != capturePerformanceEnabled_ || captureHz != capturePerformanceHz_) {
         const IOReturn performanceStatus = pollPerformance(submitted != completed);
         if (performanceStatus) {
             ready_ = false;
@@ -1257,6 +1268,18 @@ void A642LState::poll()
         ready_ = false;
         native_adreno_a6xx_stats[0] = 8;
         fail(profileStatus);
+        return;
+    }
+
+    // The last retired capture job releases its fixed GPU/DDR selection here.
+    captureEnabled = NativeAdrenoGpuProfile::captureFrequency(&captureHz);
+    if (captureEnabled != capturePerformanceEnabled_ || captureHz != capturePerformanceHz_) {
+        const IOReturn performanceStatus = pollPerformance(submitted != completed);
+        if (performanceStatus) {
+            ready_ = false;
+            native_adreno_a6xx_stats[0] = 8;
+            fail(performanceStatus);
+        }
     }
 }
 

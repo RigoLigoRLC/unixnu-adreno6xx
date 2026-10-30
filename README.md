@@ -108,7 +108,7 @@ samples and jobs, then release writes bit 29 at `0x1f994` after all registered
 jobs have retired. `native_adreno_gpu_profile_stop()` closes the window early;
 the worker performs its release. Array capacity also closes a window.
 
-The service reads 29 fixed
+The service reads 30 fixed
 A6xx counters every 20 ms while the window is active, retaining at most 4096
 samples. Each sample contains the GMU always-on clock before and after the
 reads, the raw 64-bit values and a measurement-validity mask. Definitions name
@@ -120,6 +120,11 @@ SP, TP, RB and other unit selectors are not reread. The GX power and AHB fence
 checks reject inaccessible hardware while the acknowledged request remains
 held. This window prevents autonomous GPU power collapse while the frequency
 governor continues applying paired frequency and bandwidth votes.
+
+The original 29 binary counter definitions and samples keep their existing
+layouts. Sections 6 and 7 add CP4's `CP_SQE_SYS_WFI_STALL` event 25; each extra
+sample shares the original sample's index and clock interval. CP0 and SP0 stay
+reserved. The added selector uses the same OOB ownership and retirement rules.
 
 USB and submission callbacks only update the recorder's bounded state under
 its lock. That lock is released before GMU handshakes, sampling, hardware
@@ -172,12 +177,23 @@ they do not time out a stalled Device MMIO transaction.
 ## Binary capture and user events
 
 `NativeAdrenoTrace.h` defines the fixed little-endian trace records and methods
-33 through 38. Query reports the hardware window generation and state. Control
+33 through 42. Query reports the hardware window generation and state. Control
 starts or stops that same window, and Seal freezes it after captured GPU jobs
 have retired, the worker has released the performance OOB, and every registered
 user producer has ended. The recorder retains 131072 user events in addition to
 4096 hardware samples and 4096 jobs. Full arrays preserve earlier records and
 increment explicit loss counts.
+
+`ControlCapture` starts the same bounded window with a 32-byte request containing
+the requested frequency and render-recording flags. Zero Hz enables the governor;
+315, 450 or 550 MHz selects the corresponding paired DDR vote under the thermal
+cap. The worker applies that selection before beginning the window and restores
+its ordinary policy after captured jobs retire, including early stop and the
+deadline. `QueryCaptureOptions` returns the immutable settings and additional
+counter layouts. GMEM/sysmem flags are read by Turnip when recording a new pass;
+its existing render compatibility checks decide the actual mode. The optional
+detailed-tile flag enables low-level timestamps for an explicitly selected
+capture. Legacy Control starts with automatic frequency and render selection.
 
 Metal and Turnip register a producer on their IOKit connection for each capture.
 They append up to eight 176-byte events per call, including real tracepoint
