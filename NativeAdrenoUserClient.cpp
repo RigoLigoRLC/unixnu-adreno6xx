@@ -4,7 +4,9 @@
 #include "NativeAdrenoUserClient.h"
 #include "NativeAdrenoScheduler.h"
 #include <kern/task.h>
-#include <sys/resource_private.h>
+extern "C" {
+#include <kern/policy_internal.h>
+}
 extern "C" volatile uint32_t native_adreno_trace_stage;
 /* 0 keeps user BOs cacheable and maintained before every submission (int-070..097); the board sets it from the sheng-gpu-wc boot argument. */
 /* The board diagnostic ABI retains its inactive WC control field. */
@@ -452,9 +454,12 @@ IOReturn NativeAdrenoUserClient::freeBo(const NativeAdrenoAbiBoFree *request)
 }
 int32_t NativeAdrenoUserClient::submitPriority() const
 {
-    const int32_t role=task_get_gpu_role(current_task());
-    return role==PRIO_DARWIN_GPU_BACKGROUND || role==PRIO_DARWIN_GPU_UTILITY?
-        int32_t(priority_background_):int32_t(priority_foreground_);
+    const task_t task=current_task();
+    const int role=proc_get_effective_task_policy(task,TASK_POLICY_ROLE);
+    const bool background=proc_get_effective_task_policy(task,TASK_POLICY_DARWIN_BG) ||
+        role==TASK_BACKGROUND_APPLICATION || role==TASK_NONUI_APPLICATION ||
+        role==TASK_THROTTLE_APPLICATION || role==TASK_DARWINBG_APPLICATION;
+    return int32_t(background?priority_background_:priority_foreground_);
 }
 
 IOReturn NativeAdrenoUserClient::setPriority(uint32_t foreground,uint32_t background)
