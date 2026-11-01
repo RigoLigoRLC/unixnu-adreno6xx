@@ -268,7 +268,6 @@ void NativeAdrenoVm::insert(Mapping *record,unsigned upper)
     addresses_.Root_RB_INSERT(&addresses_.root,record);
     ++objects_;
     ++registry_->total_objects_;
-    ++class_objects_[aliasClass(record->permissions,record->writeback,record->shareability)];
     if(upper) {
         upper_count_+=record->spans;
     } else {
@@ -290,7 +289,6 @@ void NativeAdrenoVm::erase(Mapping *record,unsigned upper)
     }
     --objects_;
     --registry_->total_objects_;
-    --class_objects_[aliasClass(record->permissions,record->writeback,record->shareability)];
     if(upper) {
         upper_count_-=record->spans;
     } else {

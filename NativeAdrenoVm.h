@@ -154,7 +154,6 @@ class NativeAdrenoVm final {
     size_t reserved_objects_=0;
     uint32_t clients_=0;
     uint64_t budget_generation_=1;
-    size_t class_objects_[32]{};
     unsigned budget_=0;
     uint64_t next_handle_=1;
     bool attached_=false,poisoned_=false;
