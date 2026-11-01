@@ -32,7 +32,8 @@ with two uint32 fields, foreground and background. Note is selector 44 with
 kind, count and 30 uint32 words; pass kind is 1 and pipeline kind is 2. Each
 kind retains 512 rows. Query flags add OwnedCoherent=64 and MemoryPressure=128.
 The scheduler reads the submitting task's effective role and Darwin background
-state through XNU's `proc_get_effective_task_policy`. Background, non-UI,
+state through XNU's `proc_get_effective_task_policy` in NativeAdrenoTaskPolicy.c.
+NativeAdrenoUserClient uses its C-compatible declaration. Background, non-UI,
 throttled and Darwin-background applications select the background priority;
 the other roles select the foreground priority. It preserves queue order and
 promotes ready work waiting 250 ms.
@@ -45,8 +46,9 @@ Normal NC firmware mappings, power transitions, DVFS and bounded hardware
 capture retain their SM7325 implementations. The service uses chip ID
 0x06030500 and the A660 firmware inputs.
 
-The device build recipe compiles the existing source list; all dynamic-table
-and process-VM code resides in those objects. The consuming device must pin
+The device build recipe includes NativeAdrenoTaskPolicy.c with the C compiler
+recipe; dynamic-table and process-VM code resides in the existing objects.
+The consuming device must pin
 the matching ArmSmmu4K revision and install this NativeAdrenoABI.h for Metal
 and Turnip. Build, deployment and device observations are recorded by the
 device repository for each fixed build tag.
