@@ -5,222 +5,720 @@ extern "C" {volatile uint32_t native_adreno_trace_stage;}
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <kern/task.h>
-extern "C" boolean_t PE_parse_boot_argn(const char *,void *,int);
+
+/* The board diagnostic layout keeps allocation, prepare, spans, zero, four
+ * reserved rows, complete and descriptor release. Each row records calls,
+ * total us, maximum us and bytes. */
+extern "C" {
+extern uint64_t (*native_adreno_vm_now_us)(void);
+extern unsigned int memorystatus_available_pages;
+void proc_selfname(char *,int);
+volatile uint64_t native_adreno_memory_stage_stats[10][4];
+/* hits, misses, insertions, evictions, rejected insertions, cached objects,
+ * cached bytes, peak cached bytes, pressure drains, allocation-failure drains,
+ * pages restored to WC on reuse, quarantined cache entries. */
+volatile uint64_t native_adreno_backing_cache_stats[12];
+}
+
+namespace {
+enum MemoryStage : unsigned {
+    MemoryAllocate,
+    MemoryPrepare,
+    MemorySpans,
+    MemoryZero,
+    MemoryComplete=8,
+    MemoryDescriptorRelease
+};
+
+/* MemoryStageTime accumulates one operation's duration in the bounded stage
+ * table. The caller supplies the number of bytes handled by that operation. */
+class MemoryStageTime final {
+    unsigned stage_;
+    size_t bytes_;
+    uint64_t began_;
+public:
+    MemoryStageTime(MemoryStage stage,size_t bytes):stage_(stage),bytes_(bytes),
+        began_(native_adreno_vm_now_us?native_adreno_vm_now_us():0)
+    {
+    }
+
+    ~MemoryStageTime()
+    {
+        const uint64_t ended=native_adreno_vm_now_us?native_adreno_vm_now_us():0;
+        const uint64_t elapsed=began_ && ended>=began_?ended-began_:0;
+        volatile uint64_t *row=native_adreno_memory_stage_stats[stage_];
+        row[0]=row[0]+1;
+        row[1]=row[1]+elapsed;
+        if(elapsed>row[2]) {
+            row[2]=elapsed;
+        }
+        row[3]=row[3]+bytes_;
+    }
+};
+
+enum : size_t {
+    BackingCacheEntries=64,
+    BackingCacheBytes=64u*1024u*1024u,
+    BackingCacheObjectBytes=16u*1024u*1024u,
+    BackingCacheLowPages=32768
+};
+
+/* CachedBacking owns storage after all user and GPU mappings are removed.
+ * sequence orders successful insertions so eviction releases the oldest one. */
+struct CachedBacking {
+    NativeAdrenoBackingStorage storage;
+    uint64_t sequence=0;
+};
+
+CachedBacking backing_cache[BackingCacheEntries];
+size_t backing_cache_bytes=0,backing_cache_count=0;
+uint64_t backing_cache_sequence=0;
+NativeAdrenoMemoryDiagnostics memory_diagnostics;
+
+enum BackingMissReason : unsigned {
+    BackingMissEmpty,
+    BackingMissSize,
+    BackingMissAttributes,
+    BackingMissQuarantined
+};
+
+enum BackingRejectReason : unsigned {
+    BackingRejectNotOwned,
+    BackingRejectNotPrepared,
+    BackingRejectNotWriteCombined,
+    BackingRejectQuarantined,
+    BackingRejectNoSpans,
+    BackingRejectZeroSize,
+    BackingRejectOversized,
+    BackingRejectNoEvictableEntry,
+    BackingRejectNoSlot,
+    BackingRejectImported,
+    BackingRejectPooled,
+    BackingRejectPressure,
+    BackingRejectBusy
+};
+
+unsigned backingSizeBucket(size_t bytes)
+{
+    uint64_t upper=4096;
+    for(unsigned index=0;index+1<NativeAdrenoMemorySizeBucketCount;++index) {
+        if(bytes<=upper) {
+            return index;
+        }
+        upper*=2;
+    }
+    return NativeAdrenoMemorySizeBucketCount-1;
+}
+
+void noteBackingRequest(size_t bytes,bool reuse)
+{
+    NativeAdrenoMemoryBucketStats &bucket=memory_diagnostics.buckets[backingSizeBucket(bytes)];
+    ++bucket.requests;
+    bucket.bytes+=bytes;
+    if(reuse) {
+        ++bucket.lookups;
+    } else {
+        ++bucket.bypassed;
+    }
+}
+
+void noteBackingReject(BackingRejectReason reason)
+{
+    ++memory_diagnostics.insert_reject[reason];
+    native_adreno_backing_cache_stats[4]=native_adreno_backing_cache_stats[4]+1;
+}
+
+/* MemorySlowTime retains the storage attributes needed after a descriptor is
+ * released. Allocation and import refresh those attributes when they finish,
+ * so their records include the physical spans found during the operation. */
+class MemorySlowTime final {
+    const NativeAdrenoBackingStorage *storage_;
+    const bool *pooled_;
+    NativeAdrenoMemorySlowEvent event_;
+    uint64_t began_;
+    bool refresh_;
+
+    void captureStorage()
+    {
+        event_.spans=storage_->span_count;
+        event_.source=storage_->diagnostic_source;
+        event_.cache_result=storage_->diagnostic_cache_result;
+        if(storage_->contiguous) {
+            event_.flags|=NativeAdrenoMemoryDiagnosticContiguous;
+        }
+        if(storage_->write_combined) {
+            event_.flags|=NativeAdrenoMemoryDiagnosticWriteCombined;
+        }
+        if(storage_->quarantined) {
+            event_.flags|=NativeAdrenoMemoryDiagnosticQuarantined;
+        }
+        if(storage_->diagnostic_source==NativeAdrenoMemorySource::Imported) {
+            event_.flags|=NativeAdrenoMemoryDiagnosticImported;
+        }
+        if(pooled_ && *pooled_) {
+            event_.flags|=NativeAdrenoMemoryDiagnosticPooled;
+        }
+    }
+
+public:
+    MemorySlowTime(NativeAdrenoMemorySlowOperation operation,const NativeAdrenoBackingStorage &storage,
+        size_t bytes,unsigned bits,uint32_t flags=0,bool refresh=false,const bool *pooled=nullptr):
+        storage_(&storage),pooled_(pooled),began_(native_adreno_vm_now_us?native_adreno_vm_now_us():0),refresh_(refresh)
+    {
+        event_.operation=operation;
+        event_.bytes=bytes;
+        event_.output_bits=bits;
+        event_.flags=flags;
+        captureStorage();
+    }
+
+    ~MemorySlowTime()
+    {
+        const uint64_t ended=native_adreno_vm_now_us?native_adreno_vm_now_us():0;
+        if(!began_ || ended<began_ || ended-began_<8000) {
+            return;
+        }
+        if(refresh_ && storage_->bytes) {
+            captureStorage();
+        }
+        event_.sequence=++memory_diagnostics.slow_total;
+        event_.sampled_us=ended;
+        event_.elapsed_us=ended-began_;
+        event_.cached_bytes=backing_cache_bytes;
+        event_.cached_objects=static_cast<uint32_t>(backing_cache_count);
+        event_.available_pages=memorystatus_available_pages;
+        proc_selfname(event_.process,sizeof(event_.process));
+        memory_diagnostics.slow[(event_.sequence-1)%NativeAdrenoMemorySlowEventCount]=event_;
+        if(memory_diagnostics.slow_count<NativeAdrenoMemorySlowEventCount) {
+            ++memory_diagnostics.slow_count;
+        }
+    }
+};
+
+bool backingPressure()
+{
+    return memorystatus_available_pages<BackingCacheLowPages;
+}
+
+void noteBackingCacheSize()
+{
+    native_adreno_backing_cache_stats[5]=backing_cache_count;
+    native_adreno_backing_cache_stats[6]=backing_cache_bytes;
+    if(backing_cache_bytes>native_adreno_backing_cache_stats[7]) {
+        native_adreno_backing_cache_stats[7]=backing_cache_bytes;
+    }
+    memory_diagnostics.cached_objects=backing_cache_count;
+    memory_diagnostics.cached_bytes=backing_cache_bytes;
+    if(backing_cache_count>memory_diagnostics.peak_objects) {
+        memory_diagnostics.peak_objects=backing_cache_count;
+    }
+    if(backing_cache_bytes>memory_diagnostics.peak_bytes) {
+        memory_diagnostics.peak_bytes=backing_cache_bytes;
+    }
+}
+
+IOReturn destroyOwnedStorage(NativeAdrenoBackingStorage &storage)
+{
+    if(storage.quarantined) {
+        return kIOReturnBusy;
+    }
+    const uint32_t release_flags=storage.write_combined?NativeAdrenoMemoryDiagnosticWriteCombined:0;
+    if(storage.descriptor) {
+        if(storage.prepared) {
+            MemoryStageTime elapsed(MemoryComplete,storage.bytes);
+            native_adreno_trace_stage=31;
+            const IOReturn status=storage.descriptor->complete();
+            native_adreno_trace_stage=32;
+            if(status) {
+                storage.quarantined=true;
+                return status;
+            }
+            storage.prepared=false;
+        }
+        {
+            MemoryStageTime elapsed(MemoryDescriptorRelease,storage.bytes);
+            MemorySlowTime slow(NativeAdrenoMemorySlowOperation::OwnedDescriptorRelease,storage,
+                storage.bytes,storage.output_bits,release_flags);
+            native_adreno_trace_stage=33;
+            storage.descriptor->release();
+            native_adreno_trace_stage=34;
+        }
+        storage.descriptor=nullptr;
+    }
+    if(storage.spans) {
+        IODeleteData(storage.spans,NativeAdrenoPhysicalSpan,storage.span_capacity);
+    }
+    storage={};
+    return kIOReturnSuccess;
+}
+
+IOReturn evictBacking(CachedBacking &entry,unsigned reason)
+{
+    const size_t bytes=entry.storage.bytes;
+    const bool quarantined=entry.storage.quarantined;
+    ++memory_diagnostics.eviction_attempts[reason];
+    const IOReturn status=destroyOwnedStorage(entry.storage);
+    if(status) {
+        ++memory_diagnostics.eviction_failures[reason];
+        if(!quarantined && entry.storage.quarantined) {
+            native_adreno_backing_cache_stats[11]=native_adreno_backing_cache_stats[11]+1;
+        }
+        return status;
+    }
+    entry.sequence=0;
+    backing_cache_bytes-=bytes;
+    --backing_cache_count;
+    ++memory_diagnostics.evictions[reason];
+    memory_diagnostics.evicted_bytes[reason]+=bytes;
+    native_adreno_backing_cache_stats[3]=native_adreno_backing_cache_stats[3]+1;
+    noteBackingCacheSize();
+    return kIOReturnSuccess;
+}
+
+bool takeBacking(size_t bytes,unsigned bits,bool contiguous,bool write_combined,NativeAdrenoBackingStorage &storage)
+{
+    NativeAdrenoMemoryBucketStats &bucket=memory_diagnostics.buckets[backingSizeBucket(bytes)];
+    bool any=false,sized=false,quarantined_match=false;
+    for(auto &entry:backing_cache) {
+        const NativeAdrenoBackingStorage &candidate=entry.storage;
+        if(!candidate.descriptor) {
+            continue;
+        }
+        any=true;
+        if(candidate.bytes!=bytes) {
+            continue;
+        }
+        sized=true;
+        if(candidate.output_bits!=bits || candidate.contiguous!=contiguous || candidate.write_combined!=write_combined) {
+            continue;
+        }
+        if(candidate.quarantined) {
+            quarantined_match=true;
+            continue;
+        }
+        storage=candidate;
+        storage.diagnostic_cache_result=NativeAdrenoMemoryCacheResult::Hit;
+        entry={};
+        backing_cache_bytes-=bytes;
+        --backing_cache_count;
+        native_adreno_backing_cache_stats[0]=native_adreno_backing_cache_stats[0]+1;
+        ++bucket.hits;
+        noteBackingCacheSize();
+        return true;
+    }
+    native_adreno_backing_cache_stats[1]=native_adreno_backing_cache_stats[1]+1;
+    ++bucket.misses;
+    const BackingMissReason reason=quarantined_match?BackingMissQuarantined:
+        sized?BackingMissAttributes:any?BackingMissSize:BackingMissEmpty;
+    ++bucket.miss_reason[reason];
+    storage.diagnostic_cache_result=NativeAdrenoMemoryCacheResult::Miss;
+    return false;
+}
+
+bool cacheBacking(NativeAdrenoBackingStorage &storage)
+{
+    if(!storage.descriptor || !storage.prepared || storage.quarantined ||
+        !storage.spans || !storage.span_count || !storage.bytes || storage.bytes>BackingCacheObjectBytes) {
+        const BackingRejectReason reason=!storage.descriptor?BackingRejectNotOwned:
+            !storage.prepared?BackingRejectNotPrepared:
+            storage.quarantined?BackingRejectQuarantined:!storage.spans || !storage.span_count?BackingRejectNoSpans:
+            !storage.bytes?BackingRejectZeroSize:BackingRejectOversized;
+        noteBackingReject(reason);
+        return false;
+    }
+    while(backing_cache_count==BackingCacheEntries || backing_cache_bytes>BackingCacheBytes-storage.bytes) {
+        CachedBacking *oldest=nullptr;
+        for(auto &entry:backing_cache) {
+            if(entry.storage.descriptor && !entry.storage.quarantined &&
+                (!oldest || entry.sequence<oldest->sequence)) {
+                oldest=&entry;
+            }
+        }
+        if(!oldest) {
+            noteBackingReject(BackingRejectNoEvictableEntry);
+            return false;
+        }
+        const unsigned reason=backing_cache_count==BackingCacheEntries?0:1;
+        (void)evictBacking(*oldest,reason);
+    }
+    for(auto &entry:backing_cache) {
+        if(entry.storage.descriptor) {
+            continue;
+        }
+        entry.storage=storage;
+        entry.sequence=++backing_cache_sequence;
+        backing_cache_bytes+=storage.bytes;
+        ++backing_cache_count;
+        storage={};
+        native_adreno_backing_cache_stats[2]=native_adreno_backing_cache_stats[2]+1;
+        ++memory_diagnostics.insertions;
+        noteBackingCacheSize();
+        return true;
+    }
+    noteBackingReject(BackingRejectNoSlot);
+    return false;
+}
+}
+
+IOReturn NativeAdrenoMemory::trimBackingCache(NativeAdrenoBackingTrimReason reason)
+{
+    IOReturn result=kIOReturnSuccess;
+    for(auto &entry:backing_cache) {
+        if(!entry.storage.descriptor) {
+            continue;
+        }
+        const IOReturn status=evictBacking(entry,static_cast<unsigned>(reason));
+        if(status && !result) {
+            result=status;
+        }
+    }
+    return result;
+}
+
+void NativeAdrenoMemory::copyDiagnostics(NativeAdrenoMemoryDiagnostics *out)
+{
+    if(!out) {
+        return;
+    }
+    *out=memory_diagnostics;
+    uint64_t upper=4096;
+    for(unsigned index=0;index+1<NativeAdrenoMemorySizeBucketCount;++index) {
+        out->buckets[index].upper_bound_bytes=upper;
+        upper*=2;
+    }
+    for(unsigned index=0;index<out->slow_count;++index) {
+        const uint64_t retained=out->slow_total-out->slow_count+index;
+        out->slow[index]=memory_diagnostics.slow[retained%NativeAdrenoMemorySlowEventCount];
+    }
+}
 
 static bool outputWidth(unsigned bits)
 {return bits==32 || bits==36 || bits==40 || bits==42 || bits==44 || bits==48;}
 /* Where the last import stopped (10..19, 19 = done), and for a refused page the physical address and offset: the board log shows them. */
 enum : IOReturn {kNativeAdrenoProtectionFailure=2};   /* KERN_PROTECTION_FAILURE, as prepare() reports a range that cannot be wired for writing */
-extern "C" {volatile uint32_t native_adreno_import_stage;volatile uint64_t native_adreno_import_fail_pa,native_adreno_import_fail_offset;}
-/* BO memory for the board log: [0] user BOs from the system (allocateSystem), [1] their spans, [2] refused, [3] the last refusal's status,
- * [4] MiB of them live, [5] the peak, [6] kernel-mapped BOs (allocate), [7] import spans. */
-extern "C" {volatile uint32_t native_adreno_bo_memory[8];}
-/* Contiguous BO runs: [0] made, [1] refused by the free memory (those BOs fell back to pageable pages). */
-extern "C" {volatile uint32_t native_adreno_bo_contig[2];}
+extern "C" {volatile uint32_t native_adreno_pool_mib=0,native_adreno_pool_status=0;volatile uint32_t native_adreno_import_stage;volatile uint64_t native_adreno_import_fail_pa,native_adreno_import_fail_offset;}
+/* The pool (see reservePool): a free list of page extents over one contiguous block; best fit, neighbours merged on release. */
+extern "C" {volatile uint32_t native_adreno_pool_stats[8];}
+/* The board diagnostic ABI retains this inactive field. */
+extern "C" {volatile uint32_t native_adreno_pool_wc;}
 namespace {
-uint64_t systemBytes,systemPeak;
-bool pressure;
-void noteSystem(int64_t bytes)
-{
-    systemBytes+=bytes;if(systemBytes>systemPeak)systemPeak=systemBytes;
-    native_adreno_bo_memory[4]=(uint32_t)(systemBytes>>20);native_adreno_bo_memory[5]=(uint32_t)(systemPeak>>20);
+struct PoolExtent {size_t offset,bytes;};
+struct Pool {
+    IOBufferMemoryDescriptor *descriptor=nullptr;
+    unsigned char *virt=nullptr;uint64_t physical=0;size_t bytes=0,used=0,peak=0;
+    PoolExtent free[512];unsigned count=0;
+} pool;
+bool poolTake(size_t bytes,size_t *offset) {
+    int best=-1;
+    for(unsigned i=0;i<pool.count;++i)if(pool.free[i].bytes>=bytes && (best<0 || pool.free[i].bytes<pool.free[best].bytes))best=(int)i;
+    if(best<0)return false;
+    *offset=pool.free[best].offset;
+    pool.free[best].offset+=bytes;pool.free[best].bytes-=bytes;
+    if(!pool.free[best].bytes) {for(unsigned i=(unsigned)best;i+1<pool.count;++i)pool.free[i]=pool.free[i+1];--pool.count;}
+    pool.used+=bytes;if(pool.used>pool.peak)pool.peak=pool.used;
+    native_adreno_pool_stats[3]=(uint32_t)(pool.used>>20);native_adreno_pool_stats[4]=(uint32_t)(pool.peak>>20);
+    return true;
 }
-}
-bool NativeAdrenoMemory::memoryPressure() {return pressure;}
-/* Which DRAM pages this driver's own BOs hold, a bit a page over the kernel's physical range: an import (another task's pages) aliases
- * one of them only where a bit is set, so proving an import exclusive costs its own pages, not the ranges mapped so far (every BO is
- * scattered pages: a pairwise check over them ran out of budget on each import). Made on first use; without it every page counts as
- * owned (the full alias check). */
-extern "C" uint64_t gPhysBase,gPhysSize;
-namespace {
-uint64_t *ownedBits;
-uint64_t *ownedMap()
-{
-    static bool tried;
-    if(!ownedBits && !tried) {tried=true;ownedBits=static_cast<uint64_t *>(IOMallocZero((size_t)((gPhysSize/4096+63)/64*8)));}
-    return ownedBits;
-}
-void noteOwned(const NativeAdrenoPhysicalSpan *spans,size_t count,bool owned)
-{
-    uint64_t *bits=ownedMap();
-    if(!bits)return;
-    for(size_t i=0;i<count;++i)for(uint64_t page=spans[i].physical;page<spans[i].physical+spans[i].bytes;page+=4096) {
-        if(page<gPhysBase || page-gPhysBase>=gPhysSize)continue;
-        const uint64_t at=(page-gPhysBase)/4096,bit=UINT64_C(1)<<(at%64);
-        if(owned)__atomic_fetch_or(&bits[at/64],bit,__ATOMIC_RELAXED);else __atomic_fetch_and(&bits[at/64],~bit,__ATOMIC_RELAXED);
+void poolGive(size_t offset,size_t bytes) {
+    unsigned at=0;while(at<pool.count && pool.free[at].offset<offset)++at;
+    if(pool.count>=512) {pool.used-=bytes;return;}   /* cannot happen with bounded fragmentation; the extent is lost, not reused */
+    for(unsigned i=pool.count;i>at;--i)pool.free[i]=pool.free[i-1];
+    pool.free[at]={offset,bytes};++pool.count;
+    if(at+1<pool.count && pool.free[at].offset+pool.free[at].bytes==pool.free[at+1].offset) {
+        pool.free[at].bytes+=pool.free[at+1].bytes;
+        for(unsigned i=at+1;i+1<pool.count;++i)pool.free[i]=pool.free[i+1];
+        --pool.count;
     }
-}
-}
-bool NativeAdrenoMemory::ownsAnyPage(const NativeAdrenoPhysicalSpan *spans,size_t count)
-{
-    const uint64_t *bits=ownedMap();
-    if(!bits)return true;
-    for(size_t i=0;i<count;++i)for(uint64_t page=spans[i].physical;page<spans[i].physical+spans[i].bytes;page+=4096) {
-        if(page<gPhysBase || page-gPhysBase>=gPhysSize)continue;
-        const uint64_t at=(page-gPhysBase)/4096;
-        if(__atomic_load_n(&bits[at/64],__ATOMIC_RELAXED)>>(at%64)&1)return true;
+    if(at && pool.free[at-1].offset+pool.free[at-1].bytes==pool.free[at].offset) {
+        pool.free[at-1].bytes+=pool.free[at].bytes;
+        for(unsigned i=at;i+1<pool.count;++i)pool.free[i]=pool.free[i+1];
+        --pool.count;
     }
-    return false;
+    pool.used-=bytes;native_adreno_pool_stats[3]=(uint32_t)(pool.used>>20);
 }
-/* The descriptor's pages as spans (neighbours merged), each below `limit` and, for a contiguous allocation, following the first. */
-IOReturn NativeAdrenoMemory::takeSegments(IOBufferMemoryDescriptor *descriptor,size_t bytes,uint64_t limit,bool contiguous)
-{
-    span_capacity_=bytes/4096;
-    spans_=IONewData(NativeAdrenoPhysicalSpan,span_capacity_);
-    if(!spans_)return kIOReturnNoMemory;
-    for(size_t offset=0;offset<bytes;offset+=4096) {
-        IOByteCount length=0;
-        addr64_t physical=descriptor->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
-        if(!physical || (physical&4095) || length<4096 || physical>=limit || 4096>limit-physical)return kIOReturnUnsupported;
-        if(contiguous && offset && physical!=spans_[0].physical+offset)return kIOReturnUnsupported;
-        if(span_count_ && physical==spans_[span_count_-1].physical+spans_[span_count_-1].bytes)
-            spans_[span_count_-1].bytes+=4096;
-        else spans_[span_count_++]={offset,physical,4096};
-    }
-    return kIOReturnSuccess;
 }
-IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous,size_t budget)
+size_t NativeAdrenoMemory::poolBytes() {return pool.bytes;}
+IOReturn NativeAdrenoMemory::reservePool(unsigned bits,size_t bytes)
 {
-    if(descriptor_ || spans_ || quarantined_)return kIOReturnBusy;
-    if(!bytes || (bytes&4095) || !outputWidth(bits) || !budget)
-        return kIOReturnBadArgument;
-    if(bytes>budget)return kIOReturnNoResources;
+    if(pool.descriptor)return kIOReturnBusy;
+    if(!bytes || (bytes&4095) || !outputWidth(bits))return kIOReturnBadArgument;
     NativeAdrenoCpuState cpu{};
     IOReturn status=NativeAdrenoQueryCpu4K(&cpu);if(status!=kIOReturnSuccess)return status;
-    uint64_t limit=UINT64_C(1)<<bits;
-    IOOptionBits options=static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone);
-    if(contiguous)options|=kIOMemoryPhysicallyContiguous;
-    descriptor_=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,bytes,(limit-1)&~UINT64_C(4095));
-    if(!descriptor_)return kIOReturnNoMemory;
-    status=descriptor_->prepare();
-    if(status!=kIOReturnSuccess) {descriptor_->release();descriptor_=nullptr;return status;}
-    prepared_=true;bytes_=bytes;mapping_=descriptor_->getBytesNoCopy();
-    status=kIOReturnUnsupported;
-    if(!mapping_ || ((uintptr_t)mapping_&4095) || bytes>UINTPTR_MAX-(uintptr_t)mapping_ ||
-        descriptor_->getLength()!=bytes)goto failed;
-    status=takeSegments(descriptor_,bytes,limit,contiguous);
-    if(status!=kIOReturnSuccess)goto failed;
-    bzero(mapping_,bytes);
-    status=NativeAdrenoMaintainOwnedPages(mapping_,bytes,NativeAdrenoClean);
-    if(status!=kIOReturnSuccess)goto failed;
-    NativeAdrenoNotePhase(NativeAdrenoPhaseAllocate,bytes);
-    noteOwned(spans_,span_count_,true);owned_=true;
-    native_adreno_bo_memory[6]=native_adreno_bo_memory[6]+1;
-    return kIOReturnSuccess;
-failed:
-    /* release() deliberately retains descriptor/metadata if complete fails.
-     * Preserve the allocation's original failure instead of reporting cleanup
-     * as success. No object has been exposed to a GPU or userspace yet. */
-    (void)release();return status;
-}
-/* No task: the memory is mapped nowhere until a client view maps it. The cache mode is the memory entry's, so every mapping of it (the
- * client views) and the pages themselves take it. */
-static IOBufferMemoryDescriptor *systemDescriptor(size_t bytes,bool write_combined,uint64_t *made=nullptr,uint64_t *wired=nullptr)
-{
-    IOOptionBits options=static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone)|
-        static_cast<IOOptionBits>(kIOMemoryPageable);
-    if(write_combined)options|=kIOMapWriteCombineCache;
-    /* Pageable pages arrive one by one (a BO averaged 69 spans); from `sheng-gpu-bo-contig` KiB up to 128 KiB a BO first asks for one
-     * physically contiguous run (one span, one table walk), and a request the free memory cannot serve falls back to pageable pages.
-     * A contiguous request the kernel cannot serve scans every free page before it gives up: in ibb10331f24 124 such searches (0.1 to
-     * 64 MiB) took 163 ms each at the median and 21.7 s in all, synchronously in the caller (the render server's and the widget
-     * renderer's allocations, the stalls at an app launch and on the widget page), while every success was 64 to 128 KiB. So larger
-     * BOs never ask, and after a failure no request of that size or larger asks again for 5 s. */
-    static uint32_t contigKiB=UINT32_MAX;
-    if(contigKiB==UINT32_MAX) {contigKiB=0;PE_parse_boot_argn("sheng-gpu-bo-contig",&contigKiB,sizeof contigKiB);}
-    static const size_t contigMax=size_t(128)*1024;
-    static size_t failedBytes=0;
-    static uint64_t failedAt=0,backoff=0;
-    if(!backoff)nanoseconds_to_absolutetime(UINT64_C(5000000000),&backoff);
-    const uint64_t now=mach_absolute_time();
-    if(failedBytes && now-failedAt>=backoff)failedBytes=0;
-    if(contigKiB && bytes>=size_t(contigKiB)*1024 && bytes<=contigMax && !(failedBytes && bytes>=failedBytes)) {
-        IOBufferMemoryDescriptor *run=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(nullptr,
-            (options&~static_cast<IOOptionBits>(kIOMemoryPageable))|static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous),bytes,UINT64_C(0xfffffffff000));
-        if(run && run->prepare()==kIOReturnSuccess) {native_adreno_bo_contig[0]=native_adreno_bo_contig[0]+1;return run;}
-        if(run)run->release();
-        native_adreno_bo_contig[1]=native_adreno_bo_contig[1]+1;
-        if(!failedBytes || bytes<failedBytes)failedBytes=bytes;
-        failedAt=now;
-    }
-    IOBufferMemoryDescriptor *descriptor=IOBufferMemoryDescriptor::inTaskWithOptions(nullptr,options,bytes,4096);
-    if(made)*made=mach_absolute_time();
-    if(descriptor && descriptor->prepare()!=kIOReturnSuccess) {descriptor->release();descriptor=nullptr;}
-    if(wired)*wired=mach_absolute_time();
-    return descriptor;
-}
-IOReturn NativeAdrenoMemory::prepareSystem(size_t bytes,bool write_combined,NativeAdrenoSystemPages *out)
-{
-    if(!out || out->descriptor || !bytes || (bytes&4095))return kIOReturnBadArgument;
-    uint64_t made=0,wired=0;
-    IOBufferMemoryDescriptor *descriptor=systemDescriptor(bytes,write_combined,&made,&wired);
+    const uint64_t limit=UINT64_C(1)<<bits;
+    IOBufferMemoryDescriptor *descriptor=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+        static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone)|kIOMemoryPhysicallyContiguous,
+        bytes,(limit-1)&~UINT64_C(4095));
     if(!descriptor)return kIOReturnNoMemory;
-    if(!made)made=wired=mach_absolute_time();   /* a contiguous run: made and wired in one step */
-    if(descriptor->getLength()!=bytes) {descriptor->complete();descriptor->release();return kIOReturnUnsupported;}
-    bool cleaned=false;
-    /* Default-attribute pages may still hold the zero fill in a CPU's cache: written back here, by physical runs, as allocateSystem would. */
-    if(!write_combined) {
-        cleaned=true;
-        for(size_t offset=0;offset<bytes && cleaned;) {
-            IOByteCount length=0;
-            const addr64_t physical=descriptor->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
-            if(!physical || (physical&4095) || length<4096) {cleaned=false;break;}
-            if(length>bytes-offset)length=bytes-offset;
-            length&=~IOByteCount(4095);
-            if(NativeAdrenoMaintainPhysicalPages(physical,length,NativeAdrenoClean)!=kIOReturnSuccess)cleaned=false;
-            offset+=length;
-        }
-        if(cleaned)NativeAdrenoNotePhase(NativeAdrenoPhaseAllocate,bytes);
+    status=descriptor->prepare();
+    if(status!=kIOReturnSuccess) {descriptor->release();return status;}
+    IOByteCount length=0,tail=0;
+    const addr64_t first=descriptor->getPhysicalSegment(0,&length,kIOMemoryMapperNone);
+    const addr64_t last=descriptor->getPhysicalSegment(bytes-4096,&tail,kIOMemoryMapperNone);
+    unsigned char *virt=static_cast<unsigned char *>(descriptor->getBytesNoCopy());
+    if(!first || (first&4095) || !virt || ((uintptr_t)virt&4095) || last!=first+bytes-4096 || first>=limit || bytes>limit-first ||
+        descriptor->getLength()!=bytes) {
+        (void)descriptor->complete();descriptor->release();return kIOReturnUnsupported;
     }
-    out->descriptor=descriptor;out->bytes=bytes;out->write_combined=write_combined;out->cleaned=cleaned;out->made=made;out->wired=wired;
+    pool.descriptor=descriptor;pool.virt=virt;pool.physical=first;pool.bytes=bytes;pool.used=pool.peak=0;
+    pool.free[0]={0,bytes};pool.count=1;
+    native_adreno_pool_stats[0]=(uint32_t)(bytes>>20);
     return kIOReturnSuccess;
 }
+IOReturn NativeAdrenoMemory::prepareSystem(size_t bytes,NativeAdrenoSystemPages *pages)
+{
+    if(!pages || pages->descriptor || !bytes || (bytes&4095)) {
+        return kIOReturnBadArgument;
+    }
+    pages->bytes=bytes;
+    const IOOptionBits options=static_cast<IOOptionBits>(kIODirectionInOut)|
+        static_cast<IOOptionBits>(kIOMemoryMapperNone)|static_cast<IOOptionBits>(kIOMemoryPageable);
+    pages->descriptor=IOBufferMemoryDescriptor::inTaskWithOptions(nullptr,options,bytes,4096);
+    if(!pages->descriptor) {
+        return pages->status=kIOReturnNoMemory;
+    }
+    pages->status=pages->descriptor->prepare();
+    if(pages->status) {
+        pages->descriptor->release();
+        pages->descriptor=nullptr;
+    }
+    return pages->status;
+}
+
 void NativeAdrenoMemory::discardSystem(NativeAdrenoSystemPages *pages)
 {
-    if(!pages || !pages->descriptor)return;
-    pages->descriptor->complete();pages->descriptor->release();
-    *pages=NativeAdrenoSystemPages{};
-}
-IOReturn NativeAdrenoMemory::allocateSystem(size_t bytes,unsigned bits,size_t budget,bool write_combined,NativeAdrenoSystemPages *prepared)
-{
-    if(descriptor_ || spans_ || quarantined_)return kIOReturnBusy;
-    if(!bytes || (bytes&4095) || !outputWidth(bits) || !budget)return kIOReturnBadArgument;
-    if(bytes>budget)return kIOReturnNoResources;
-    NativeAdrenoCpuState cpu{};
-    IOReturn status=NativeAdrenoQueryCpu4K(&cpu);if(status!=kIOReturnSuccess)return status;
-    /* Pages prepared outside the lock for this very request are taken over; any other request makes its own. */
-    bool cleaned=false;
-    if(prepared && prepared->descriptor && prepared->bytes==bytes && prepared->write_combined==write_combined) {
-        descriptor_=prepared->descriptor;cleaned=prepared->cleaned;*prepared=NativeAdrenoSystemPages{};
-    } else descriptor_=systemDescriptor(bytes,write_combined);
-    status=descriptor_?kIOReturnSuccess:kIOReturnNoMemory;
-    if(status==kIOReturnSuccess) {
-        system_=true;prepared_=true;bytes_=bytes;write_combined_=write_combined;noteSystem((int64_t)bytes);
-        status=descriptor_->getLength()==bytes?takeSegments(descriptor_,bytes,UINT64_C(1)<<bits,false):kIOReturnUnsupported;
-        /* Default-attribute pages may still hold the zero fill in this CPU's cache: written back before the GPU reads them. */
-        if(status==kIOReturnSuccess && !write_combined && !cleaned) {
-            status=maintainImported(0,bytes,NativeAdrenoClean);
-            NativeAdrenoNotePhase(NativeAdrenoPhaseAllocate,bytes);
+    if(pages && pages->descriptor) {
+        if(pages->descriptor->complete()) {
+            return;
         }
-        if(status!=kIOReturnSuccess) {write_combined_=false;(void)release();}
+        pages->descriptor->release();
+        *pages={};
     }
-    if(status!=kIOReturnSuccess) {
-        pressure=true;
-        native_adreno_bo_memory[2]=native_adreno_bo_memory[2]+1;native_adreno_bo_memory[3]=(uint32_t)status;
+}
+
+IOReturn NativeAdrenoMemory::allocateSystem(size_t bytes,unsigned bits,size_t budget,
+    NativeAdrenoSystemPages *prepared)
+{
+    if(backed() || storage_.spans || storage_.quarantined) {
+        return kIOReturnBusy;
+    }
+    if(!bytes || (bytes&4095) || !outputWidth(bits) || !budget || bytes>budget) {
+        return kIOReturnBadArgument;
+    }
+    NativeAdrenoCpuState cpu{};
+    const IOReturn cpuStatus=NativeAdrenoQueryCpu4K(&cpu);
+    if(cpuStatus) {
+        return cpuStatus;
+    }
+    NativeAdrenoSystemPages local;
+    if(!prepared) {
+        prepareSystem(bytes,&local);
+        prepared=&local;
+    }
+    if(prepared->status) {
+        return prepared->status;
+    }
+    if(!prepared->descriptor || prepared->bytes!=bytes) {
+        return kIOReturnBadArgument;
+    }
+    storage_.descriptor=prepared->descriptor;
+    *prepared={};
+    storage_.prepared=true;
+    storage_.bytes=bytes;
+    storage_.output_bits=bits;
+    storage_.diagnostic_source=NativeAdrenoMemorySource::UserOwned;
+    cpu_cache_mode_=NativeAdrenoCpuCacheMode::Cached;
+    const uint64_t limit=UINT64_C(1)<<bits;
+    IOReturn status=kIOReturnSuccess;
+    storage_.span_capacity=bytes/4096;
+    storage_.spans=IONewData(NativeAdrenoPhysicalSpan,storage_.span_capacity);
+    if(!storage_.spans) {
+        status=kIOReturnNoMemory;
+    }
+    for(size_t offset=0;!status && offset<bytes;) {
+        IOByteCount length=0;
+        const addr64_t physical=storage_.descriptor->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
+        if(length>bytes-offset) {
+            length=bytes-offset;
+        }
+        if(!physical || (physical&4095) || !length || (length&4095) ||
+            physical>=limit || length>limit-physical) {
+            status=kIOReturnUnsupported;
+            break;
+        }
+        if(storage_.span_count && physical==storage_.spans[storage_.span_count-1].physical+
+            storage_.spans[storage_.span_count-1].bytes) {
+            storage_.spans[storage_.span_count-1].bytes+=length;
+        } else {
+            storage_.spans[storage_.span_count++]={offset,physical,size_t(length),1};
+        }
+        offset+=length;
+    }
+    if(status) {
+        (void)release();
         return status;
     }
-    pressure=false;
-    noteOwned(spans_,span_count_,true);owned_=true;
-    native_adreno_bo_memory[0]=native_adreno_bo_memory[0]+1;native_adreno_bo_memory[1]=native_adreno_bo_memory[1]+(uint32_t)span_count_;
+    __asm__ volatile("dsb st" ::: "memory");
     return kIOReturnSuccess;
+}
+
+IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous,size_t budget,bool pooled,
+    bool reuse_backing,bool write_combined)
+{
+    if(backed() || storage_.spans || storage_.quarantined) {
+        return kIOReturnBusy;
+    }
+    if(!bytes || (bytes&4095) || !outputWidth(bits) || !budget || budget>256u*1024u*1024u) {
+        return kIOReturnBadArgument;
+    }
+    if(bytes>budget) {
+        return kIOReturnNoResources;
+    }
+    const NativeAdrenoMemorySource source=pooled?NativeAdrenoMemorySource::UserOwned:NativeAdrenoMemorySource::KernelOwned;
+    cpu_cache_mode_=write_combined?NativeAdrenoCpuCacheMode::NormalUncached:NativeAdrenoCpuCacheMode::Cached;
+    storage_.diagnostic_source=source;
+    storage_.diagnostic_cache_result=NativeAdrenoMemoryCacheResult::NotRequested;
+    storage_.output_bits=bits;
+    storage_.contiguous=contiguous;
+    MemorySlowTime slow(NativeAdrenoMemorySlowOperation::Allocation,storage_,bytes,bits,
+        reuse_backing?NativeAdrenoMemoryDiagnosticReuseRequested:0,true,&pooled_);
+
+    NativeAdrenoCpuState cpu{};
+    IOReturn status=NativeAdrenoQueryCpu4K(&cpu);
+    if(status) {
+        return status;
+    }
+    noteBackingRequest(bytes,reuse_backing);
+    if(backing_cache_count && backingPressure()) {
+        native_adreno_backing_cache_stats[8]=native_adreno_backing_cache_stats[8]+1;
+        (void)trimBackingCache(NativeAdrenoBackingTrimReason::MemoryPressure);
+    }
+
+    if(reuse_backing && takeBacking(bytes,bits,contiguous,write_combined,storage_)) {
+        storage_.diagnostic_source=source;
+        {
+            MemoryStageTime elapsed(MemoryZero,bytes);
+            bzero(storage_.mapping,bytes);
+            __asm__ volatile("dsb sy":::"memory");
+        }
+        return kIOReturnSuccess;
+    }
+
+    const uint64_t limit=UINT64_C(1)<<bits;
+    if(pooled && !write_combined && pool.descriptor && bytes<=pool.bytes) {
+        size_t offset=0;
+        if(poolTake(bytes,&offset)) {
+            const uint64_t physical=pool.physical+offset;
+            if(physical>=limit || bytes>limit-physical) {
+                poolGive(offset,bytes);
+            } else {
+                storage_.spans=IONewData(NativeAdrenoPhysicalSpan,1);
+                if(!storage_.spans) {
+                    poolGive(offset,bytes);
+                    return kIOReturnNoMemory;
+                }
+                storage_.span_capacity=1;
+                storage_.span_count=1;
+                storage_.spans[0]={0,physical,bytes};
+                storage_.mapping=pool.virt+offset;
+                storage_.bytes=bytes;
+                storage_.prepared=true;
+                pooled_=true;
+                pool_offset_=offset;
+                {
+                    MemoryStageTime elapsed(MemoryZero,bytes);
+                    bzero(storage_.mapping,bytes);
+                }
+                native_adreno_pool_stats[1]=native_adreno_pool_stats[1]+1;
+                return kIOReturnSuccess;
+            }
+        }
+        native_adreno_pool_stats[2]=native_adreno_pool_stats[2]+1;
+    }
+
+    IOOptionBits options=static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone);
+    options|=write_combined?kIOMapWriteCombineCache:kIOMapCopybackCache;
+    if(contiguous) {
+        options|=kIOMemoryPhysicallyContiguous;
+    }
+    {
+        MemoryStageTime elapsed(MemoryAllocate,bytes);
+        storage_.descriptor=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,bytes,(limit-1)&~UINT64_C(4095));
+    }
+    if(!storage_.descriptor && backing_cache_count) {
+        native_adreno_backing_cache_stats[9]=native_adreno_backing_cache_stats[9]+1;
+        (void)trimBackingCache(NativeAdrenoBackingTrimReason::AllocationRetry);
+        MemoryStageTime elapsed(MemoryAllocate,bytes);
+        storage_.descriptor=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,bytes,(limit-1)&~UINT64_C(4095));
+    }
+    if(!storage_.descriptor) {
+        return kIOReturnNoMemory;
+    }
+    storage_.write_combined=write_combined;
+    {
+        MemoryStageTime elapsed(MemoryPrepare,bytes);
+        status=storage_.descriptor->prepare();
+    }
+    if(status) {
+        MemoryStageTime elapsed(MemoryDescriptorRelease,bytes);
+        MemorySlowTime slowRelease(NativeAdrenoMemorySlowOperation::OwnedDescriptorRelease,storage_,bytes,bits);
+        storage_.descriptor->release();
+        storage_.descriptor=nullptr;
+        return status;
+    }
+    storage_.prepared=true;
+    storage_.bytes=bytes;
+    storage_.output_bits=bits;
+    storage_.contiguous=contiguous;
+    storage_.mapping=storage_.descriptor->getBytesNoCopy();
+    status=kIOReturnUnsupported;
+    if(!storage_.mapping || ((uintptr_t)storage_.mapping&4095) || bytes>UINTPTR_MAX-(uintptr_t)storage_.mapping ||
+        storage_.descriptor->getLength()!=bytes) {
+        goto failed;
+    }
+    storage_.span_capacity=bytes/4096;
+    storage_.spans=IONewData(NativeAdrenoPhysicalSpan,storage_.span_capacity);
+    if(!storage_.spans) {
+        status=kIOReturnNoMemory;
+        goto failed;
+    }
+    {
+        MemoryStageTime elapsed(MemorySpans,bytes);
+        for(size_t offset=0;offset<bytes;offset+=4096) {
+            IOByteCount length=0;
+            const addr64_t physical=storage_.descriptor->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
+            if(!physical || (physical&4095) || length<4096 || physical>=limit || 4096>limit-physical) {
+                status=kIOReturnUnsupported;
+                goto failed;
+            }
+            if(contiguous && offset && physical!=storage_.spans[0].physical+offset) {
+                status=kIOReturnUnsupported;
+                goto failed;
+            }
+            if(storage_.span_count &&
+                physical==storage_.spans[storage_.span_count-1].physical+storage_.spans[storage_.span_count-1].bytes) {
+                storage_.spans[storage_.span_count-1].bytes+=4096;
+            } else {
+                storage_.spans[storage_.span_count++]={offset,physical,4096,write_combined?0u:1u};
+            }
+        }
+    }
+    {
+        MemoryStageTime elapsed(MemoryZero,bytes);
+        bzero(storage_.mapping,bytes);
+    }
+    native_adreno_pool_stats[5]=native_adreno_pool_stats[5]+1;
+    native_adreno_pool_stats[6]=native_adreno_pool_stats[6]+(uint32_t)storage_.span_count;
+    return kIOReturnSuccess;
+
+failed:
+    (void)release();
+    return status;
 }
 /* An import holds the pages through a memory entry of its own (kIOMemoryPersistent), which references the VM object: the owner may unmap
  * its range while the GPU still uses it (Core Animation frees an image's Shmem once its no-copy buffer is released, before the runtime frees
  * the import), and the object then lives on until the import completes instead of being torn down under a wired UPL (int-233..235: the render
  * thread stuck in vm_deallocate). A range no memory entry can be made of is imported as before; [0] counts the persistent imports, [1] those. */
 extern "C" {volatile uint32_t native_adreno_import_persistent[2];}
-/* Imports whose pages were all non-cacheable ([1]: no CPU maintenance for them) or not ([0]). */
-extern "C" {volatile uint32_t native_adreno_pool_stats_uncached[2];}
 static IOMemoryDescriptor *importRange(uint64_t address,size_t bytes,IODirection direction,void *task)
 {
     const IOOptionBits options=static_cast<IOOptionBits>(direction)|static_cast<IOOptionBits>(kIOMemoryMapperNone);
@@ -233,12 +731,17 @@ static IOMemoryDescriptor *importRange(uint64_t address,size_t bytes,IODirection
 IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes,unsigned bits,size_t budget)
 {
     native_adreno_import_stage=10;
-    if(descriptor_ || imported_ || spans_ || quarantined_)return kIOReturnBusy;
+    if(backed() || storage_.spans || storage_.quarantined)return kIOReturnBusy;
     native_adreno_import_stage=11;
     if(!task || !address || (address&4095) || !bytes || (bytes&4095) || address>UINT64_MAX-bytes || !outputWidth(bits) ||
-        !budget)return kIOReturnBadArgument;
+        !budget || budget>256u*1024u*1024u)return kIOReturnBadArgument;
     native_adreno_import_stage=12;
     if(bytes>budget)return kIOReturnNoResources;
+    storage_.diagnostic_source=NativeAdrenoMemorySource::Imported;
+    storage_.diagnostic_cache_result=NativeAdrenoMemoryCacheResult::NotRequested;
+    storage_.output_bits=bits;
+    MemorySlowTime slow(NativeAdrenoMemorySlowOperation::Import,storage_,bytes,bits,
+        NativeAdrenoMemoryDiagnosticImported,true);
     NativeAdrenoCpuState cpu{};
     native_adreno_import_stage=13;
     IOReturn status=NativeAdrenoQueryCpu4K(&cpu);if(status!=kIOReturnSuccess)return status;
@@ -258,169 +761,131 @@ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes
         if(status==kIOReturnSuccess)read_only_=true;
     }
     if(status!=kIOReturnSuccess) {imported_->release();imported_=nullptr;return status;}
-    prepared_=true;bytes_=bytes;
+    storage_.prepared=true;
+    storage_.bytes=bytes;
     status=kIOReturnUnsupported;
     native_adreno_import_stage=16;
     if(imported_->getLength()!=bytes)goto failed;
     native_adreno_import_stage=17;
-    span_capacity_=bytes/4096;
-    spans_=IONewData(NativeAdrenoPhysicalSpan,span_capacity_);
-    if(!spans_) {status=kIOReturnNoMemory;goto failed;}
+    storage_.span_capacity=bytes/4096;
+    storage_.spans=IONewData(NativeAdrenoPhysicalSpan,storage_.span_capacity);
+    if(!storage_.spans) {
+        status=kIOReturnNoMemory;
+        goto failed;
+    }
     for(size_t offset=0;offset<bytes;offset+=4096) {
         IOByteCount length=0;
         addr64_t physical=imported_->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
         if(!physical || (physical&4095) || length<4096 || physical>=limit || 4096>limit-physical)
             {native_adreno_import_stage=18;native_adreno_import_fail_pa=physical;native_adreno_import_fail_offset=offset;
              status=kIOReturnUnsupported;goto failed;}
-        if(span_count_ && physical==spans_[span_count_-1].physical+spans_[span_count_-1].bytes)
-            spans_[span_count_-1].bytes+=4096;
-        else spans_[span_count_++]={offset,physical,4096};
+        const NativeAdrenoCpuCacheMode mode=NativeAdrenoQueryPageCacheMode(physical);
+        if(mode==NativeAdrenoCpuCacheMode::Unknown) {
+            status=kIOReturnUnsupported;
+            goto failed;
+        }
+        if(!offset) {
+            cpu_cache_mode_=mode;
+        } else if(cpu_cache_mode_!=mode) {
+            cpu_cache_mode_=NativeAdrenoCpuCacheMode::Mixed;
+        }
+        const unsigned writeback=mode==NativeAdrenoCpuCacheMode::Cached?1u:0u;
+        if(storage_.span_count && storage_.spans[storage_.span_count-1].writeback==writeback &&
+            physical==storage_.spans[storage_.span_count-1].physical+storage_.spans[storage_.span_count-1].bytes) {
+            storage_.spans[storage_.span_count-1].bytes+=4096;
+        } else {
+            storage_.spans[storage_.span_count++]={offset,physical,4096,writeback};
+        }
     }
     native_adreno_import_stage=19;
-    owner_uncached_=NativeAdrenoPagesUncached(spans_,span_count_);
-    native_adreno_pool_stats_uncached[owner_uncached_]=native_adreno_pool_stats_uncached[owner_uncached_]+1;
-    native_adreno_bo_memory[7]=native_adreno_bo_memory[7]+(uint32_t)span_count_;
+    native_adreno_pool_stats[7]=native_adreno_pool_stats[7]+(uint32_t)storage_.span_count;
     return kIOReturnSuccess;
 failed:
     (void)release();return status;
 }
-IOReturn NativeAdrenoMemory::borrow(void *mapping,uint64_t physical,size_t bytes)
-{
-    if(descriptor_ || imported_ || spans_ || quarantined_ || borrowed_)return kIOReturnBusy;
-    if(!mapping || ((uintptr_t)mapping&4095) || !physical || (physical&4095) || !bytes || (bytes&4095))return kIOReturnBadArgument;
-    spans_=IONewData(NativeAdrenoPhysicalSpan,1);
-    if(!spans_)return kIOReturnNoMemory;
-    span_capacity_=1;span_count_=1;spans_[0]={0,physical,bytes};
-    mapping_=mapping;bytes_=bytes;prepared_=true;borrowed_=true;
-    bzero(mapping_,bytes);
-    return kIOReturnSuccess;
-}
-IOReturn NativeAdrenoMemory::makeWriteCombined()
-{
-    if(!descriptor_ || system_ || imported_ || !prepared_ || quarantined_ || device_references_ || write_combined_ || !mapping_ || !span_count_)
-        return kIOReturnNotReady;
-    IOReturn status=NativeAdrenoMaintainOwnedPages(mapping_,bytes_,NativeAdrenoCleanInvalidate);
-    if(status)return status;
-    NativeAdrenoNotePhase(NativeAdrenoPhaseAllocate,bytes_);
-    status=NativeAdrenoSetPagesCacheMode(spans_,span_count_,true);
-    if(status)return status;
-    write_combined_=true;return kIOReturnSuccess;
-}
-/* Frees of an owned BO whose first pages a user task still maps: [0] count, [1] the last mapping's page number. */
-extern "C" {volatile uint32_t native_adreno_free_user_mapped[2];}
-extern "C" unsigned int native_pmap_user_mappings(ppnum_t,void **,uint64_t *,char *) __attribute__((weak_import));
-IOReturn NativeAdrenoMemory::release()
+IOReturn NativeAdrenoMemory::release(bool cache_backing)
 {
     native_adreno_trace_stage=30;
-    if(device_references_ || quarantined_)return kIOReturnBusy;
-    /* System memory's pages go back to the VM with the default attribute (vm_object_reap), as they came. */
-    if(system_)write_combined_=false;
-    if(write_combined_) {
-        /* The pages go back to the VM cacheable, as they came. */
-        const IOReturn status=NativeAdrenoSetPagesCacheMode(spans_,span_count_,false);
-        if(status) {quarantined_=true;return status;}
-        write_combined_=false;
+    if(cache_backing) {
+        ++memory_diagnostics.insert_attempts;
+    }
+    if(device_references_ || storage_.quarantined) {
+        if(cache_backing) {
+            noteBackingReject(storage_.quarantined?BackingRejectQuarantined:BackingRejectBusy);
+        }
+        return kIOReturnBusy;
+    }
+    const bool pressure=backingPressure();
+    if(pressure && backing_cache_count) {
+        native_adreno_backing_cache_stats[8]=native_adreno_backing_cache_stats[8]+1;
+        (void)trimBackingCache(NativeAdrenoBackingTrimReason::MemoryPressure);
+    }
+    if(cache_backing) {
+        if(pressure) {
+            noteBackingReject(BackingRejectPressure);
+        } else if(imported_) {
+            noteBackingReject(BackingRejectImported);
+        } else if(pooled_ || !storage_.mapping) {
+            noteBackingReject(BackingRejectPooled);
+        } else if(cacheBacking(storage_)) {
+            read_only_=false;
+            return kIOReturnSuccess;
+        }
     }
     if(imported_) {
-        if(prepared_) {
-            IOReturn status=imported_->complete();
-            if(status!=kIOReturnSuccess) {quarantined_=true;return status;}
-            prepared_=false;
-        }
-        imported_->release();imported_=nullptr;
-    }
-    if(descriptor_ && !system_ && native_pmap_user_mappings && spans_) {
-        /* A page a user task still maps (a BO view over physical pages holds no reference to them) is counted before the pages are freed:
-         * the first page of up to 64 spans, then which process maps it. XNU frees such a page under the mapping (pmap_assert_free). A view
-         * of system memory maps its VM object, which keeps the pages until the view goes. */
-        for(size_t i=0;i<span_count_ && i<64;++i) {
-            char name[17]={};void *pmap=nullptr;uint64_t va=0;
-            if(native_pmap_user_mappings((ppnum_t)(spans_[i].physical>>12),&pmap,&va,name)) {
-                native_adreno_free_user_mapped[0]=native_adreno_free_user_mapped[0]+1;
-                native_adreno_free_user_mapped[1]=(uint32_t)(va>>12);
-                break;
+        if(storage_.prepared) {
+            MemoryStageTime elapsed(MemoryComplete,storage_.bytes);
+            const IOReturn status=imported_->complete();
+            if(status) {
+                storage_.quarantined=true;
+                return status;
             }
+            storage_.prepared=false;
         }
-    }
-    if(descriptor_) {
-        if(prepared_) {
-            native_adreno_trace_stage=31;
-            IOReturn status=descriptor_->complete();
-            native_adreno_trace_stage=32;
-            if(status!=kIOReturnSuccess) {quarantined_=true;return status;}
-            prepared_=false;
+        {
+            MemoryStageTime elapsed(MemoryDescriptorRelease,storage_.bytes);
+            MemorySlowTime slow(NativeAdrenoMemorySlowOperation::ImportedDescriptorRelease,storage_,
+                storage_.bytes,storage_.output_bits);
+            imported_->release();
         }
-        native_adreno_trace_stage=33;
-        descriptor_->release();descriptor_=nullptr;
-        native_adreno_trace_stage=34;
+        imported_=nullptr;
+        cpu_cache_mode_=NativeAdrenoCpuCacheMode::Unknown;
     }
-    if(owned_) {noteOwned(spans_,span_count_,false);owned_=false;}
-    if(system_) {noteSystem(-(int64_t)bytes_);system_=false;}
-    if(borrowed_) {borrowed_=false;prepared_=false;}
-    if(spans_)IODeleteData(spans_,NativeAdrenoPhysicalSpan,span_capacity_);
-    mapping_=nullptr;spans_=nullptr;bytes_=span_count_=span_capacity_=0;read_only_=false;owner_uncached_=false;
-    return kIOReturnSuccess;
-}
-IOReturn NativeAdrenoMemory::releaseSystemInto(NativeAdrenoSystemPages *out)
-{
-    if(!out || out->descriptor || !system_ || !descriptor_ || !prepared_ || imported_ || device_references_ || quarantined_)return release();
-    /* The GPU no longer maps the pages (the free unmapped them first) and every client view holds the descriptor itself. */
-    out->descriptor=descriptor_;out->bytes=bytes_;out->write_combined=write_combined_;out->cleaned=false;
-    descriptor_=nullptr;prepared_=false;
-    return release();
+    if(pooled_) {
+        poolGive(pool_offset_,storage_.bytes);
+        pooled_=false;
+        storage_.prepared=false;
+        pool_offset_=0;
+    }
+    const IOReturn status=destroyOwnedStorage(storage_);
+    if(!status) {
+        read_only_=false;
+    }
+    return status;
 }
 IOReturn NativeAdrenoMemory::holdForDevice()
 {
-    if(!backed() || !prepared_ || !span_count_ || quarantined_)return kIOReturnNotReady;
+    if(!backed() || !storage_.prepared || !storage_.span_count || storage_.quarantined)return kIOReturnNotReady;
     if(device_references_==UINT32_MAX)return kIOReturnNoResources;
     ++device_references_;return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoMemory::retireAfterQuiescence()
 {
     if(!device_references_)return kIOReturnBadArgument;
-    if(quarantined_)return kIOReturnNotReady;
+    if(storage_.quarantined)return kIOReturnNotReady;
     --device_references_;return kIOReturnSuccess;
 }
-IOReturn NativeAdrenoMemory::publishForDevice(size_t offset,size_t bytes,bool writes,bool include_write_combined,unsigned phase)
+IOReturn NativeAdrenoMemory::publishForDevice(size_t offset,size_t bytes)
 {
-    if(!backed() || !prepared_ || quarantined_)return kIOReturnNotReady;
-    if(!bytes || ((offset|bytes)&4095) || offset>bytes_ || bytes>bytes_-offset)return kIOReturnBadArgument;
-    /* Pages every CPU mapping holds non-cacheable carry no line to clean. */
-    if(imported_ && owner_uncached_)return kIOReturnSuccess;
-    if(imported_) {NativeAdrenoNotePhase(phase,bytes);return maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);}
-    if(write_combined_) {  /* no CPU mapping should cache these pages; if one does, reach its lines through the physical pages */
-        if(!include_write_combined)return kIOReturnSuccess;
-        NativeAdrenoNotePhase(phase,bytes);
-        return maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);
-    }
-    NativeAdrenoNotePhase(phase,bytes);
-    if(!mapping_)return maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);   /* system memory */
-    return NativeAdrenoMaintainOwnedPages(static_cast<unsigned char *>(mapping_)+offset,bytes,
-        writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);
+    if(!backed() || !storage_.prepared || storage_.quarantined)return kIOReturnNotReady;
+    if(!bytes || offset>storage_.bytes || bytes>storage_.bytes-offset)return kIOReturnBadArgument;
+    __asm__ volatile("dsb st" ::: "memory");
+    return kIOReturnSuccess;
 }
-IOReturn NativeAdrenoMemory::acquireDeviceWrites(size_t offset,size_t bytes,unsigned phase)
+IOReturn NativeAdrenoMemory::acquireDeviceWrites(size_t offset,size_t bytes)
 {
-    if(!backed() || !prepared_ || quarantined_)return kIOReturnNotReady;
-    if(!bytes || ((offset|bytes)&4095) || offset>bytes_ || bytes>bytes_-offset)return kIOReturnBadArgument;
-    if(imported_ && owner_uncached_)return kIOReturnSuccess;
-    /* Imported pages may hold the owner's unrelated dirty lines next to the GPU's writes: clean as well as invalidate. */
-    if(imported_) {NativeAdrenoNotePhase(phase,bytes);return maintainImported(offset,bytes,NativeAdrenoCleanInvalidate);}
-    if(write_combined_)return kIOReturnSuccess;
-    NativeAdrenoNotePhase(phase,bytes);
-    if(!mapping_)return maintainImported(offset,bytes,NativeAdrenoInvalidate);   /* system memory */
-    return NativeAdrenoMaintainOwnedPages(static_cast<unsigned char *>(mapping_)+offset,bytes,NativeAdrenoInvalidate);
-}
-/* Imported pages have no kernel mapping here (and write-combined ones only a non-cacheable one); maintain each span's part of
- * [offset, offset+bytes) by physical address. */
-IOReturn NativeAdrenoMemory::maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation op)
-{
-    for(size_t i=0;i<span_count_;++i) {
-        const NativeAdrenoPhysicalSpan &span=spans_[i];
-        const size_t begin=offset>span.offset?offset:span.offset;
-        const size_t end=offset+bytes<span.offset+span.bytes?offset+bytes:span.offset+span.bytes;
-        if(begin>=end)continue;
-        const IOReturn status=NativeAdrenoMaintainPhysicalPages(span.physical+(begin-span.offset),end-begin,op);
-        if(status)return status;
-    }
+    if(!backed() || !storage_.prepared || storage_.quarantined)return kIOReturnNotReady;
+    if(!bytes || offset>storage_.bytes || bytes>storage_.bytes-offset)return kIOReturnBadArgument;
+    __asm__ volatile("dsb sy" ::: "memory");
     return kIOReturnSuccess;
 }

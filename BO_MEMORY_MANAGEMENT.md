@@ -1,0 +1,118 @@
+# BO memory management
+
+The driver separates a BO's backing allocation, GPU address range and user CPU
+view. NativeAdrenoUserClient owns the BO. NativeAdrenoVm retains its memory
+while GPU page-table entries exist. NativeAdrenoSubmit retains job references
+until the ring fence completes. AGXDeviceUserClient removes CPU views before
+the user client releases the backing allocation.
+
+## GPU address records
+
+NativeAdrenoVm embeds XNU's `libkern/tree.h` red-black-tree node in each BO
+mapping. The tree orders GPU addresses; the adjacent BOs determine whether a
+new interval overlaps an existing mapping. Insertion, removal and containing
+address lookup are logarithmic in the number of mapped BOs. A linked list
+supports iteration over live objects and gap searches for kernel allocations.
+Turnip selects user BO addresses with its existing Mesa VMA allocator.
+
+Each connection owns an independent address tree, ASID and dynamic page table.
+Its user aperture begins at 4 GiB and ends at the SMMU input address limit;
+a bank limited to 32 input bits uses 0x20000000 as the start.
+The kernel VM owns a shared registry of 16384 mapping records and an augmented
+physical interval tree. Each mapping queries that tree to reject incompatible
+attributes and retain exact byte intervals shared with other mappings. The
+scheduler follows those saved intervals for cross-process GPU dependencies and
+DPU scanout reads. Every process table maps the kernel ring and fence buffers
+at the same low addresses. CP switches TTBR0 and ASID before its client IBs.
+
+VM and user-client handles contain a slot and generation. Slot lookup and the
+free list take constant time. Reusing a record changes its generation, so an
+old handle cannot name the new object. User handles remain opaque ABI values.
+CPU view teardown checks both the current handle and its mapping token.
+
+## Page-table updates
+
+The VM audits the empty context during attach. For each map it checks GPU
+address overlap, physical attributes, physical bounds and both table pools.
+It passes only the new BO's physical ranges to
+`ArmSmmu4KLiveUpdateContextRanges`. That entry point checks the actual old leaf
+descriptors, writes and publishes the changed table pages, and checks the new
+descriptors. An unmap completes ASID invalidation and TLB synchronization
+before the VM retires its memory reference.
+
+The original SMMU entry points remain available to callers supplying complete
+range lists. The BO path uses the incremental entry point. Its recurring work
+depends on the BO being mapped, with no periodic scan of the full aperture.
+The GPU and GMU contexts enable coherent Outer Shareable table walks. Table
+publication uses a store barrier. Each data leaf takes the cached or Normal NC
+policy recorded for its physical span. Submissions retain GPU cache commands,
+fences and ordering barriers without CPU clean/invalidate passes.
+
+## Backing allocations and reuse
+
+Ordinary user BOs use pageable system VM objects wired through a prepared
+IOBufferMemoryDescriptor. AGXDeviceUserClient creates and prepares the descriptor
+outside the driver lock, then NativeAdrenoMemory adopts it and records physical
+runs under the lock. The VM supplies zero-filled WB pages. Their coherent GPU
+WB/WA mappings need store ordering before device access. CPU mappings retain
+the same descriptor, including its VM object and cache attributes. These BOs
+have no permanent kernel virtual address. Turnip reuses completed BOs through
+its existing resource cache.
+
+Explicit contiguous BO requests retain NativeAdrenoBackingStorage reuse after
+all device references and CPU views are released. Matching requires exact bytes,
+physical address width, contiguity and CPU cache policy. Reuse clears the whole
+object. Imports, system VM objects, pool extents and quarantined allocations
+are excluded from this kernel cache.
+
+The cache holds at most 64 allocations and 64 MiB, with a 16 MiB per-object
+limit. Low available memory, allocation failure and client close drain it.
+Failed teardown retains the affected storage in quarantine. The reserved
+contiguous pool uses CPU WB mappings.
+
+Imports query each pinned page's pmap attribute once. COPYBACK, INNERWBACK and
+WTHRU pages use coherent GPU WB/WA leaves; WCOMB uses Normal NC leaves. Managed
+RT pages use Normal NC only when `t733-managed-rt-normal=1`, matching the board's
+XNU page mapping policy. Adjacent physical pages with the same GPU policy form
+one span, so a mixed cached/NC import needs no submission-time attribute query.
+The page owner preserves its CPU cache attributes until GPU unmap. Device and
+unrecognized attributes return Unsupported from import instead of selecting a
+software cache-maintenance path.
+
+The existing active-job alias exclusion remains for imported NC/mixed ranges.
+Coherent resources bypass those overlap queries. Job references are released
+after the GPU fence and CPU ordering barrier.
+
+## Measurements
+
+The USB `gpu` query snapshots counters under the GPU lock and prints after
+unlocking. `vm_map` and `vm_unmap` separate metadata, cache maintenance,
+page-table updates, address-index changes and preflight/release. `pte_map` and
+`pte_unmap` separate validation, old leaf checks, writes/publication, TLB
+synchronization and new leaf checks. These phase totals count successful
+transactions. Existing method counters also count failures.
+
+The memory-stage rows report allocation, prepare, physical-span discovery,
+zeroing, complete and descriptor release. The diagnostic layout retains four
+zero-valued rows for removed cache maintenance and attribute operations.
+Backing-cache rows report hits, misses, retained bytes, evictions and pressure
+drains.
+All values accumulate in bounded memory; ordinary BO operations print no rows.
+
+## Implementation references
+
+- [Linux DRM memory management](https://docs.kernel.org/gpu/drm-mm.html):
+  GEM object ownership, GPU address ranges and TTM page pools.
+- [MSM GEM](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/msm_gem.c):
+  separate backing pages, CPU mapping and GPU virtual-address lifetime.
+- [Mesa Freedreno BO cache](https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/freedreno/drm/freedreno_bo_cache.c):
+  reuse completed private BOs by compatible allocation properties.
+- [Turnip suballocator](https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/freedreno/vulkan/tu_suballoc.cc):
+  place small aligned allocations inside an existing mapped BO.
+- [Linux ARM LPAE page tables](https://github.com/torvalds/linux/blob/master/drivers/iommu/io-pgtable-arm.c):
+  update affected descriptors and synchronize removed translations.
+
+The XNU tree code is included from the kernel headers and retains its existing
+license. These references informed the ownership and data-structure choices;
+their hardware-specific cache and synchronization procedures remain platform
+specific.

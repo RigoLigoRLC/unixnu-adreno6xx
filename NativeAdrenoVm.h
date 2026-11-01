@@ -3,7 +3,7 @@
 #define NATIVE_ADRENO_VM_H
 #include "NativeAdrenoSmmuMemory.h"
 #include "ArmSmmu4KStreams.h"
-#include "NativeAdrenoHandleIndex.h"
+#include <libkern/tree.h>
 struct NativeAdrenoVmRegion {
     NativeAdrenoTablePages *tables;
     ArmSmmu4KLiveArena *arena;
@@ -14,19 +14,27 @@ struct NativeAdrenoVmResult {
     size_t completed_spans;
     bool complete;
 };
-/* Kernel-owned BO mapping transactions, not a userspace ABI or GPU scheduler.
- * Attach only under the actual bank/ASID/stream and powered-MMIO lease, with
- * fault IRQ handling installed and empty native4K arenas already active.
- * The real table allocations, context/streams and BO objects remain retained
- * by the owning driver. No implicit destructor cleanup; detach must succeed.
- * Serialize all methods, table updates and submission under the DRIVER gate.
- * ALL masters must stay genuinely quiesced through each map/unmap transaction.
- * Job counts are lifetime accounting; neither they nor these APIs are fences.
- * Each active region is audited, including the unmodified peer. Partial failure
- * keeps every old/new BO reference, poisons both arenas and attempts to FAULT
- * only the owned streams. Uncertain resources require independent real reset.
- * No VM may be advertised to apps until per-client isolation, submission
- * validation/protection, genuine IRQ fences and reset are implemented. */
+/* NativeAdrenoVm owns the CPU records for BOs mapped into the GPU context.
+ * Each record retains its backing memory, physical ranges and a physical-address
+ * index. Generation handles locate records directly. Mapping validates the BO
+ * against its GPU address neighbors, physical attributes and page-table pools,
+ * then records shared physical intervals as pairs of BO offsets before asking
+ * ArmSmmu4K to install its leaves. Submission follows these recorded intervals
+ * to find overlapping job resources. Unmapping completes TLB synchronization
+ * and removes both ends of each alias before releasing the memory reference.
+ *
+ * The service serializes these operations and owns the powered context, streams
+ * and page-table allocations. NativeAdrenoSubmit retains job references until
+ * the GPU fence completes. A failed page-table transaction keeps the records
+ * and memory. Kernel-context failures fault the owned streams; a process VM
+ * quarantines its own table and allocations without changing other roots. */
+enum : size_t {
+    NativeAdrenoVmHandleIndexBits=14,
+    NativeAdrenoVmMaxObjects=size_t(1)<<NativeAdrenoVmHandleIndexBits,
+    NativeAdrenoAliasQueryLimit=262144,
+    NativeAdrenoAliasHitLimit=1048576,
+    NativeAdrenoAliasRangeLimit=262144
+};
 /* Board hook for sampleWord(): reads one aligned word of physical memory through a fresh uncached mapping; 0 on success. */
 extern "C" int (*native_adreno_dram_read32)(uint64_t physical,uint32_t *value);
 /* The board's reader through the kernel's cacheable physical aperture (null on the host: the BO's own mapping is read). */
@@ -36,142 +44,227 @@ extern "C" int (*native_adreno_cached_read32)(uint64_t physical,uint32_t *value)
  * cached copy the line was dirty (*dirty), when DRAM is unchanged it was a stale clean copy (*stale). 0 on success. */
 extern "C" int (*native_adreno_line_audit)(uint64_t physical,size_t bytes,uint32_t *dirty,uint32_t *stale);
 class NativeAdrenoVm final {
+    struct PhysicalRange;
+    struct MappingAlias;
     struct Mapping {
+        NativeAdrenoVm *owner=nullptr;
         NativeAdrenoMemory *memory=nullptr;
+        ArmSmmu4KRange *ranges=nullptr;
+        uint32_t *physical_order=nullptr;
+        PhysicalRange *physical_ranges=nullptr;
+        MappingAlias *aliases=nullptr; /* All live intervals involving this mapping. */
+        MappingAlias *alias_storage=nullptr; /* One allocation for intervals discovered by this map. */
+        size_t alias_count=0; /* Allocated slots, including intervals whose other mapping was removed. */
+        size_t physical_count=0;
         uint64_t handle=0,iova=0;
         size_t spans=0,mapped_spans=0;
-        unsigned permissions=0,writeback=0,shareability=0,jobs=0,upper=0;
+        unsigned permissions=0,writeback=0,shareability=0,jobs=0;
+        size_t next_free=0;
+        RB_ENTRY(Mapping) address_link;
+        Mapping *previous=nullptr,*next=nullptr;
     };
+    struct AddressTree {
+        RB_HEAD(Root,Mapping) root{};
+        static int compare(Mapping *left,Mapping *right) {
+            if(left->iova<right->iova) {
+                return -1;
+            }
+            return left->iova>right->iova?1:0;
+        }
+        RB_GENERATE(Root,Mapping,address_link,compare)
+    } addresses_;
+    struct PhysicalRange {
+        Mapping *mapping=nullptr;
+        uint64_t physical=0,end=0,subtree_end=0;
+        size_t offset=0;
+        unsigned writeback=0;
+        RB_ENTRY(PhysicalRange) link;
+        void augment() {
+            subtree_end=end;
+            const PhysicalRange *left=RB_LEFT(this,link),*right=RB_RIGHT(this,link);
+            if(left && left->subtree_end>subtree_end) {
+                subtree_end=left->subtree_end;
+            }
+            if(right && right->subtree_end>subtree_end) {
+                subtree_end=right->subtree_end;
+            }
+        }
+    };
+    /* PhysicalTree contains each mapped span once. Augmented ends let a byte
+     * interval find overlapping mappings without scanning other BOs. */
+    struct PhysicalTree {
+        RB_HEAD(PhysicalRoot,PhysicalRange) root{};
+        void augment(PhysicalRange *range) {
+            while(range) {
+                range->augment();
+                range=PhysicalRoot_RB_GETPARENT(range);
+            }
+        }
+        static int compare(PhysicalRange *left,PhysicalRange *right) {
+            if(left->physical!=right->physical) {
+                return left->physical<right->physical?-1:1;
+            }
+            if(left==right) {
+                return 0;
+            }
+            return uintptr_t(left)<uintptr_t(right)?-1:1;
+        }
+#pragma push_macro("RB_AUGMENT")
+#undef RB_AUGMENT
+#define RB_AUGMENT(node) augment(node)
+        RB_GENERATE(PhysicalRoot,PhysicalRange,link,compare)
+#pragma pop_macro("RB_AUGMENT")
+    } physical_;
+    /* MappingAlias records equal physical bytes at two BO offsets. Its newer
+     * mapping owns the storage; both mappings link the record until either is
+     * unmapped. Adjacent equal-offset translations share one record. */
+    struct MappingAlias {
+        Mapping *mapping[2]{};
+        size_t offset[2]{},bytes=0;
+        MappingAlias *next[2]{},*previous[2]{};
+    };
+    struct AliasMergeState {
+        uint64_t generation=0;
+        size_t offset=0,other_offset=0,bytes=0,index=0;
+    };
+    struct AliasBuild {
+        Mapping *owner;
+        MappingAlias *output;
+        size_t count,limit;
+        uint64_t generation,hits;
+        IOReturn status;
+        unsigned permissions,shareability,writeback;
+    };
+    /* The kernel VM owns records shared by every process VM. Each process
+     * keeps its own address tree and page tables; global handles and physical
+     * intervals let the scheduler track IOSurfaces imported by several clients. */
+    NativeAdrenoVm *registry_=this;
+    size_t registry_users_=0,total_objects_=0;
     Mapping *mappings_=nullptr;
-    NativeAdrenoHandleIndex index_;   /* live handle -> its mappings_ slot */
-    size_t free_hint_=0;   /* no free mappings_ slot below it */
-    size_t high_=0;   /* no live mappings_ slot at or above it: the walks over every mapping stop there */
-    size_t class_spans_[16]{};   /* mapped spans per alias class, so a map counts the other classes without a walk */
-    size_t import_spans_[16]{};   /* the imported mappings' ranges per alias class */
+    AliasMergeState *alias_merge_=nullptr;
+    size_t alias_storage_count_=0;
+    uint64_t alias_build_generation_=0;
+    Mapping *first_=nullptr,*last_=nullptr;
     NativeAdrenoVmRegion regions_[2]{};
     ArmSmmu4KLiveVisibility visibility_[2]{};
     ArmSmmu4KIo io_{};
     ArmSmmu4KContextConfig *context_=nullptr;
     ArmSmmu4KStreamState *streams_=nullptr;
-    /* The mapped objects of each region by GPU address (mappings_ slots, the lower region's first): a map finds its place and a free
-     * hole there. It replaced a sorted list of every mapped span (one per 4 KiB page of system memory, about a million), whose insert
-     * moved the list's tail and whose growth copied it under the driver's lock (i fc8d9e7fe: BoMap held it up to 70 ms, 3.0 s in all). */
-    uint32_t *order_=nullptr;
-    size_t order_count_[2]{};
-    /* One mapping's spans as the table transaction takes them, and the kit's physical-alias sort scratch
-     * (ArmSmmu4KLiveArena::alias_scratch) for them: capacity_ entries each, grown to the largest mapping. */
-    ArmSmmu4KRange *changes_=nullptr;
-    uint32_t *alias_scratch_=nullptr;
-    size_t capacity_=0,lower_count_=0,upper_count_=0,objects_=0;
-    /* Both tables grow on demand with no limit but memory (a VM per GPU process: most use a few hundred objects; a fixed table filled up
-     * at 1024, then 4096 mappings: int-237, i567). */
-    size_t mapping_capacity_=0;
-    bool growScratch(size_t needed);
-    void freeTables();
-    bool growMappings();
+    size_t lower_count_=0,upper_count_=0,objects_=0,free_head_=0,mapping_capacity_=0;
+    size_t reserved_objects_=0;
+    uint32_t clients_=0;
+    uint64_t budget_generation_=1;
+    size_t class_objects_[32]{};
     unsigned budget_=0;
     uint64_t next_handle_=1;
-    bool attached_=false,poisoned_=false,distrust_write_combined_=false,unusable_=false;
-    uint64_t faults_=0,hangs_=0;
-    bool fault_streams_=true;   /* a failure faults the bank's streams; off for a process table, whose streams are the kernel table's too */
+    bool attached_=false,poisoned_=false;
+    bool fault_streams_=true;
+    bool cached_coherent_imports_=false;
+    bool map_busy_alias_=false,map_alias_limit_=false;
+    void (*backing_release_observer_)(uint64_t)=nullptr;
+    IOReturn (*mapping_added_)(void *,uint64_t)=nullptr;
+    void (*mapping_removed_)(void *,uint64_t)=nullptr;
+    void *mapping_observer_context_=nullptr;
     NativeAdrenoVmResult result_{};
-    /* A region with the existing ranges the kit is told of: none for a map (its pages' leaves must be invalid, which the kit checks in
-     * the table), the mapping's own for its unmap. The whole-verification update of a region is its first, which finds it empty. */
-    ArmSmmu4KLiveRegion region(unsigned,const ArmSmmu4KRange *ranges=nullptr,size_t count=0) const;
-    ArmSmmu4KStatus observe() const;
-    /* The route check alone: the table walk is the update's own (it verifies every region before the first store and after the last), so
-     * map/unmap pay a full extra audit only every 64th operation (int-139: 4 full walks of the 2 GiB aperture made every map 70 ms). */
-    ArmSmmu4KStatus observeStreamsOnly() const;
-    ArmSmmu4KStatus observeCheap();
-    unsigned since_audit_=0;
+    ArmSmmu4KLiveRegion region(unsigned) const;
+    ArmSmmu4KStatus observeEmptyTables() const;
     IOReturn fail(ArmSmmu4KStatus);
-    Mapping *find(uint64_t);
-    const Mapping *find(uint64_t) const;
-    size_t orderBegin(unsigned upper) const {return upper?order_count_[0]:0;}
-    size_t orderEnd(unsigned upper) const {return upper?order_count_[0]+order_count_[1]:order_count_[0];}
-    /* The first mapping of the region whose last byte is at or past iova (orderEnd when none). */
-    size_t orderAt(unsigned upper,uint64_t iova) const;
-    void insert(Mapping *);
-    bool erase(Mapping *);
-    IOReturn preflight(const NativeAdrenoMemory *,unsigned,uint64_t,unsigned,unsigned,unsigned,bool exclusive) const;
-    bool exclusivePages(const NativeAdrenoMemory *,unsigned cls) const;
+    Mapping *find(uint64_t) const;
+    const Mapping *findAddressRecord(uint64_t) const;
+    Mapping *lowerBound(uint64_t) const;
+    void insert(Mapping *,unsigned);
+    void erase(Mapping *,unsigned);
+    IOReturn preflight(const NativeAdrenoMemory *,unsigned,uint64_t,unsigned,unsigned,unsigned) const;
+    bool activeAlias(const NativeAdrenoMemory *,uint64_t excluded) const;
+    bool collectPhysicalAliases(const PhysicalRange *,uint64_t,uint64_t,size_t,AliasBuild &);
+    IOReturn buildMappingAliases(Mapping *,const NativeAdrenoMemory *,PhysicalRange *,MappingAlias **,size_t *,unsigned,unsigned);
+    static void linkMappingAlias(MappingAlias &);
+    static void unlinkMappingAlias(MappingAlias &);
+    static bool visitPhysical(const PhysicalRange *,uint64_t,uint64_t,
+        bool (*)(void *,uint64_t,size_t,size_t),void *);
 public:
     NativeAdrenoVm()=default;
     ~NativeAdrenoVm()=default;
     NativeAdrenoVm(const NativeAdrenoVm &)=delete;
     NativeAdrenoVm &operator=(const NativeAdrenoVm &)=delete;
+    IOReturn shareResources(NativeAdrenoVm *);
     IOReturn attach(const ArmSmmu4KIo *,ArmSmmu4KContextConfig *,ArmSmmu4KStreamState *,
         const NativeAdrenoVmRegion *lower,const NativeAdrenoVmRegion *upper,
-        size_t first_spans,unsigned poll_budget);
+        size_t max_objects,unsigned poll_budget);
     /* Frees CPU metadata only, with no BOs remaining. Never releases roots,
      * disables a bank or returns the platform lease; board lifecycle owns it. */
     IOReturn detach();
+    /* A642L permits coherent cached mappings. Each backing records its CPU
+     * page attributes before the VM installs the corresponding GPU leaves. */
+    IOReturn enableCachedCoherentImports(uint32_t chip_id);
+    bool cachedCoherentImports() const {return cached_coherent_imports_;}
     IOReturn findAddress(unsigned upper,size_t bytes,uint64_t alignment,uint64_t *iova) const;
     IOReturn map(NativeAdrenoMemory *,unsigned upper,uint64_t iova,
         unsigned permissions,unsigned writeback,unsigned shareability,uint64_t *handle);
     IOReturn unmap(uint64_t handle);
     IOReturn holdJob(uint64_t handle);
+    bool resourceBusy(uint64_t handle) const;
+    bool resourceHasUncachedImport(uint64_t handle) const;
+    bool resourceImported(uint64_t handle) const;
+    /* The borrowed backing remains valid while the service holds its GPU lock.
+     * Generation handles reject an unmapped or reused record. */
+    const NativeAdrenoMemory *resourceBacking(uint64_t handle) const;
+    /* The observer releases diagnostic descriptor references before a mapped
+     * backing loses its VM reference. The service serializes the callback. */
+    void setBackingReleaseObserver(void (*observer)(uint64_t)) {
+        backing_release_observer_=observer;
+    }
+    void setMappingObserver(IOReturn (*observer)(void *,uint64_t),
+        void (*removed)(void *,uint64_t),void *context) {
+        mapping_added_=observer;
+        mapping_removed_=removed;
+        mapping_observer_context_=context;
+    }
+    /* Physical ranges are visited during display acquisition and map creation.
+     * The callback receives the mapped handle and exact overlapping BO bytes. */
+    IOReturn visitPhysicalAliases(uint64_t,size_t,
+        bool (*)(void *,uint64_t,size_t,size_t),void *) const;
+    /* The callback receives the same mapping and each static physical alias at
+     * the translated BO interval. A conflict or exhausted query budget returns
+     * Busy; the caller retries after active jobs retire. */
+    IOReturn visitResourceAliases(uint64_t handle,size_t offset,size_t bytes,size_t cache_line,
+        bool (*)(void *,uint64_t,size_t,size_t),void *,uint64_t *queries,uint64_t *hits) const;
     /* TLBIALL for the context bank plus TLBSYNC: drops every cached translation of the bank whatever its ASID. Unmap already
      * synchronizes by ASID; this is the stronger form the submit path uses before each submission (int-070: on sheng the CP read
      * zeros from an IB whose table entry and DRAM were both correct, after the address had been mapped to other pages before). */
     IOReturn invalidateTlb();
-    /* Cleans and invalidates the CPU caches over every mapped BO (whole objects; imported ones through their physical pages), so
-     * no CPU cache line can hold data the GPU should see or hide what it wrote. Lines are physically tagged, so this also reaches
-     * lines a user mapping of the same pages left behind. int-070 runs it before every submission. */
-    IOReturn publishMapped();
-    /* The submit path saw a CPU-cached word that DRAM did not hold yet in a client's BO: from now on write-combined BOs are maintained
-     * like any other (sticky; the safe behaviour of int-070..097). */
-    void distrustWriteCombined() {distrust_write_combined_=true;}
-    bool writeCombinedTrusted() const {return !distrust_write_combined_;}
-    /* After a submission completed: cleans and invalidates the CPU caches over every GPU-writable imported BO, so the owner's mapping
-     * (an IOSurface) reads what the GPU wrote, not a line prefetched while the GPU ran. Jobs name only their IBs, so every such BO
-     * is covered. int-071: an imported render target read back 672 of 4096 texels stale. */
-    IOReturn acquireImported();
+    IOReturn invalidateAsid();
+    void keepStreamsOnFailure() {
+        fault_streams_=false;
+    }
+    uint64_t ttbr0() const {
+        return regions_[0].state && context_?
+            regions_[0].state->tables.root_physical|(uint64_t(context_->asid)<<48):0;
+    }
+    NativeAdrenoVm *resourceVm(uint64_t handle) const;
+    unsigned bank() const {
+        return streams_?streams_->bank:0;
+    }
     /* Diagnostic, never a proof of coherence: the 32-bit word at a mapped GPU address as the kernel's cacheable alias reads it
      * and, when the board installed native_adreno_dram_read32, as DRAM reads it through an uncached mapping (else ~0). */
     IOReturn sampleWord(uint64_t iova,uint32_t *cached,uint32_t *dram) const;
-    /* Every line of [iova, iova+bytes) that lies in a write-combined BO, through native_adreno_line_audit: *dirty counts lines a CPU
-     * cache held newer than DRAM (a client view that caches after all; each such line is written back by the audit), *stale clean
-     * copies, *lines the lines compared. kIOReturnUnsupported without a board hook. int-099 sampled one word and wrote its line back
-     * before reading DRAM, so it could never see a dirty line. */
-    /* Before a submission while write-combined BOs are trusted: every page of every mapped write-combined BO that XNU set back to the
-     * default attribute is write-combined again (and its lines written back); *reset counts the pages. */
-    IOReturn reassertWriteCombined(uint32_t *reset) const;
-    IOReturn auditRange(uint64_t iova,size_t bytes,uint32_t *lines,uint32_t *dirty,uint32_t *stale) const;
     /* Read-only description of a live mapping; never pins or extends it. */
     IOReturn describe(uint64_t handle,uint64_t *iova,size_t *bytes,unsigned *permissions) const;
     /* Up to `count` dwords of a mapped kernel-owned BO at a GPU address (through the kernel's own mapping), for the board log. */
     IOReturn peekWords(uint64_t iova,uint32_t *out,size_t count) const;
-    /* The same after cleaning and invalidating the CPU cache lines over the words: a BO zeroed through the kernel's cacheable mapping keeps
-     * clean lines of those zeros there, which a plain read returns instead of what the client wrote through its own mapping since. */
-    IOReturn peekWordsUncached(uint64_t iova,uint32_t *out,size_t count) const;
-    /* The physical address of the leaf descriptor that maps the page at target (the table walk coherence proof); false when none does. */
-    bool leafPhysical(uint64_t target,uint64_t *physical) const;
-    /* The context bank's fault record for the board log: FSR, FAR (lo, hi) and FSYNR0. Reads only; never clears a fault. */
-    IOReturn faultState(uint32_t out[4]) const;
-    /* Map handles count up and are never reused, so they order mappings in time: the next one, and the one over a GPU address (0: none). */
-    uint64_t nextHandle() const {return next_handle_;}
-    uint64_t handleAt(uint64_t iova) const;
     /* Only a scheduler's actual successful GPU completion may call this.
      * A timeout, interrupt bit alone or CPU-written timestamp is insufficient. */
     IOReturn retireJobAfterCompletion(uint64_t handle);
     bool poisoned() const {return poisoned_;}
-    /* A GPU hang this VM's submission caused. As Metal does after a GPU restart, only the hung command buffer is lost: the process keeps
-     * its device, its queued submissions run again and new ones are taken (msm instead makes the VM unusable, and the client then
-     * reports its device lost; when that client was the render server, backboardd ended and SpringBoard's restart stalled, untagged-1f4ba0a24).
-     * hangs() counts them; faults(), which a client turns into a lost device, stays for a VM whose table failed. */
-    void noteHang(bool) {++hangs_;}
-    uint64_t hangs() const {return hangs_;}
-    uint64_t faults() const {return faults_;}
-    bool unusable() const {return unusable_;}
-    /* A process address space: its failure poisons only itself (its tables and BOs), never the streams the kernel table shares. */
-    void keepStreamsOnFailure() {fault_streams_=false;}
-    /* The lower region's table root with this VM's ASID in bits 63:48: what the bank's TTBR0 holds while the GPU runs this VM. */
-    uint64_t ttbr0() const {return regions_[0].state && context_?regions_[0].state->tables.root_physical|(uint64_t)context_->asid<<48:0;}
-    unsigned asid() const {return context_?context_->asid:0;}
-    /* TLBIASID of this VM's ASID (its translations only), for an ASID about to be given to another table. */
-    IOReturn invalidateAsid();
-    size_t objectCount() const {return objects_;}
+    size_t objectCount() const {return registry_->total_objects_;}
+    size_t objectCapacity() const {return registry_->mapping_capacity_;}
+    size_t reservedObjects() const {return registry_->reserved_objects_;}
+    uint32_t clientCount() const {return registry_->clients_;}
+    uint64_t budgetGeneration() const {return registry_->budget_generation_;}
+    bool mapBusyAlias() const {return map_busy_alias_;}
+    bool mapAliasLimit() const {return map_alias_limit_;}
+    void addClient();
+    void removeClient();
     size_t spanCount() const {return lower_count_+upper_count_;}
     NativeAdrenoVmResult lastResult() const {return result_;}
 };

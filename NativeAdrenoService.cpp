@@ -1,646 +1,1446 @@
 /* SPDX-License-Identifier: MIT */
-/* IOKit surface for the native Adreno backend. This file is compiled against
- * the real source-kernel headers; it does not run on any host. start() parses
- * the provider's device-tree reg windows through NativeAdrenoBoard and maps the
- * first window, then stops: board power, GMU boot and SMMU context programming
- * are not implemented for Darwin yet, so the service refuses to publish rather
- * than expose a device that cannot execute. newUserClient and the external
- * method table are present because they are fixed by the core ABI; no client
- * can be created while the GPU is not ready. clientMemoryForType has no
- * descriptor to return until a client owns a leased BO, so it refuses. */
+#include "NativeAdrenoA6xxService.h"
+#include "NativeAdrenoA6xxGmu.h"
+#include "NativeAdrenoA6xxHwInit.h"
+#include "NativeAdrenoA6xxZap.h"
+#include "NativeAdrenoA6xxSmmu.h"
+#include "NativeAdrenoGpuContext.h"
+#include "NativeAdrenoGpuProfile.h"
+#include "NativeAdrenoCpInit.h"
+#include "NativeAdrenoIrq.h"
+#include "NativeAdrenoKernelTime.h"
+#include "NativeAdrenoUserClient.h"
+#include "ArmSmmu4KMmio.h"
+#include "AdrenoPM4.h"
 #include <IOKit/IODeviceMemory.h>
-#include <string.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOService.h>
-#include <IOKit/IOUserClient.h>
-#include "NativeAdrenoBoard.h"
-#include "NativeAdrenoFirmware.h"
-#include "NativeAdrenoGmuConfig.h"
-#include "NativeAdrenoGmuContext.h"
-#include "NativeAdrenoGmuPlatform.h"
-#include "NativeAdrenoGmuService.h"
-#include "NativeAdrenoSmmuContext.h"
-#include "NativeAdrenoIrq.h"
-#include "NativeAdrenoKernelTime.h"
-#include "NativeAdrenoCpInit.h"
-#include "NativeAdrenoPwrup.h"
-#include "NativeAdrenoRing.h"
-#include "ShengGmuCommandDb.h"
-#include "NativeAdrenoSmmuService.h"
+#include <kern/thread.h>
+#include <kern/clock.h>
 #include <pexpert/pexpert.h>
-#if __has_include("ShengGmuSource.h")
-#include "ShengGmuSource.h"
-#define NATIVE_ADRENO_HAVE_GMU_RULES 1
-#endif
-#if __has_include("ShengGmuVotesSource.h")
-#include "ShengGmuVotesSource.h"
-#define NATIVE_ADRENO_HAVE_GMU_VOTES 1
-#endif
-#if __has_include("ShengGmuCommandDbSource.h")
-#include "ShengGmuCommandDbSource.h"
-#define NATIVE_ADRENO_HAVE_COMMAND_DB 1
-#endif
-extern "C" const uint8_t native_adreno_firmware_image[] __attribute__((weak));
-extern "C" const uint64_t native_adreno_firmware_image_size __attribute__((weak));
-extern "C" const uint8_t native_adreno_sqe_firmware_image[] __attribute__((weak));
-extern "C" const uint64_t native_adreno_sqe_firmware_image_size __attribute__((weak));
-#include "NativeAdrenoUserClient.h"
-/* Physical address of the fence page (the CP writes its timestamps there): the board log reads it from DRAM and through the CPU cache. */
-extern "C" {volatile uint64_t native_adreno_fence_phys=0;}
-extern "C" volatile uint32_t native_adreno_diag;   /* NativeAdrenoSubmit.cpp */
+#include <string.h>
 
-class NativeAdrenoGpuClient;
-static IOUserClient *createGpuClient(task_t,void *,UInt32,OSDictionary *,NativeAdrenoUserClient *);
-
-struct NativeAdrenoGpuWindow {
-    volatile uint8_t *base;
-    size_t bytes;
-};
-class NativeAdrenoGpuService : public IOService {
-    OSDeclareDefaultStructors(NativeAdrenoGpuService)
-    OSSharedPtr<IOMemoryMap> maps_[2];
-    NativeAdrenoGmuContext gmu_ctx_;
-    NativeAdrenoGmuPlatform gmu_platform_;
-    ShengGmuIo gmu_io_{};
-    ShengGmuDevice gmu_device_{};
-    ShengGmuStartupResult gmu_startup_{};
-    NativeAdrenoFirmwareView firmware_{};
-    bool gmu_io_bound_=false,firmware_valid_=false,ready_=false;
-    /* Set only once a separate GPU-stream context exists; until then the CP path below is refused. */
-    bool gpu_context_ready_=false;
-    NativeAdrenoMemory ring_mem_,fence_mem_,sqe_mem_,pwrup_mem_;
-    NativeAdrenoRing ring_;
-    uint64_t ring_map_=0,fence_map_=0,sqe_map_=0,pwrup_map_=0;
-    NativeAdrenoIrq irq_;
-    NativeAdrenoSubmit *execbuf_=nullptr;
-    NativeAdrenoUserClient *core_=nullptr;
-    bool core_ready_=false;
-    struct RingCache {NativeAdrenoMemory *ring;NativeAdrenoMemory *fence;};
-    RingCache ring_cache_{};
-    NativeAdrenoGpuWindow ring_window_{};   /* the ring keeps a pointer to it: it must outlive start() */
-    static int gpu_read32(void *,uint32_t,uint32_t *);
-    static int gmu_fence_status(void *,int clear,uint32_t *status);
-    static int gpu_write32(void *,uint32_t,uint32_t);
-    static int gpu_barrier(void *);
-    static int ring_publish(void *,const volatile uint32_t *,size_t);
-    static int fence_acquire(void *,volatile uint32_t *,size_t);
-    static uint64_t ring_now(void *);
-public:
-    IOService *probe(IOService *provider,SInt32 *score) APPLE_KEXT_OVERRIDE;
-    bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
-    void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
-    IOReturn newUserClient(task_t owningTask,void *securityID,UInt32 type,
-        OSDictionary *properties,IOUserClient **handler) APPLE_KEXT_OVERRIDE;
-};
-OSDefineMetaClassAndStructors(NativeAdrenoGpuService,IOService)
-
-static bool advertisesAdreno(IOService *provider)
-{
-    OSObject *property=provider?provider->getProperty("compatible"):nullptr;
-    OSData *data=OSDynamicCast(OSData,property);
-    if(!data || !data->getBytesNoCopy() || !data->getLength())return false;
-    const char *text=static_cast<const char *>(data->getBytesNoCopy());
-    const size_t length=data->getLength();
-    static const char needle[]="qcom,adreno";
-    for(size_t at=0;at+sizeof(needle)-1<=length;++at) {
-        size_t index=0;
-        while(index<sizeof(needle)-1 && text[at+index]==needle[index])++index;
-        if(index==sizeof(needle)-1)return true;
-    }
-    return false;
-}
-struct NativeAdrenoSmmuWindow {
-    volatile uint8_t *base;
-    size_t bytes;
-};
-static int smmu_read32(void *cookie,size_t at,uint32_t *value)
-{
-    NativeAdrenoSmmuWindow *window=static_cast<NativeAdrenoSmmuWindow *>(cookie);
-    if(!window || !value || !window->base || (at&3) || at+4>window->bytes)return 1;
-    *value=*reinterpret_cast<volatile uint32_t *>(window->base+at);
-    return 0;
-}
-static int smmu_read64(void *cookie,size_t at,uint64_t *value)
-{
-    NativeAdrenoSmmuWindow *window=static_cast<NativeAdrenoSmmuWindow *>(cookie);
-    if(!window || !value || !window->base || (at&7) || at+8>window->bytes)return 1;
-    *value=*reinterpret_cast<volatile uint64_t *>(window->base+at);
-    return 0;
-}
-static int smmu_write32(void *cookie,size_t at,uint32_t value)
-{
-    NativeAdrenoSmmuWindow *window=static_cast<NativeAdrenoSmmuWindow *>(cookie);
-    if(!window || !window->base || (at&3) || at+4>window->bytes)return 1;
-    *reinterpret_cast<volatile uint32_t *>(window->base+at)=value;
-    return 0;
-}
-static int smmu_write64(void *cookie,size_t at,uint64_t value)
-{
-    NativeAdrenoSmmuWindow *window=static_cast<NativeAdrenoSmmuWindow *>(cookie);
-    if(!window || !window->base || (at&7) || at+8>window->bytes)return 1;
-    *reinterpret_cast<volatile uint64_t *>(window->base+at)=value;
-    return 0;
-}
-static int smmu_barrier(void *cookie)
-{
-    if(!cookie)return 1;
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    return 0;
-}
-int NativeAdrenoGpuService::gpu_read32(void *cookie,uint32_t reg,uint32_t *value)
-{
-    NativeAdrenoGpuWindow *window=static_cast<NativeAdrenoGpuWindow *>(cookie);
-    const size_t at=size_t(reg)*4;
-    if(!window || !value || !window->base || at+4>window->bytes)return 1;
-    *value=*reinterpret_cast<volatile uint32_t *>(window->base+at);
-    return 0;
-}
-int NativeAdrenoGpuService::gpu_write32(void *cookie,uint32_t reg,uint32_t value)
-{
-    NativeAdrenoGpuWindow *window=static_cast<NativeAdrenoGpuWindow *>(cookie);
-    const size_t at=size_t(reg)*4;
-    if(!window || !window->base || at+4>window->bytes)return 1;
-    *reinterpret_cast<volatile uint32_t *>(window->base+at)=value;
-    return 0;
-}
-/* GMU_AHB_FENCE_STATUS (0x23b13) and GMU_AHB_FENCE_STATUS_CLR (0x23b14) in the GMU core window, whose byte offset is the GPU word
- * offset times 4 minus SHENG_GMU_CORE_GPU_DELTA (0x6a000). */
-int NativeAdrenoGpuService::gmu_fence_status(void *cookie,int clear,uint32_t *status)
-{
-    const ShengGmuIo *io=static_cast<const ShengGmuIo *>(cookie);
-    if(!io || !io->read32 || !status)return 1;
-    if(clear)return io->write32(io->cookie,ShengGmuCore,0x23b14u*4u-0x6a000u,0x7u);
-    return io->read32(io->cookie,ShengGmuCore,0x23b13u*4u-0x6a000u,status);
-}
-int NativeAdrenoGpuService::gpu_barrier(void *cookie)
-{
-    if(!cookie)return 1;
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    return 0;
-}
-int NativeAdrenoGpuService::ring_publish(void *cookie,const volatile uint32_t *words,size_t bytes)
-{
-    NativeAdrenoGpuService::RingCache *cache=static_cast<RingCache *>(cookie);
-    return cache && cache->ring && cache->ring->publishForDevice(0,bytes,false)==kIOReturnSuccess?0:1;
-}
-int NativeAdrenoGpuService::fence_acquire(void *cookie,volatile uint32_t *words,size_t bytes)
-{
-    NativeAdrenoGpuService::RingCache *cache=static_cast<RingCache *>(cookie);
-    return cache && cache->fence && cache->fence->acquireDeviceWrites(0,bytes)==kIOReturnSuccess?0:1;
-}
-uint64_t NativeAdrenoGpuService::ring_now(void *)
-{
-    uint64_t microseconds=0;
-    NativeAdrenoKernelTime::now_us(nullptr,&microseconds);
-    return microseconds;
-}
+extern "C" const uint8_t native_adreno_firmware_image[];
+extern "C" const uint64_t native_adreno_firmware_image_size;
+extern "C" const uint8_t native_adreno_sqe_firmware_image[];
+extern "C" const uint64_t native_adreno_sqe_firmware_image_size;
 extern "C" uint64_t (*native_adreno_vm_now_us)(void);
-static uint64_t vm_clock_us(void) {uint64_t microseconds=0;NativeAdrenoKernelTime::now_us(nullptr,&microseconds);return microseconds;}
-IOService *NativeAdrenoGpuService::probe(IOService *provider,SInt32 *score)
-{
-    native_adreno_vm_now_us=vm_clock_us;
-    if(!advertisesAdreno(provider))return nullptr;
-    if(score)*score=1000;
-    return this;
+extern "C" volatile uint32_t native_adreno_pool_mib;
+extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *,NativeAdrenoSubmit *,NativeAdrenoRing *,
+    const NativeAdrenoRingClock *,const NativeAdrenoTimer *,const NativeAdrenoAbiDeviceInfo *,uint32_t,uint32_t,
+    NativeAdrenoGpuContext *);
+extern "C" void native_adreno_fault(void);
+extern "C" int native_adreno_progress(uint32_t *,uint32_t *);
+extern "C" IOReturn native_adreno_initialize_classes(void);
+extern "C" {
+volatile uint64_t native_adreno_fence_phys=0;
+volatile uint32_t native_adreno_a6xx_stats[24];
 }
-bool NativeAdrenoGpuService::start(IOService *provider)
+
+namespace {
+uint32_t performanceWake = 0;
+
+uint32_t performanceLevelFor(uint64_t frequencyHz)
 {
-    if(!IOService::start(provider))return false;
-    OSData *reg=OSDynamicCast(OSData,provider->getProperty("reg"));
-    OSData *address=OSDynamicCast(OSData,provider->getProperty("#address-cells"));
-    OSData *size=OSDynamicCast(OSData,provider->getProperty("#size-cells"));
-    NativeAdrenoWindow windows[NativeAdrenoMaxWindows]{};
-    size_t count=0;
-    uint32_t address_cells=2,size_cells=2;
-    if(address && address->getLength()>=4)
-        address_cells=*static_cast<const uint32_t *>(address->getBytesNoCopy());
-    if(size && size->getLength()>=4)
-        size_cells=*static_cast<const uint32_t *>(size->getBytesNoCopy());
-    if(!reg || NativeAdrenoBoard::parseReg(
-        static_cast<const uint8_t *>(reg->getBytesNoCopy()),reg->getLength(),
-        address_cells,size_cells,windows,NativeAdrenoMaxWindows,&count)!=kIOReturnSuccess) {
-        IOLog("NativeAdreno: provider reg windows are not usable\n");
-        IOService::stop(provider);
-        return false;
+    uint32_t level = 1;
+    while (level < NativeAdrenoA6xxOperatingPointCount &&
+        NativeAdrenoA6xxOperatingPoints[level - 1].frequencyHz < frequencyHz) {
+        ++level;
     }
-    if(count<2) {
-        IOLog("NativeAdreno: GPU node needs the register and CX windows\n");
-        IOService::stop(provider);
-        return false;
+
+    return level;
+}
+
+/* A642LState owns all mappings, contexts and DMA allocations for this boot.
+ * A failed attempt retains them while the GMU and CP are stopped. The CPU
+ * framebuffer continues independently of whether this object publishes a GPU.
+ *
+ * Its hardware worker reads the GMU AO busy counter and selects an operating
+ * point every 16 ms. Ring publication only records submission time and wakes
+ * that worker after a 50 ms gap. The worker applies the board's temperature
+ * cap, waits for the paired frequency/DDR HFI acknowledgement, and sends the
+ * resulting state to the bounded capture recorder. The same worker owns fault
+ * shutdown and performance-counter OOB acquisition and release. */
+class A642LState final {
+    OSSharedPtr<IOMemoryMap> maps_[NativeAdrenoA6xxDomains];
+    OSSharedPtr<IOMemoryMap> zapMap_;
+    OSSharedPtr<IOMemoryMap> smmuMap_;
+    NativeAdrenoA6xxResources resources_{};
+    NativeAdrenoA6xxWindow windows_[NativeAdrenoA6xxDomains]{};
+    NativeAdrenoA6xxPower power_;
+    NativeAdrenoA6xxGmu gmu_;
+    NativeAdrenoA6xxReport failedPowerReport_{},failedGmuReport_{};
+    bool failureCaptured_=false;
+    NativeAdrenoA6xxZap zap_;
+    NativeAdrenoA6xxSmmu smmuProvider_;
+    NativeAdrenoGmuContext gmuContext_;
+    NativeAdrenoGpuContext gpuContext_;
+    NativeAdrenoGpuContext lpacContext_;
+    NativeAdrenoGmuContextReport gmuContextReport_{};
+    NativeAdrenoGmuContextReport gpuContextReport_{};
+    NativeAdrenoGmuContextReport lpacContextReport_{};
+    NativeAdrenoRing ring_;
+    NativeAdrenoIrq irq_;
+    NativeAdrenoSubmit submit_;
+    NativeAdrenoTimer timer_;
+    NativeAdrenoAbiDeviceInfo info_{};
+    ArmSmmu4KMmio smmuMmio_{};
+    ArmSmmu4KIo smmuIo_{};
+    NativeAdrenoRingIo ringIo_{};
+    NativeAdrenoRingClock clock_{};
+    bool cpTouched_=false;
+    bool cpTrace_=false;
+    bool ready_=false;
+    bool irqAttached_=false;
+    bool hardwareIrqEnabled_=false;
+    uint32_t hardwareIrqFailed_=0;
+    uint32_t watchedFence_=0;
+    uint64_t watchedSince_=0;
+    uint64_t nextHealthPollUs_ = 0;
+    uint64_t nextPerformancePollUs_ = 0;
+    uint64_t lastPerformanceUs_ = 0;
+    uint64_t lastBusyTicks_ = 0;
+    uint64_t lastActiveUs_ = 0;
+    uint64_t continuousBusyUs_ = 0;
+    uint64_t boostUntilUs_ = 0;
+    uint64_t lastSubmissionUs_ = 0; // Ring publisher writes; hardware worker reads atomically.
+    uint32_t activityKick_ = 0;
+    uint32_t boostLevel_ = 1;
+    uint32_t fixedPerformanceLevel_ = 0;
+    bool capturePerformanceEnabled_ = false;
+    uint32_t capturePerformanceHz_ = 0;
+    uint32_t downWindows_ = 0;
+    uint32_t downHold_ = 0;
+    NativeAdrenoTracePerformance performance_{};
+    unsigned gpuSlots_[2]{},gmuSlots_[2]{},lpacSlots_[2]{};
+
+    static int read(void *,uint32_t,uint32_t,uint32_t *);
+    static int write(void *,uint32_t,uint32_t,uint32_t);
+    static void delay(void *,uint32_t);
+    static int gpuRead(void *,uint32_t,uint32_t *);
+    static int gpuWrite(void *,uint32_t,uint32_t);
+    static int writeWptr(void *,uint32_t);
+    static int readGpuBusy(void *,uint32_t *);
+    static int readAlwaysOn(void *, uint64_t *);
+    IOReturn readBusyTicks(uint64_t *);
+    IOReturn pollPerformance(bool pending);
+    static IOReturn acquireProfileAccess(void *);
+    static IOReturn releaseProfileAccess(void *);
+    static bool profileAccessible(void *);
+    static int barrier(void *);
+    static int publishRing(void *,const volatile uint32_t *,size_t);
+    static int acquireFence(void *,volatile uint32_t *,size_t);
+    static uint64_t now(void *);
+    static int idle(void *);
+    static void gpuInterrupt(void *);
+    IOReturn observeInitialization();
+    IOReturn checkGpuTranslations();
+    IOReturn mapWindows();
+    IOReturn contexts();
+    IOReturn reserveSmmuResources();
+    IOReturn startCp();
+    IOReturn fail(IOReturn);
+public:
+    IOReturn start();
+    void poll();
+    uint32_t waitMilliseconds() const;
+    bool activityPending() const;
+    void dump() const;
+};
+
+A642LState *state=nullptr;
+uint32_t launched=0;
+uint32_t hardwareLaunched=0;
+
+OSSharedPtr<IOMemoryMap> mapWindow(const NativeAdrenoA6xxWindow &window,
+    IOOptionBits cacheMode=kIOMapInhibitCache)
+{
+    if(!window.physical || !window.bytes || window.bytes>SIZE_MAX ||
+        window.physical>UINT64_MAX-window.bytes) {
+        return {};
     }
-    for(unsigned index=0;index<2;++index) {
-        IODeviceMemory *memory=getDeviceMemoryWithIndex(index);
-        if(!memory) {
-            IOLog("NativeAdreno: provider window %u has no device memory\n",index);
-            stop(provider);
-            return false;
+    IODeviceMemory *memory=IODeviceMemory::withRange(window.physical,window.bytes);
+    if(!memory) {
+        return {};
+    }
+    OSSharedPtr<IOMemoryMap> map(memory->map(kIOMapAnywhere|cacheMode),OSNoRetain);
+    memory->release();
+    return map;
+}
+
+int A642LState::read(void *cookie,uint32_t domain,uint32_t offset,uint32_t *value)
+{
+    A642LState *self=static_cast<A642LState *>(cookie);
+    if(!self || !value || domain>=NativeAdrenoA6xxDomains || (offset&3) ||
+        !self->maps_[domain] || uint64_t(offset)+4>self->windows_[domain].bytes) {
+        return 1;
+    }
+    const uintptr_t base=self->maps_[domain]->getVirtualAddress();
+    if(self->cpTrace_) {
+        IOLog("NativeAdrenoCpMmio: read begin domain=%u offset=%x reg=%x\n",domain,offset,offset/4);
+    }
+    *value=*reinterpret_cast<volatile uint32_t *>(base+offset);
+    __asm__ volatile("dsb ld" ::: "memory");
+    if(self->cpTrace_) {
+        IOLog("NativeAdrenoCpMmio: read end domain=%u offset=%x value=%08x\n",domain,offset,*value);
+    }
+    return 0;
+}
+
+int A642LState::write(void *cookie,uint32_t domain,uint32_t offset,uint32_t value)
+{
+    A642LState *self=static_cast<A642LState *>(cookie);
+    if(!self || domain>=NativeAdrenoA6xxDomains || (offset&3) ||
+        !self->maps_[domain] || uint64_t(offset)+4>self->windows_[domain].bytes) {
+        return 1;
+    }
+    const uintptr_t base=self->maps_[domain]->getVirtualAddress();
+    if(self->cpTrace_) {
+        IOLog("NativeAdrenoCpMmio: write begin domain=%u offset=%x reg=%x value=%08x\n",domain,offset,offset/4,value);
+    }
+    __asm__ volatile("dsb st" ::: "memory");
+    *reinterpret_cast<volatile uint32_t *>(base+offset)=value;
+    if(self->cpTrace_) {
+        IOLog("NativeAdrenoCpMmio: write end domain=%u offset=%x\n",domain,offset);
+    }
+    return 0;
+}
+
+void A642LState::delay(void *,uint32_t microseconds)
+{
+    IODelay(microseconds);
+}
+
+int A642LState::gpuRead(void *cookie,uint32_t reg,uint32_t *value)
+{
+    return reg>UINT32_MAX/4?1:read(cookie,NativeAdrenoA6xxGpu,reg*4,value);
+}
+
+int A642LState::gpuWrite(void *cookie,uint32_t reg,uint32_t value)
+{
+    return reg>UINT32_MAX/4?1:write(cookie,NativeAdrenoA6xxGpu,reg*4,value);
+}
+
+int A642LState::writeWptr(void *cookie,uint32_t value)
+{
+    auto *self=static_cast<A642LState *>(cookie);
+    if(self->cpTrace_) {
+        IOLog("NativeAdrenoCp: WPTR publication begin value=%x\n",value);
+    }
+
+    for(unsigned attempt=0;attempt<200;++attempt) {
+        if(gpuWrite(cookie,0x807,value)) {
+            return 1;
         }
-        maps_[index]=OSSharedPtr<IOMemoryMap>(memory->map(kIOMapAnywhere|kIOMapInhibitCache),
-            OSNoRetain);
-        if(!maps_[index]) {
-            IOLog("NativeAdreno: GPU window %u did not map\n",index);
-            stop(provider);
-            return false;
+
+        if(self->cpTrace_ && !attempt) {
+            IOLog("NativeAdrenoCp: WPTR store completed; synchronizing\n");
         }
-    }
-    IOLog("NativeAdreno: %lu windows, GPU window at 0x%llx/0x%llx mapped\n",
-        static_cast<unsigned long>(count),
-        static_cast<unsigned long long>(windows[0].base),
-        static_cast<unsigned long long>(windows[0].bytes));
-    /* The GMU node publishes its bases so no DT phandle resolution is needed.
-     * Discovery does not imply readiness: bring-up still needs board power,
-     * firmware and the SMMU context before any register may be touched. */
-    OSDictionary *matching=IOService::serviceMatching("NativeAdrenoGmuService");
-    IOService *gmu=matching?IOService::copyMatchingService(matching):nullptr;
-    if(matching)matching->release();
-    if(gmu) {
-        NativeAdrenoGmuService *node=OSDynamicCast(NativeAdrenoGmuService,gmu);
-        const unsigned published=node?static_cast<unsigned>(node->windowCount()):0;
-        IOLog("NativeAdreno: GMU node present with %u windows\n",published);
-        if(node && published>=3) {
-            NativeAdrenoGmuWindow gmu_windows[ShengGmuWindows]{};
-            for(unsigned index=0;index<3;++index) {
-                gmu_windows[index].base=node->windowAddress(index);
-                gmu_windows[index].bytes=static_cast<size_t>(node->windowBytes(index));
+
+        __asm__ volatile("dsb sy" ::: "memory");
+
+        uint32_t fence=0;
+        if(read(cookie,NativeAdrenoA6xxGmuRegisters,0x23b13*4-0x6a000,&fence)) {
+            return 1;
+        }
+
+        if(!(fence&1)) {
+            if(self->cpTrace_) {
+                IOLog("NativeAdrenoCp: WPTR acknowledged attempts=%u fence=%08x\n",attempt+1,fence);
             }
-            gmu_windows[ShengGmuGpu].base=
-                reinterpret_cast<volatile uint8_t *>(maps_[0]->getVirtualAddress());
-            gmu_windows[ShengGmuGpu].bytes=static_cast<size_t>(windows[0].bytes);
-            gmu_windows[ShengGmuCxMisc].base=
-                reinterpret_cast<volatile uint8_t *>(maps_[1]->getVirtualAddress());
-            gmu_windows[ShengGmuCxMisc].bytes=static_cast<size_t>(windows[1].bytes);
-            if(gmu_platform_.bind(gmu_windows,&gmu_io_)==kIOReturnSuccess) {
-                gmu_io_bound_=true;
-                IOLog("NativeAdreno: GMU five-window I/O adapter bound\n");
-            } else
-                IOLog("NativeAdreno: GMU windows are not usable\n");
+
+            const uint64_t submittedUs = now(nullptr);
+            const uint64_t previousUs = __atomic_exchange_n(&self->lastSubmissionUs_,
+                submittedUs, __ATOMIC_RELAXED);
+            if (!previousUs || submittedUs - previousUs >= 50000) {
+                __atomic_store_n(&self->activityKick_, 1, __ATOMIC_RELEASE);
+                thread_wakeup(&performanceWake);
+            }
+
+            return 0;
         }
-        gmu->release();
-    } else {
-        IOLog("NativeAdreno: GMU node not published yet\n");
+
+        IODelay(10);
     }
-    /* Stream IDs are this node's iommus; the specifier width is published by
-     * the SMMU node. Nothing is assumed when either is missing. */
-    OSDictionary *smmu_match=IOService::serviceMatching("NativeAdrenoSmmuService");
-    IOService *smmu=smmu_match?IOService::copyMatchingService(smmu_match):nullptr;
-    if(smmu_match)smmu_match->release();
-    if(smmu) {
-        OSNumber *cells=OSDynamicCast(OSNumber,smmu->getProperty("iommu-cells"));
-        OSData *iommus=OSDynamicCast(OSData,provider->getProperty("iommus"));
-        uint16_t sids[8]{};
-        size_t sid_count=0;
-        if(cells && iommus && NativeAdrenoBoard::parseIommus(
-            static_cast<const uint8_t *>(iommus->getBytesNoCopy()),iommus->getLength(),
-            cells->unsigned32BitValue(),sids,8,&sid_count)==kIOReturnSuccess)
-            IOLog("NativeAdreno: %lu stream IDs from iommus, first %u\n",
-                static_cast<unsigned long>(sid_count),sid_count?sids[0]:0);
-        else
-            IOLog("NativeAdreno: iommus are not usable\n");
-        smmu->release();
-    } else {
-        IOLog("NativeAdreno: SMMU node not published yet\n");
+
+    IOLog("NativeAdrenoCp: WPTR acknowledgement timed out value=%x\n",value);
+    return 1;
+}
+
+int A642LState::readGpuBusy(void *cookie,uint32_t *value)
+{
+    return read(cookie,NativeAdrenoA6xxGmuRegisters,0x23b0c*4-0x6a000,value);
+}
+
+IOReturn A642LState::readBusyTicks(uint64_t *ticks)
+{
+    // XOCLK0 belongs to GMU AO and counts busy time at 19.2 MHz.
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        uint32_t before = 0;
+        uint32_t low = 0;
+        uint32_t after = 0;
+        if (read(this, NativeAdrenoA6xxGmuRegisters, 0x1f845 * 4 - 0x6a000, &before) ||
+            read(this, NativeAdrenoA6xxGmuRegisters, 0x1f844 * 4 - 0x6a000, &low) ||
+            read(this, NativeAdrenoA6xxGmuRegisters, 0x1f845 * 4 - 0x6a000, &after)) {
+            return kIOReturnIOError;
+        }
+        if (before == after) {
+            *ticks = uint64_t(after) << 32 | low;
+            return kIOReturnSuccess;
+        }
     }
-    /* Explicit opt-in (sheng-gpu-bringup=1). Without the bank/asid/sid/slot arguments the SMMU window is only read
-     * (identity and fault registers). With all four arguments the sequence below PROGRAMS the SMMU: it prepares a context
-     * bank, attaches the stream and maps the GMU payloads. Do not run it before the read-only power/clock observation
-     * (sheng-gpu-power, docs/gpu-hardware-plan.md) shows the GPU SMMU powered and writable: the apps SMMU on this board is
-     * hypervisor-managed (docs/native-ufs.md) and the adreno SMMU has not been shown to differ. */
-    uint32_t bringup=0;
-    if(PE_parse_boot_argn("sheng-gpu-bringup",&bringup,sizeof(bringup)) && bringup) {
-        NativeAdrenoSmmuService *node=OSDynamicCast(NativeAdrenoSmmuService,smmu);
-        if(node && node->windowCount() && node->windowAddress(0)) {
-            volatile uint8_t *smmu_base=node->windowAddress(0);
-            const size_t smmu_bytes=static_cast<size_t>(node->windowBytes(0));
-            const uint32_t id0=*reinterpret_cast<volatile uint32_t *>(smmu_base+0x20);
-            const uint32_t id1=*reinterpret_cast<volatile uint32_t *>(smmu_base+0x24);
-            const uint32_t id2=*reinterpret_cast<volatile uint32_t *>(smmu_base+0x28);
-            const uint32_t scr0=*reinterpret_cast<volatile uint32_t *>(smmu_base+0x0);
-            const uint32_t fault=*reinterpret_cast<volatile uint32_t *>(smmu_base+0x48);
-            IOLog("NativeAdreno: SMMU id0=%08x id1=%08x id2=%08x scr0=%08x fault=%08x window=%lu\n",
-                id0,id1,id2,scr0,fault,static_cast<unsigned long>(smmu_bytes));
-            uint32_t bank=0,asid=0,sid=0,slot=0;
-            const bool configured=
-                PE_parse_boot_argn("sheng-gpu-bank",&bank,sizeof(bank)) &&
-                PE_parse_boot_argn("sheng-gpu-asid",&asid,sizeof(asid)) &&
-                PE_parse_boot_argn("sheng-gpu-sid",&sid,sizeof(sid)) &&
-                PE_parse_boot_argn("sheng-gpu-slot",&slot,sizeof(slot));
-            if(!configured || bank>63 || !asid || asid>0xffff || sid>0xffff || slot>127) {
-                IOLog("NativeAdreno: bring-up needs bank/asid/sid/slot arguments\n");
+
+    return kIOReturnIOError;
+}
+
+/* pollPerformance applies pandora_gpu.c's 16 ms, 50-percent busy policy to
+ * SM7325's three stock operating points. It raises to the lowest sufficient
+ * frequency with ten-percent headroom, delays a one-level decrease for four
+ * low-load windows, and preserves the activity boost for 50 ms. */
+IOReturn A642LState::pollPerformance(bool pending)
+{
+    uint64_t busyTicks = 0;
+    IOReturn status = readBusyTicks(&busyTicks);
+    if (status) {
+        return status;
+    }
+
+    const uint64_t currentUs = now(nullptr);
+    const uint64_t intervalNs = (currentUs - lastPerformanceUs_) * 1000;
+    const bool busyValid = lastPerformanceUs_ && intervalNs && busyTicks >= lastBusyTicks_;
+    const uint64_t deltaTicks = busyValid ? busyTicks - lastBusyTicks_ : 0;
+    const uint64_t busyNs = deltaTicks > intervalNs * 12 / 625 ?
+        intervalNs : deltaTicks * 625 / 12;
+    const uint32_t busyPermille = busyValid ? uint32_t(busyNs * 1000 / intervalNs) : 0;
+    const uint32_t currentLevel = gmu_.acknowledgedPerformance();
+    const uint32_t currentHz = NativeAdrenoA6xxOperatingPoints[currentLevel - 1].frequencyHz;
+    uint32_t wantedLevel = currentLevel;
+
+    const bool kicked = __atomic_exchange_n(&activityKick_, 0, __ATOMIC_ACQ_REL) != 0;
+    if (kicked) {
+        boostLevel_ = performanceLevelFor(uint64_t(currentHz) * 2);
+        boostUntilUs_ = currentUs + 50000;
+    }
+    const bool boosted = currentUs < boostUntilUs_;
+    const bool active = busyNs || pending;
+    if (busyValid) {
+        const uint64_t neededHz = uint64_t(busyPermille) * currentHz * 2 / 1000;
+        const uint32_t sufficientLevel = performanceLevelFor(neededHz * 11 / 10);
+        continuousBusyUs_ = busyPermille >= 950 ?
+            continuousBusyUs_ + intervalNs / 1000 : 0;
+        if (busyPermille > 850 || continuousBusyUs_ >= 50000) {
+            wantedLevel = NativeAdrenoA6xxOperatingPointCount;
+            downWindows_ = 0;
+        } else if (sufficientLevel > currentLevel) {
+            wantedLevel = sufficientLevel;
+            downWindows_ = 0;
+        } else if (active) {
+            if (currentLevel > 1 && neededHz * 10 <=
+                uint64_t(NativeAdrenoA6xxOperatingPoints[currentLevel - 2].frequencyHz) * 8) {
+                if (++downWindows_ >= 4 + downHold_) {
+                    wantedLevel = currentLevel - 1;
+                }
             } else {
-                /* The GMU context at its fixed a6xx_gmu.c addresses (NativeAdrenoGmuContext). The ring, fence,
-                 * SQE and power-up list are read by the CP through the GPU's own streams (iommus 0/1) and need
-                 * the GPU context, which is not built yet; they are never placed in the GMU context. */
-                [[maybe_unused]] const size_t ring_bytes=0x8000,fence_bytes=0x1000;
-                [[maybe_unused]] const uint64_t ring_iova=0,fence_iova=0,sqe_iova=0,pwrup_iova=0;
-                [[maybe_unused]] const uint64_t sqe_bytes=(reinterpret_cast<uintptr_t>(&native_adreno_sqe_firmware_image_size)&&
-                    reinterpret_cast<uintptr_t>(native_adreno_sqe_firmware_image))?
-                    ((native_adreno_sqe_firmware_image_size+0xfff)&~UINT64_C(0xfff)):0;
-                NativeAdrenoSmmuWindow window{smmu_base,smmu_bytes};
-                ArmSmmu4KIo smmu_io{&window,smmu_bytes,smmu_read32,smmu_read64,
-                    smmu_write32,smmu_write64,smmu_barrier};
-                NativeAdrenoGmuContextReport report{};
-                IOReturn status=gmu_ctx_.bringUp(&smmu_io,bank,asid,slot,uint16_t(sid),nullptr,&report);
-                [[maybe_unused]] NativeAdrenoGmuAllocator &gmu_=gmu_ctx_.allocator();
-                [[maybe_unused]] NativeAdrenoVm &vm_=gmu_ctx_.vm();
+                downWindows_ = 0;
+            }
+        } else if (currentUs - lastActiveUs_ >= 80000) {
+            wantedLevel = 1;
+            downWindows_ = 0;
+        }
+    }
+    if (active) {
+        lastActiveUs_ = currentUs;
+    }
+    if (boosted && wantedLevel < boostLevel_) {
+        wantedLevel = boostLevel_;
+    }
+    uint32_t captureHz = 0;
+    const bool captureEnabled = NativeAdrenoGpuProfile::captureFrequency(&captureHz);
+    const uint32_t fixedLevel = captureEnabled ?
+        (captureHz ? performanceLevelFor(captureHz) : 0) : fixedPerformanceLevel_;
+    if (fixedLevel) {
+        wantedLevel = fixedLevel;
+    }
+
+    NativeAdrenoTracePerformance sample{};
+    sample.thermal_cap_hz = native_adreno_thermal_cap_hz(&sample.temperature_millic,
+        &sample.thermal_valid_mask, &sample.thermal_flags);
+    uint32_t capLevel = NativeAdrenoA6xxOperatingPointCount;
+    while (capLevel > 1 &&
+        NativeAdrenoA6xxOperatingPoints[capLevel - 1].frequencyHz > sample.thermal_cap_hz) {
+        --capLevel;
+    }
+    const bool thermalLimited = wantedLevel > capLevel;
+    if (thermalLimited) {
+        wantedLevel = capLevel;
+    }
+
+    sample.busy_ticks = deltaTicks;
+    sample.interval_ns = busyValid ? intervalNs : 0;
+    sample.busy_permille = busyPermille;
+    sample.requested_hz = NativeAdrenoA6xxOperatingPoints[wantedLevel - 1].frequencyHz;
+    sample.flags = (busyValid ? NativeAdrenoTracePerformanceBusyValid : 0) |
+        (boosted && !fixedLevel ? NativeAdrenoTracePerformanceBoost : 0) |
+        (fixedLevel ? NativeAdrenoTracePerformanceFixedFrequency : 0) |
+        (pending ? NativeAdrenoTracePerformancePendingWork : 0) |
+        (thermalLimited ? NativeAdrenoTracePerformanceThermalLimited : 0);
+
+    if (wantedLevel != currentLevel) {
+        status = gmu_.setPerformance(wantedLevel);
+        if (!status) {
+            sample.flags |= NativeAdrenoTracePerformanceVoteChanged;
+            downHold_ = wantedLevel > currentLevel ? 1 : 0;
+        }
+        downWindows_ = 0;
+    }
+    const uint32_t acknowledgedLevel = gmu_.acknowledgedPerformance();
+    const auto &acknowledged = NativeAdrenoA6xxOperatingPoints[acknowledgedLevel - 1];
+    sample.acknowledged_hz = acknowledged.frequencyHz;
+    sample.bandwidth_index = acknowledged.bandwidthIndex;
+    sample.vote_status = uint32_t(status);
+    sample.timestamp_ns = now(nullptr) * 1000;
+    performance_ = sample;
+    capturePerformanceEnabled_ = captureEnabled;
+    capturePerformanceHz_ = captureHz;
+    NativeAdrenoGpuProfile::recordPerformance(sample);
+
+    lastPerformanceUs_ = currentUs;
+    lastBusyTicks_ = busyTicks;
+    nextPerformancePollUs_ = currentUs + 16000;
+    return status;
+}
+
+bool A642LState::profileAccessible(void *cookie)
+{
+    uint32_t gx=0,fence=0;
+    return !read(cookie,NativeAdrenoA6xxGmuRegisters,0x1f8d0*4-0x6a000,&gx) &&
+        !read(cookie,NativeAdrenoA6xxGmuRegisters,0x23b10*4-0x6a000,&fence) &&
+        !(gx&0xc0) && !fence;
+}
+
+int A642LState::readAlwaysOn(void *cookie, uint64_t *ticks)
+{
+    if (!ticks) {
+        return 1;
+    }
+
+    // Samsung a6xx_read_alwayson uses GMU AO for CPU AHB reads on this target.
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        uint32_t before = 0;
+        uint32_t low = 0;
+        uint32_t after = 0;
+        if (read(cookie, NativeAdrenoA6xxGmuRegisters, 0x1f889 * 4 - 0x6a000, &before) ||
+            read(cookie, NativeAdrenoA6xxGmuRegisters, 0x1f888 * 4 - 0x6a000, &low) ||
+            read(cookie, NativeAdrenoA6xxGmuRegisters, 0x1f889 * 4 - 0x6a000, &after)) {
+            return 1;
+        }
+        if (before == after) {
+            *ticks = (uint64_t(after) << 32) | low;
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+IOReturn A642LState::acquireProfileAccess(void *cookie)
+{
+    return static_cast<A642LState *>(cookie)->gmu_.acquirePerformanceCounters();
+}
+
+IOReturn A642LState::releaseProfileAccess(void *cookie)
+{
+    return static_cast<A642LState *>(cookie)->gmu_.releasePerformanceCounters();
+}
+
+int A642LState::barrier(void *)
+{
+    __asm__ volatile("dsb sy" ::: "memory");
+    return 0;
+}
+
+int A642LState::publishRing(void *cookie,const volatile uint32_t *,size_t bytes)
+{
+    A642LState *self=static_cast<A642LState *>(cookie);
+    if(self->cpTrace_) {
+        IOLog("NativeAdrenoCp: ring publication begin bytes=%lx\n",bytes);
+    }
+    const IOReturn status=self->gpuContext_.buffer(1).publishForDevice(0,bytes);
+    if(self->cpTrace_) {
+        IOLog("NativeAdrenoCp: ring publication end status=%08x\n",status);
+    }
+    return status?1:0;
+}
+
+int A642LState::acquireFence(void *cookie,volatile uint32_t *,size_t bytes)
+{
+    A642LState *self=static_cast<A642LState *>(cookie);
+    return self->gpuContext_.buffer(2).acquireDeviceWrites(0,bytes)?1:0;
+}
+
+uint64_t A642LState::now(void *)
+{
+    uint64_t value=0;
+    NativeAdrenoKernelTime::now_us(nullptr,&value);
+    return value;
+}
+
+int A642LState::idle(void *cookie)
+{
+    IODelay(5);
+    return static_cast<A642LState *>(cookie)->observeInitialization()?1:0;
+}
+
+IOReturn A642LState::observeInitialization()
+{
+    IOReturn status=smmuProvider_.observe();
+    if(!status) {
+        status=gmu_.poll();
+    }
+    if(status || !irqAttached_ || hardwareIrqEnabled_) {
+        return status;
+    }
+    NativeAdrenoIrqResult result{};
+    status=irq_.handle(&result);
+    if(status || (result.flags&NativeAdrenoIrqFatal)) {
+        IOLog("NativeAdrenoCp: initialization fault status=%08x rbbm=%08x cp=%08x protect=%08x flags=%08x\n",
+            status,result.status,result.cp_status,result.protect_status,result.flags);
+        return status?status:kIOReturnIOError;
+    }
+    return kIOReturnSuccess;
+}
+
+void A642LState::gpuInterrupt(void *cookie)
+{
+    A642LState *self=static_cast<A642LState *>(cookie);
+    NativeAdrenoIrqResult result{};
+    const IOReturn status=self->irq_.handle(&result);
+    native_adreno_a6xx_stats[11]=result.status;
+    native_adreno_a6xx_stats[12]=result.cp_status;
+    native_adreno_a6xx_stats[13]=result.protect_status;
+    const bool failed=status || (result.flags&NativeAdrenoIrqFatal);
+    if(failed) {
+        __atomic_store_n(&self->hardwareIrqFailed_,1,__ATOMIC_RELEASE);
+        native_adreno_smmu_disable_irq(self->resources_.gpuInterrupt);
+    }
+    if(failed || (result.flags&NativeAdrenoIrqFence)) {
+        native_adreno_gpu_interrupt(failed);
+    }
+}
+
+IOReturn A642LState::checkGpuTranslations()
+{
+    const uint64_t addresses[]={GpuSqeIova,GpuRingIova,GpuMemptrsIova,GpuPwrupIova,GpuScratchIova};
+    const unsigned banks[]={resources_.gpuBank,resources_.gpuBank,resources_.lpacBank,resources_.lpacBank};
+    const uint16_t sids[]={uint16_t(resources_.gpuSid),uint16_t(resources_.gpuSid|resources_.gpuSidMask),
+        uint16_t(resources_.lpacSid),uint16_t(resources_.lpacSid|resources_.lpacSidMask)};
+    for(unsigned stream=0;stream<4;++stream) {
+        const uint16_t sid=sids[stream];
+        for(unsigned index=0;index<GpuBufferCount;++index) {
+            const NativeAdrenoMemory &buffer=gpuContext_.buffer(index);
+            if(buffer.spanCount()!=1) {
+                return kIOReturnUnsupported;
+            }
+            const bool privileged=index!=4;
+            const bool instruction=index==0;
+            const bool writes=index>=2;
+            for(size_t offset=0;offset<buffer.bytes();offset+=4096) {
+                const IOReturn status=smmuProvider_.checkTranslation(banks[stream],sid,
+                    addresses[index]+offset,buffer.spans()[0].physical+offset,
+                    privileged,instruction,writes);
                 if(status) {
-                    IOLog("NativeAdreno: GMU context stopped at step %u status 0x%x; resources retained\n",
-                        report.step,status);
-                } else {
-                    IOLog("NativeAdreno: GMU payloads mapped, bank=%u asid=%u sid=%u slot=%u ttbr0=0x%llx\n",
-                        bank,asid,sid,slot,static_cast<unsigned long long>(report.ttbr0));
-#ifdef NATIVE_ADRENO_HAVE_GMU_RULES
-                    if(reinterpret_cast<uintptr_t>(native_adreno_firmware_image) &&
-                        reinterpret_cast<uintptr_t>(&native_adreno_firmware_image_size)) {
-                        NativeAdrenoFirmwareRules rules{};
-                        rules.bytes=SHENG_GMU_FIRMWARE_BYTES;
-                        for(unsigned i=0;i<32;++i)rules.sha256[i]=sheng_gmu_firmware_sha256[i];
-                        const IOReturn checked=NativeAdrenoFirmware::validate(
-                            native_adreno_firmware_image,native_adreno_firmware_image_size,
-                            &rules,&firmware_);
-                        if(checked)
-                            IOLog("NativeAdreno: embedded GMU firmware failed validation 0x%x\n",
-                                checked);
-                        else {
-                            firmware_valid_=true;
-                            IOLog("NativeAdreno: embedded GMU firmware validated (%lu bytes)\n",
-                                static_cast<unsigned long>(firmware_.length));
-                        }
-                    } else {
-                        IOLog("NativeAdreno: no embedded GMU firmware in this image\n");
-                    }
-#else
-                    IOLog("NativeAdreno: GMU rules not generated for this build\n");
-#endif
-#ifdef NATIVE_ADRENO_HAVE_COMMAND_DB
-                    uint32_t version=0;
-                    if(!firmware_valid_ || !gmu_io_bound_) {
-                        IOLog("NativeAdreno: GMU boot needs firmware and bound windows\n");
-                    } else if(!PE_parse_boot_argn("sheng-gpu-cmddb-version",&version,
-                        sizeof(version)) || !version) {
-                        IOLog("NativeAdreno: GMU boot needs sheng-gpu-cmddb-version\n");
-                    } else {
-                        IODeviceMemory *db=IODeviceMemory::withRange(
-                            SHENG_GMU_COMMAND_DB_BASE,SHENG_GMU_COMMAND_DB_BYTES);
-                        if(!db) {
-                            IOLog("NativeAdreno: command-db reservation did not map\n");
-                        } else {
-                            OSSharedPtr<IOMemoryMap> db_map(db->map(
-                                kIOMapAnywhere|kIOMapInhibitCache),OSNoRetain);
-                            db->release();
-                            if(!db_map) {
-                                IOLog("NativeAdreno: command-db mapping failed\n");
-                            } else {
-                                ShengGmuVoteInputs inputs{};
-                                const ShengGmuDbStatus parsed=ShengGmuCommandDbInputs(
-                                    reinterpret_cast<const uint8_t *>(static_cast<uintptr_t>(db_map->getVirtualAddress())),
-                                    SHENG_GMU_COMMAND_DB_BYTES,version,&inputs);
-                                if(parsed!=ShengGmuDbSuccess) {
-                                    IOLog("NativeAdreno: command-db refused (%d)\n",parsed);
-                                } else {
-#ifdef NATIVE_ADRENO_HAVE_GMU_VOTES
-                                    inputs.chip_id=SHENG_GMU_VOTES_CHIP_ID;
-                                    inputs.enable_acd=1;
-                                    /* IFPC stays off: the power-up list carries no IFPC restore registers and
-                                     * WPTR writes are not fenced, so a collapse between frames loses CP state. */
-                                    inputs.enable_ifpc=0;
-                                    AdrenoHfiStartupConfig startup{};
-                                    ShengGmuConfig config{};
-                                    NativeAdrenoGmuTime time{nullptr,
-                                        NativeAdrenoKernelTime::now_us,
-                                        NativeAdrenoKernelTime::wait_us};
-                                    ShengGmuServices services{};
-                                    if(ShengGmuBuildStartup(&inputs,&startup)!=AdrenoHfiStartupSuccess)
-                                        IOLog("NativeAdreno: startup config refused\n");
-                                    else if(NativeAdrenoAssembleGmuConfig(&firmware_,&gmu_,
-                                        SHENG_GMU_VOTES_CHIP_ID,1000,&config)!=kIOReturnSuccess)
-                                        IOLog("NativeAdreno: GMU config assembly refused\n");
-                                    else if(NativeAdrenoGmuPlatform::services(&time,&services))
-                                        IOLog("NativeAdreno: GMU services refused\n");
-                                    else {
-                                        ShengGmuStartupLimits limits{4,100,1000,10000};
-                                        const ShengGmuStatus started=ShengGmuColdStart(
-                                            &gmu_device_,&config,&startup,&limits,&gmu_startup_);
-                                        IOLog("NativeAdreno: ColdStart status=%d fw_ready=%u hfi_ready=%u stage=%u\n",
-                                        started,gmu_startup_.load.firmware_ready_observed,
-                                        gmu_startup_.load.hfi_ready_observed,
-                                        gmu_startup_.protocol.stage);
-                                    if(started==ShengGmuSuccess && !gpu_context_ready_) {
-                                        IOLog("NativeAdreno: ring/SQE refused: the GPU context (iommus 0/1) is not built\n");
-                                    } else if(started==ShengGmuSuccess) {
-                                        IOReturn ring_status=ring_mem_.allocate(ring_bytes,40,true,ring_bytes);
-                                        if(!ring_status)ring_status=fence_mem_.allocate(fence_bytes,40,true,fence_bytes);
-                                        if(!ring_status && sqe_bytes)
-                                            ring_status=sqe_mem_.allocate(size_t(sqe_bytes),40,true,size_t(sqe_bytes));
-                                        if(!ring_status)ring_status=vm_.map(&ring_mem_,1,ring_iova,3,0,2,&ring_map_);
-                                        if(!ring_status)ring_status=vm_.map(&fence_mem_,1,fence_iova,3,0,2,&fence_map_);
-                                        if(!ring_status && fence_mem_.spanCount())native_adreno_fence_phys=fence_mem_.spans()[0].physical;
-                                        if(!ring_status)ring_status=vm_.map(&sqe_mem_,1,sqe_iova,3,0,2,&sqe_map_);
-                                        if(ring_status) {
-                                            IOLog("NativeAdreno: ring/SQE setup stopped at 0x%x\n",ring_status);
-                                        } else {
-                                            ring_window_={
-                                                reinterpret_cast<volatile uint8_t *>(maps_[0]->getVirtualAddress()),
-                                                static_cast<size_t>(windows[0].bytes)};
-                                            NativeAdrenoRingIo ring_io{&ring_window_,gpu_write32,gpu_read32,gpu_barrier,
-                                                gmu_io_bound_?&gmu_io_:nullptr,gmu_io_bound_?gmu_fence_status:nullptr};
-                                            ring_cache_={&ring_mem_,&fence_mem_};
-                                            NativeAdrenoRingCache cache{&ring_cache_,ring_publish,fence_acquire};
-                                            ring_status=ring_.attach(&ring_io,&cache,ring_mem_.mapping(),
-                                                ring_bytes,ring_iova,fence_mem_.mapping(),fence_bytes,fence_iova);
-                                            /* With the diagnostics (sheng-diag=1) framed submissions stamp the CP's always-on counter before and after their
-                                             * buffers; sheng-gpu-timeline=0 or 1 overrides that. */
-                                            {unsigned timeline=0,diag=0;PE_parse_boot_argn("sheng-diag",&diag,sizeof(diag));
-                                             native_adreno_diag=diag==1;
-                                             if(!PE_parse_boot_argn("sheng-gpu-timeline",&timeline,sizeof(timeline)))timeline=diag==1;
-                                             ring_.setTimeline(timeline!=0);}
-                                            if(!ring_status && sqe_bytes) {
-                                                memcpy(sqe_mem_.mapping(),native_adreno_sqe_firmware_image,
-                                                    size_t(native_adreno_sqe_firmware_image_size));
-                                                ring_status=sqe_mem_.publishForDevice(0,size_t(sqe_bytes),false);
-                                            }
-                                            if(ring_status)
-                                                IOLog("NativeAdreno: ring attach stopped at 0x%x\n",ring_status);
-                                            else
-                                                IOLog("NativeAdreno: ring attached ring_iova=0x%llx fence_iova=0x%llx sqe_iova=0x%llx\n",
-                                                    static_cast<unsigned long long>(ring_iova),
-                                                    static_cast<unsigned long long>(fence_iova),
-                                                    static_cast<unsigned long long>(sqe_iova));
-                                            }
-                                            if(!ring_status) {
-                                                NativeAdrenoGpuWindow cp_window={
-                                                    reinterpret_cast<volatile uint8_t *>(maps_[0]->getVirtualAddress()),
-                                                    static_cast<size_t>(windows[0].bytes)};
-                                                NativeAdrenoRingIo cp_io{&cp_window,gpu_write32,gpu_read32,gpu_barrier,nullptr,nullptr};
-                                                ring_status=pwrup_mem_.allocate(0x1000,40,true,0x1000);
-                                                if(!ring_status)ring_status=vm_.map(&pwrup_mem_,1,
-                                                    pwrup_iova,3,0,2,&pwrup_map_);
-                                                size_t list_bytes=0;
-                                                if(!ring_status)ring_status=NativeAdrenoPwrupList::buildA740(
-                                                    gpu_read32,&cp_window,
-                                                    static_cast<uint8_t *>(pwrup_mem_.mapping()),
-                                                    0x1000,&list_bytes);
-                                                if(!ring_status)ring_status=pwrup_mem_.publishForDevice(0,0x1000,false);
-                                                if(!ring_status) {
-                                                    NativeAdrenoCpInit cp;
-                                                    NativeAdrenoCpInitConfig cfg{sqe_iova,pwrup_iova,0};
-                                                    uint32_t start_fence=0;
-                                                    ring_status=cp.run(&cp_io,&ring_,&cfg,&start_fence);
-                                                    if(!ring_status) {
-                                                        NativeAdrenoRingClock clock{nullptr,ring_now,nullptr};
-                                                        ring_status=ring_.wait(start_fence,&clock,2000,nullptr)
-                                                            ==NativeAdrenoRingFenceComplete?
-                                                            kIOReturnSuccess:kIOReturnTimeout;
-                                                    }
-                                                    if(!ring_status) {
-                                                        ring_status=irq_.attach(&cp_io);
-                                                        if(!ring_status)ring_status=irq_.programMask(nullptr);
-                                                    }
-                                                    if(ring_status)
-                                                        IOLog("NativeAdreno: CP start stopped at 0x%x\n",ring_status);
-                                                    else
-                                                    {
-                                                        execbuf_=new NativeAdrenoSubmit;
-                                                        core_=new NativeAdrenoUserClient;
-                                                        if(execbuf_ && core_ &&
-                                                            execbuf_->attach(&vm_,&ring_)==kIOReturnSuccess &&
-                                                            core_->open(NativeAdrenoAbiVersion,&vm_,execbuf_,
-                                                                &ring_,32,40)==kIOReturnSuccess)
-                                                            core_ready_=true;
-                                                        ready_=true;
-                                                        IOLog("NativeAdreno: CP started, fence=%u, interrupts masked=%08x\n",
-                                                            start_fence,NativeAdrenoIrq::mask());
-                                                    }
-                                                }
-                                            }
-                                    }
-                                    }
-#else
-                                    IOLog("NativeAdreno: vote rules not generated for this build\n");
-#endif
-                                }
-                            }
-                        }
-                    }
-#else
-                    IOLog("NativeAdreno: command-db reservation not generated for this build\n");
-#endif
+                    return status;
                 }
             }
         }
     }
-    if(ready_) {
-        IOLog("NativeAdreno: GPU ready, publishing service\n");
-        registerService();
-        return true;
+    IOLog("NativeAdrenoSmmu: all four GPU and LPAC streams translated every bootstrap page\n");
+    return smmuProvider_.observe();
+}
+
+IOReturn A642LState::mapWindows()
+{
+    if(native_adreno_a6xx_resources(&resources_) || resources_.chipId!=0x06030500 ||
+        resources_.gmemBytes!=0x80000 || resources_.frequencyHz!=315000000 || resources_.ddrType!=7 ||
+        resources_.gpuSidMask!=0x400 || resources_.gmuSidMask!=0x400 || resources_.lpacSidMask!=0x400 ||
+        resources_.gpuSid>0xffff || resources_.gmuSid>0xffff ||
+        resources_.lpacSid!=1 || resources_.gpuSid!=0 || resources_.gmuSid!=5 ||
+        !resources_.gpuAsid || resources_.gpuAsid>0xffff ||
+        !resources_.gmuAsid || resources_.gmuAsid>0xffff ||
+        !resources_.lpacAsid || resources_.lpacAsid>0xffff ||
+        resources_.gpuAsid==resources_.gmuAsid || resources_.gpuAsid==resources_.lpacAsid ||
+        resources_.gmuAsid==resources_.lpacAsid) {
+        return kIOReturnBadArgument;
     }
-    IOLog("NativeAdreno: refusing to publish without a started CP\n");
-    IOService::stop(provider);
-    return false;
-}
-void NativeAdrenoGpuService::stop(IOService *provider)
-{
-    for(auto &map:maps_)map.reset();
-    IOService::stop(provider);
-}
-IOReturn NativeAdrenoGpuService::newUserClient(task_t owningTask,void *securityID,
-    UInt32 type,OSDictionary *properties,IOUserClient **handler)
-{
-    if(handler)*handler=nullptr;
-    if(!core_ready_)return kIOReturnNotReady;
-    IOUserClient *client=createGpuClient(owningTask,securityID,type,properties,core_);
-    if(!client)return kIOReturnNoResources;
-    if(handler)*handler=client;
+    const NativeAdrenoA6xxWindow supplied[]={
+        resources_.gpu,resources_.gmu,resources_.gpucc,resources_.gcc,
+        resources_.pdc,resources_.rscc,resources_.commandDb,resources_.rpmh,
+        resources_.aop,resources_.ipcc,resources_.cxMisc
+    };
+    for(unsigned index=0;index<NativeAdrenoA6xxDomains;++index) {
+        windows_[index]=supplied[index];
+        maps_[index]=mapWindow(windows_[index]);
+        if(!maps_[index]) {
+            return kIOReturnNoMemory;
+        }
+    }
+    // The ZAP reservation is DDR loaded through Normal NC, matching PIL's ioremap_wc.
+    zapMap_=mapWindow(resources_.zap,kIOMapWriteCombineCache);
+    if(!zapMap_) {
+        return kIOReturnNoMemory;
+    }
     return kIOReturnSuccess;
 }
 
-class NativeAdrenoGpuClient : public IOUserClient {
-    OSDeclareDefaultStructors(NativeAdrenoGpuClient)
-    NativeAdrenoUserClient *core_=nullptr;
-    task_t task_=TASK_NULL;
-    static IOReturn action(OSObject *target,void *reference,
-        IOExternalMethodArguments *arguments);
-public:
-    void setCore(NativeAdrenoUserClient *core) {core_=core;}
-    bool initWithTask(task_t owningTask,void *securityID,UInt32 type,
-        OSDictionary *properties) APPLE_KEXT_OVERRIDE;
-    IOReturn clientClose() APPLE_KEXT_OVERRIDE;
-    IOReturn clientMemoryForType(UInt32 type,IOOptionBits *options,
-        IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
-    IOReturn externalMethod(uint32_t selector,IOExternalMethodArguments *arguments,
-        IOExternalMethodDispatch *dispatch,OSObject *target,
-        void *reference) APPLE_KEXT_OVERRIDE;
-};
-OSDefineMetaClassAndStructors(NativeAdrenoGpuClient,IOUserClient)
+IOReturn A642LState::reserveSmmuResources()
+{
+    uint32_t id0=0,id1=0;
+    if(smmuIo_.read32(smmuIo_.cookie,0x20,&id0) ||
+        smmuIo_.read32(smmuIo_.cookie,0x24,&id1)) {
+        return kIOReturnIOError;
+    }
+    const unsigned slotCount=id0&255,bankCount=id1&255,firstStage1=(id1>>16)&255;
+    const size_t stride=size_t(1)<<((id1>>31)?16:12);
+    const size_t pages=size_t(1)<<(((id1>>28)&7)+1);
+    const bool extended=id0&(1u<<8);
+    if(!(id0&(1u<<27)) || slotCount<6 || slotCount>128 || bankCount>64 ||
+        firstStage1>=bankCount || 2*pages*stride>smmuIo_.register_bytes) {
+        IOLog("NativeAdrenoSmmu: allocation unsupported id=%08x/%08x slots=%u stage1=%u..%u\n",
+            id0,id1,slotCount,firstStage1,bankCount);
+        return kIOReturnUnsupported;
+    }
+    bool freeSlots[128]={},reservedSlots[128]={},referencedBanks[64]={},freeBanks[64]={};
+    const uint16_t requestedSids[6]={uint16_t(resources_.gpuSid),
+        uint16_t(resources_.gpuSid|resources_.gpuSidMask),uint16_t(resources_.gmuSid),
+        uint16_t(resources_.gmuSid|resources_.gmuSidMask),uint16_t(resources_.lpacSid),
+        uint16_t(resources_.lpacSid|resources_.lpacSidMask)};
+    const uint32_t sidBits=(id0>>9)&15;
+    const uint32_t sidMask=extended?0xffffu:((1u<<sidBits)-1);
+    for(unsigned slot=0;slot<slotCount;++slot) {
+        uint32_t smr=0,s2cr=0;
+        if(smmuIo_.read32(smmuIo_.cookie,0x800+4*slot,&smr) ||
+            smmuIo_.read32(smmuIo_.cookie,0xc00+4*slot,&s2cr)) {
+            return kIOReturnIOError;
+        }
+        const bool valid=extended?bool(s2cr&(1u<<10)):bool(smr&(1u<<31));
+        const unsigned type=(s2cr>>16)&3,bank=s2cr&255;
+        freeSlots[slot]=!valid && type==2;
+        if(valid && !type && bank<64) {
+            referencedBanks[bank]=true;
+        }
+        if(valid) {
+            const uint32_t mask=(smr>>16)&(extended?0xffffu:0x7fffu);
+            for(uint16_t sid:requestedSids) {
+                if(!((sid^(smr&0xffff))&~mask&sidMask)) {
+                    IOLog("NativeAdrenoSmmu: allocation conflicts slot=%u smr=%08x s2cr=%08x sid=%04x\n",
+                        slot,smr,s2cr,sid);
+                    return kIOReturnBusy;
+                }
+            }
+        }
+    }
+    for(unsigned bank=firstStage1;bank<bankCount;++bank) {
+        const size_t offset=(pages+bank)*stride;
+        uint32_t sctlr=0;
+        if(offset>smmuIo_.register_bytes || smmuIo_.register_bytes-offset<0x7f8 ||
+            smmuIo_.read32(smmuIo_.cookie,offset,&sctlr)) {
+            return kIOReturnIOError;
+        }
+        freeBanks[bank]=!(sctlr&1) && !referencedBanks[bank];
+    }
 
-bool NativeAdrenoGpuClient::initWithTask(task_t owningTask,void *securityID,
-    UInt32 type,OSDictionary *properties)
-{
-    if(!IOUserClient::initWithTask(owningTask,securityID,type,properties))return false;
-    task_=owningTask;
-    return true;
-}
-IOReturn NativeAdrenoGpuClient::clientClose()
-{
-    core_=nullptr;task_=TASK_NULL;
-    terminate();
+    unsigned selectedSlots[3][2]={{UINT32_MAX,UINT32_MAX},{UINT32_MAX,UINT32_MAX},{UINT32_MAX,UINT32_MAX}};
+    const unsigned preferredSlots[3]={resources_.gpuSlot,resources_.gmuSlot,resources_.lpacSlot};
+    for(unsigned role=0;role<3;++role) {
+        const unsigned first=preferredSlots[role];
+        if(first<slotCount && first+1<slotCount && freeSlots[first] && freeSlots[first+1] &&
+            !reservedSlots[first] && !reservedSlots[first+1]) {
+            selectedSlots[role][0]=first;
+            selectedSlots[role][1]=first+1;
+            reservedSlots[first]=true;
+            reservedSlots[first+1]=true;
+        }
+    }
+    for(unsigned role=0;role<3;++role) {
+        for(unsigned index=0;index<2;++index) {
+            if(selectedSlots[role][index]!=UINT32_MAX) {
+                continue;
+            }
+            for(unsigned slot=0;slot<slotCount;++slot) {
+                if(freeSlots[slot] && !reservedSlots[slot]) {
+                    selectedSlots[role][index]=slot;
+                    reservedSlots[slot]=true;
+                    break;
+                }
+            }
+            if(selectedSlots[role][index]==UINT32_MAX) {
+                IOLog("NativeAdrenoSmmu: six free stream slots unavailable count=%u\n",slotCount);
+                return kIOReturnNoResources;
+            }
+        }
+    }
+    unsigned selectedBanks[3]={UINT32_MAX,UINT32_MAX,UINT32_MAX};
+    const unsigned preferredBanks[3]={resources_.gpuBank,resources_.gmuBank,resources_.lpacBank};
+    for(unsigned role=0;role<3;++role) {
+        const unsigned bank=preferredBanks[role];
+        if(bank>=firstStage1 && bank<bankCount && freeBanks[bank]) {
+            selectedBanks[role]=bank;
+            freeBanks[bank]=false;
+        }
+    }
+    for(unsigned role=0;role<3;++role) {
+        if(selectedBanks[role]!=UINT32_MAX) {
+            continue;
+        }
+        for(unsigned bank=firstStage1;bank<bankCount;++bank) {
+            if(freeBanks[bank]) {
+                selectedBanks[role]=bank;
+                freeBanks[bank]=false;
+                break;
+            }
+        }
+        if(selectedBanks[role]==UINT32_MAX) {
+            IOLog("NativeAdrenoSmmu: three disabled unreferenced context banks unavailable\n");
+            return kIOReturnNoResources;
+        }
+    }
+    IOLog("NativeAdrenoSmmu: allocated slots=%u banks=%u GPU cb=%u slots=%u/%u SID=%04x/%04x GMU cb=%u slots=%u/%u SID=%04x/%04x LPAC cb=%u slots=%u/%u SID=%04x/%04x\n",
+        slotCount,bankCount,selectedBanks[0],selectedSlots[0][0],selectedSlots[0][1],
+        requestedSids[0],requestedSids[1],selectedBanks[1],selectedSlots[1][0],selectedSlots[1][1],
+        requestedSids[2],requestedSids[3],selectedBanks[2],selectedSlots[2][0],selectedSlots[2][1],
+        requestedSids[4],requestedSids[5]);
+
+    /* These invalid slots fault transactions with the board's non-shareable
+     * override before the context objects attach their exact SID routes. */
+    for(unsigned role=0;role<3;++role) {
+        for(unsigned index=0;index<2;++index) {
+            const unsigned slot=selectedSlots[role][index];
+            uint32_t smr=0,before=0,after=0;
+            if(smmuIo_.read32(smmuIo_.cookie,0x800+4*slot,&smr) ||
+                smmuIo_.read32(smmuIo_.cookie,0xc00+4*slot,&before)) {
+                return kIOReturnIOError;
+            }
+            const bool valid=extended?bool(before&(1u<<10)):bool(smr&(1u<<31));
+            if(valid || ((before>>16)&3)!=2) {
+                IOLog("NativeAdrenoSmmu: reservation changed slot=%u smr=%08x s2cr=%08x\n",slot,smr,before);
+                return kIOReturnBusy;
+            }
+            const uint32_t faultRoute=(2u<<16)|(3u<<8);
+            if(smmuIo_.write32(smmuIo_.cookie,0xc00+4*slot,faultRoute) ||
+                smmuIo_.barrier(smmuIo_.cookie) ||
+                smmuIo_.read32(smmuIo_.cookie,0xc00+4*slot,&after)) {
+                return kIOReturnIOError;
+            }
+            IOLog("NativeAdrenoSmmu: reserved slot=%u fault_before=%08x fault_after=%08x\n",slot,before,after);
+            if(after!=faultRoute) {
+                return kIOReturnIOError;
+            }
+        }
+    }
+    resources_.gpuBank=selectedBanks[0];
+    resources_.gmuBank=selectedBanks[1];
+    resources_.lpacBank=selectedBanks[2];
+    for(unsigned index=0;index<2;++index) {
+        gpuSlots_[index]=selectedSlots[0][index];
+        gmuSlots_[index]=selectedSlots[1][index];
+        lpacSlots_[index]=selectedSlots[2][index];
+    }
     return kIOReturnSuccess;
 }
-IOReturn NativeAdrenoGpuClient::clientMemoryForType(UInt32 type,IOOptionBits *options,
-    IOMemoryDescriptor **memory)
+
+IOReturn A642LState::contexts()
 {
-    if(memory)*memory=nullptr;
-    if(options)*options=kIOMapAnywhere;
-    /* The type is a BO mapping token; no client can hold one before the GPU
-     * and its core client exist, and the descriptor handoff is not written. */
-    return kIOReturnUnsupported;
-}
-IOReturn NativeAdrenoGpuClient::action(OSObject *target,void *reference,
-    IOExternalMethodArguments *arguments)
-{
-    NativeAdrenoGpuClient *client=OSDynamicCast(NativeAdrenoGpuClient,target);
-    if(!client || !arguments)return kIOReturnBadArgument;
-    if(!client->core_)return kIOReturnNotReady;
-    (void)reference;
-    /* Waits need a real time base, supplied by the service once bring-up exists. */
-    return client->core_->dispatch(arguments->selector,arguments->structureInput,
-        arguments->structureInputSize,arguments->structureOutput,
-        arguments->structureOutputSize,nullptr);
-}
-IOReturn NativeAdrenoGpuClient::externalMethod(uint32_t selector,
-    IOExternalMethodArguments *arguments,IOExternalMethodDispatch *dispatch,
-    OSObject *target,void *reference)
-{
-    /* One entry per ABI method; sizes are the exact wire records. */
-    static const IOExternalMethodDispatch table[]={
-        {&action,0,0,0,sizeof(NativeAdrenoAbiParams)},                    /* Query */
-        {&action,0,sizeof(NativeAdrenoAbiBoAlloc),0,sizeof(NativeAdrenoAbiBoAllocReply)},
-        {&action,0,sizeof(NativeAdrenoAbiBoMap),0,sizeof(NativeAdrenoAbiBoMapReply)},
-        {&action,0,sizeof(NativeAdrenoAbiBoFree),0,0},
-        {&action,0,sizeof(NativeAdrenoAbiSubmit),0,sizeof(NativeAdrenoAbiSubmitReply)},
-        {&action,0,sizeof(NativeAdrenoAbiWaitFence),0,0},
-        {&action,0,0,0,sizeof(NativeAdrenoAbiTimestamp)},
-        {&action,0,0,0,sizeof(NativeAdrenoAbiStatus)},
-        {&action,0,sizeof(NativeAdrenoAbiMetadata),0,0},
-        {&action,0,sizeof(NativeAdrenoAbiMetadata),0,sizeof(NativeAdrenoAbiMetadata)},
-        {&action,0,sizeof(NativeAdrenoAbiQueue),0,sizeof(NativeAdrenoAbiQueueReply)},
-        {&action,0,sizeof(NativeAdrenoAbiQueue),0,0},
-        {&action,0,sizeof(NativeAdrenoAbiBoCpuMap),0,sizeof(NativeAdrenoAbiBoCpuMapReply)},
-        {&action,0,sizeof(NativeAdrenoAbiBoCpuUnmap),0,0}};
-    if(selector<1 || selector>sizeof(table)/sizeof(table[0]))return kIOReturnUnsupported;
-    return IOUserClient::externalMethod(selector,arguments,
-        const_cast<IOExternalMethodDispatch *>(&table[selector-1]),target?target:this,reference);
+    smmuMap_=mapWindow(resources_.smmu);
+    if(!smmuMap_) {
+        return kIOReturnNoMemory;
+    }
+    /* The context callbacks retain the mapped register pointer for BO updates. */
+    smmuMmio_={reinterpret_cast<volatile unsigned char *>(smmuMap_->getVirtualAddress()),
+        size_t(resources_.smmu.bytes)};
+    if(ArmSmmu4KBindMmio(&smmuMmio_,&smmuIo_)!=ArmSmmu4KSuccess) {
+        return kIOReturnBadArgument;
+    }
+    constexpr uint32_t cm3ResetOffset=0x1f800*4-0x6a000;
+    uint32_t resetBefore=0,resetAfter=0;
+    if(read(this,NativeAdrenoA6xxGmuRegisters,cm3ResetOffset,&resetBefore) ||
+        write(this,NativeAdrenoA6xxGmuRegisters,cm3ResetOffset,1)) {
+        IOLog("NativeAdrenoSmmu: GMU CM3 reset access failed\n");
+        return kIOReturnIOError;
+    }
+    IODelay(1);
+    if(read(this,NativeAdrenoA6xxGmuRegisters,cm3ResetOffset,&resetAfter) || !(resetAfter&1)) {
+        IOLog("NativeAdrenoSmmu: GMU CM3 reset did not assert before=%08x after=%08x\n",resetBefore,resetAfter);
+        return kIOReturnIOError;
+    }
+    IOLog("NativeAdrenoSmmu: GMU CM3 held reset before=%08x after=%08x\n",resetBefore,resetAfter);
+    NativeAdrenoSnapshotSmmu(&smmuIo_,"before-platform-setup");
+
+    IOReturn status=reserveSmmuResources();
+    if(status) {
+        return status;
+    }
+    status=smmuProvider_.prepare(resources_,smmuIo_);
+    if(status) {
+        return status;
+    }
+    NativeAdrenoGmuContextReport &report=gmuContextReport_;
+    status=gmuContext_.bringUp(&smmuIo_,resources_.gmuBank,resources_.gmuAsid,
+        gmuSlots_[0],uint16_t(resources_.gmuSid),nullptr,&report,
+        uint16_t(resources_.gmuSid|resources_.gmuSidMask),gmuSlots_[1]);
+    native_adreno_a6xx_stats[4]=report.step;
+    native_adreno_a6xx_stats[5]=report.mismatch;
+    NativeAdrenoLogSmmuReport("gmu",&report);
+    if(status) {
+        if(report.program_writes) {
+            NativeAdrenoSnapshotSmmu(&smmuIo_,"after-gmu-failure");
+        }
+        return status;
+    }
+    const uint16_t sids[2]={uint16_t(resources_.gpuSid),uint16_t(resources_.gpuSid|resources_.gpuSidMask)};
+    status=gpuContext_.bringUp(&smmuIo_,resources_.gpuBank,resources_.gpuAsid,gpuSlots_,sids,nullptr,&gpuContextReport_);
+    native_adreno_a6xx_stats[6]=gpuContextReport_.step;
+    native_adreno_a6xx_stats[7]=gpuContextReport_.program_status;
+    NativeAdrenoLogSmmuReport("gpu",&gpuContextReport_);
+    if(status) {
+        if(gpuContextReport_.program_writes) {
+            NativeAdrenoSnapshotSmmu(&smmuIo_,"after-gpu-failure");
+        }
+        return status;
+    }
+    const uint16_t lpacSids[2]={uint16_t(resources_.lpacSid),
+        uint16_t(resources_.lpacSid|resources_.lpacSidMask)};
+    status=lpacContext_.bringUpShared(&smmuIo_,resources_.lpacBank,resources_.lpacAsid,
+        lpacSlots_,lpacSids,&gpuContext_,&lpacContextReport_);
+    NativeAdrenoLogSmmuReport("lpac",&lpacContextReport_);
+    if(status) {
+        if(lpacContextReport_.program_writes) {
+            NativeAdrenoSnapshotSmmu(&smmuIo_,"after-lpac-failure");
+        }
+        return status;
+    }
+    return kIOReturnSuccess;
 }
 
-static IOUserClient *createGpuClient(task_t owningTask,void *securityID,UInt32 type,
-    OSDictionary *properties,NativeAdrenoUserClient *core)
+IOReturn A642LState::startCp()
 {
-    NativeAdrenoGpuClient *client=new NativeAdrenoGpuClient;
-    if(!client)return nullptr;
-    if(!client->initWithTask(owningTask,securityID,type,properties)) {
-        client->release();
-        return nullptr;
+    ringIo_={this,gpuWrite,gpuRead,barrier,writeWptr,readGpuBusy,readAlwaysOn};
+    IOLog("NativeAdrenoCp: checking GMU keepalive and full AHB fence before GX registers\n");
+    IOReturn status=gmu_.keepAlive(true);
+    if(status) {
+        return status;
     }
-    client->setCore(core);
-    return client;
+    cpTrace_=true;
+    uint32_t gxStatus=0,fenceControl=0,gxDomain=0,spClock=0;
+    if(read(this,NativeAdrenoA6xxGmuRegisters,0x1f8d0*4-0x6a000,&gxStatus) ||
+        read(this,NativeAdrenoA6xxGmuRegisters,0x23b10*4-0x6a000,&fenceControl) ||
+        read(this,NativeAdrenoA6xxGpuCc,0x100c,&gxDomain) ||
+        read(this,NativeAdrenoA6xxGmuRegisters,0x1a880*4-0x6a000,&spClock)) {
+        return kIOReturnIOError;
+    }
+    IOLog("NativeAdrenoCp: GX power/clock=%08x AHB fence=%08x GX GDSCR=%08x SP clock=%08x\n",
+        gxStatus,fenceControl,gxDomain,spClock);
+    if((gxStatus&0xc0) || fenceControl || !(gxDomain&(1u<<31))) {
+        return kIOReturnNotReady;
+    }
+    cpTouched_=true;
+    IOLog("NativeAdrenoCp: core register initialization begin with SP clock retained\n");
+    status=NativeAdrenoA6xxHwInit::program(&ringIo_,resources_.highestBankBit);
+    if(status) {
+        return status;
+    }
+
+    const NativeAdrenoGpuProfileAccess profileAccess{
+        acquireProfileAccess, releaseProfileAccess, profileAccessible
+    };
+    status=NativeAdrenoGpuProfile::initialize(&ringIo_,profileAccess);
+    if(status) {
+        return status;
+    }
+
+    const uint32_t counterRegisters[]={0x1f841,0x1f842};
+    const uint32_t counterSelectors[]={0x20,0x04};
+    for(unsigned index=0;index<2;++index) {
+        const uint32_t offset=counterRegisters[index]*4-0x6a000;
+        uint32_t previous=0;
+        if(read(this,NativeAdrenoA6xxGmuRegisters,offset,&previous) ||
+            write(this,NativeAdrenoA6xxGmuRegisters,offset,(previous&~0xffu)|counterSelectors[index])) {
+            return kIOReturnIOError;
+        }
+    }
+
+    if(write(this,NativeAdrenoA6xxGmuRegisters,0x23b0e*4-0x6a000,0xff000000) ||
+        write(this,NativeAdrenoA6xxGmuRegisters,0x1f840*4-0x6a000,1)) {
+        return kIOReturnIOError;
+    }
+
+    IOLog("NativeAdrenoCp: GMU hardware clock controls begin\n");
+    const uint32_t clockRegisters[][2]={
+        {0x23b09,0x20000},{0x23b0a,0x10111},{0x23b0b,0x5555},{0x1f802,0}
+    };
+    for(const auto &entry:clockRegisters) {
+        if(write(this,NativeAdrenoA6xxGmuRegisters,entry[0]*4-0x6a000,entry[1])) {
+            return kIOReturnIOError;
+        }
+    }
+
+    uint32_t topClock=0;
+    if(gpuRead(this,0xae,&topClock)) {
+        return kIOReturnIOError;
+    }
+
+    IOLog("NativeAdrenoCp: inherited RBBM_CLOCK_CNTL=%08x\n",topClock);
+    if(topClock!=0x8aa8aa82) {
+        if(read(this,NativeAdrenoA6xxGmuRegisters,0x1a880*4-0x6a000,&spClock) ||
+            write(this,NativeAdrenoA6xxGmuRegisters,0x1a880*4-0x6a000,spClock&~1u)) {
+            return kIOReturnIOError;
+        }
+
+        status=NativeAdrenoA6xxHwInit::programClockGating(&ringIo_);
+        if(status) {
+            return status;
+        }
+
+        uint32_t gbif=0;
+        if(gpuRead(this,0xe3a,&gbif) || gpuWrite(this,0xe3a,(gbif&~0x70000u)|2) ||
+            read(this,NativeAdrenoA6xxGmuRegisters,0x1a880*4-0x6a000,&spClock) ||
+            write(this,NativeAdrenoA6xxGmuRegisters,0x1a880*4-0x6a000,spClock|1) ||
+            gpuWrite(this,0xae,0x8aa8aa82)) {
+            return kIOReturnIOError;
+        }
+    } else {
+        IOLog("NativeAdrenoCp: hardware clock gating already configured\n");
+    }
+
+    status=NativeAdrenoA6xxHwInit::finish(&ringIo_);
+    if(status) {
+        return status;
+    }
+
+    IOLog("NativeAdrenoCp: checking TBU translations before SQE start\n");
+    status=checkGpuTranslations();
+    if(status) {
+        return status;
+    }
+    status=irq_.attach(&ringIo_,NativeAdrenoA642L);
+    if(!status) {
+        irqAttached_=true;
+        status=irq_.programMask(nullptr);
+    }
+    if(status) {
+        return status;
+    }
+
+    if(native_adreno_sqe_firmware_image_size<=4 ||
+        native_adreno_sqe_firmware_image_size-4>gpuContext_.buffer(0).bytes()) {
+        return kIOReturnBadArgument;
+    }
+    IOLog("NativeAdrenoCp: SQE copy begin cpu=%p physical=%llx iova=%llx bytes=%llx\n",
+        gpuContext_.buffer(0).mapping(),gpuContext_.buffer(0).spans()[0].physical,
+        uint64_t(GpuSqeIova),native_adreno_sqe_firmware_image_size-4);
+    memcpy(gpuContext_.buffer(0).mapping(),native_adreno_sqe_firmware_image+4,
+        size_t(native_adreno_sqe_firmware_image_size-4));
+    IOLog("NativeAdrenoCp: SQE copy completed\n");
+    /* The empty register-list header is valid with IFPC held disabled. */
+    memset(gpuContext_.buffer(3).mapping(),0,GpuPageBytes);
+    memset(gpuContext_.buffer(4).mapping(),0,GpuPageBytes);
+    IOLog("NativeAdrenoCp: SQE publication begin\n");
+    status=gpuContext_.buffer(0).publishForDevice(0,gpuContext_.buffer(0).bytes());
+    IOLog("NativeAdrenoCp: SQE publication completed status=%08x\n",status);
+    if(status) {
+        return status;
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+
+    uint32_t inheritedRptr=0,inheritedWptr=0,inheritedSqe=0;
+    if(gpuRead(this,0x806,&inheritedRptr) ||
+        gpuRead(this,0x807,&inheritedWptr) ||
+        gpuRead(this,0x808,&inheritedSqe)) {
+        return kIOReturnIOError;
+    }
+    IOLog("NativeAdrenoCp: inherited ring rptr=%08x wptr=%08x sqe=%08x\n",
+        inheritedRptr,inheritedWptr,inheritedSqe);
+    if(inheritedRptr || inheritedWptr) {
+        return kIOReturnNotReady;
+    }
+
+    NativeAdrenoRingCache cache{this,publishRing,acquireFence};
+    IOLog("NativeAdrenoCp: ring attach begin ring=%llx fence=%llx\n",uint64_t(GpuRingIova),uint64_t(GpuMemptrsIova));
+    status=ring_.attach(&ringIo_,&cache,gpuContext_.buffer(1).mapping(),GpuRingBytes,GpuRingIova,
+        gpuContext_.buffer(2).mapping(),GpuPageBytes,GpuMemptrsIova,NativeAdrenoA642L);
+    IOLog("NativeAdrenoCp: ring attach completed status=%08x\n",status);
+    if(status) {
+        return status;
+    }
+    native_adreno_fence_phys=gpuContext_.buffer(2).spans()[0].physical;
+    NativeAdrenoCpInit cp;
+    NativeAdrenoCpInitConfig config{GpuSqeIova,GpuPwrupIova,0,NativeAdrenoA642L};
+    uint32_t bootstrapWptr=0;
+    IOLog("NativeAdrenoCp: SQE start and CP_ME_INIT submit begin\n");
+    cpTrace_=false;
+    status=cp.runBootstrap(&ringIo_,&ring_,&config,&bootstrapWptr);
+    cpTrace_=true;
+    IOLog("NativeAdrenoCp: CP_ME_INIT submit completed status=%08x wptr=%u\n",status,bootstrapWptr);
+    clock_={this,now,idle};
+    cpTrace_=false;
+    uint32_t observedRptr=0;
+    IOLog("NativeAdrenoCp: CP_ME_INIT idle wait begin\n");
+    if(!status && ring_.waitBootstrap(bootstrapWptr,&clock_,2000000,&observedRptr)!=NativeAdrenoRingFenceComplete) {
+        status=kIOReturnTimeout;
+    }
+    cpTrace_=true;
+    IOLog("NativeAdrenoCp: CP_ME_INIT idle wait completed status=%08x rptr=%u/%u\n",status,observedRptr,bootstrapWptr);
+    if(status) {
+        return status;
+    }
+
+    IOLog("NativeAdrenoA6xx: CP init completed, authenticating PAS 13 shader\n");
+    status=zap_.load(resources_.zap,reinterpret_cast<void *>(zapMap_->getVirtualAddress()));
+    IOLog("NativeAdrenoCp: PAS shader startup completed status=%08x phase=%u SCM=%lld/%lld\n",
+        status,zap_.phase(),zap_.transport(),zap_.result());
+    native_adreno_a6xx_stats[16]=zap_.phase();
+    native_adreno_a6xx_stats[17]=uint32_t(zap_.transport());
+    native_adreno_a6xx_stats[18]=uint32_t(zap_.result());
+    if(status) {
+        return status;
+    }
+
+    uint32_t secureMode[2]={0};
+    if(AdrenoPM4Type7(0x66,1,&secureMode[0])!=AdrenoPM4Success) {
+        return kIOReturnBadArgument;
+    }
+
+    IOLog("NativeAdrenoCp: CP_SET_SECURE_MODE submit begin\n");
+    status=ring_.submitBootstrap(secureMode,2,&bootstrapWptr);
+    cpTrace_=false;
+    if(!status && ring_.waitBootstrap(bootstrapWptr,&clock_,2000000,&observedRptr)!=NativeAdrenoRingFenceComplete) {
+        status=kIOReturnTimeout;
+    }
+    cpTrace_=true;
+    IOLog("NativeAdrenoCp: secure mode exit completed status=%08x rptr=%u/%u\n",status,observedRptr,bootstrapWptr);
+    if(status) {
+        return status;
+    }
+
+    uint32_t words[4]={0};
+    if(AdrenoPM4Type7(0x3d,3,&words[0])!=AdrenoPM4Success) {
+        return kIOReturnBadArgument;
+    }
+
+    words[1]=uint32_t(GpuScratchIova);
+    words[2]=uint32_t(GpuScratchIova>>32);
+    words[3]=0x6421cafe;
+    uint32_t fence=0;
+    IOLog("NativeAdrenoCp: scratch write submit begin\n");
+    status=ring_.submit(words,4,&fence);
+    IOLog("NativeAdrenoCp: scratch submit completed status=%08x fence=%u\n",status,fence);
+    cpTrace_=false;
+    if(!status && ring_.wait(fence,&clock_,20000,nullptr)!=NativeAdrenoRingFenceComplete) {
+        status=kIOReturnTimeout;
+    }
+    cpTrace_=true;
+    IOLog("NativeAdrenoCp: scratch fence wait completed status=%08x observed=%u\n",status,ring_.completedFence());
+    native_adreno_a6xx_stats[8]=fence;
+    native_adreno_a6xx_stats[9]=ring_.completedFence();
+    if(!status) {
+        status=gpuContext_.buffer(4).acquireDeviceWrites(0,GpuPageBytes);
+    }
+    native_adreno_a6xx_stats[10]=*static_cast<volatile uint32_t *>(gpuContext_.buffer(4).mapping());
+    if(!status && native_adreno_a6xx_stats[10]!=0x6421cafe) {
+        status=kIOReturnIOError;
+    }
+    if(status) {
+        return status;
+    }
+
+    status=submit_.attach(gpuContext_.vm(),&ring_);
+    if(!status) {
+        status=gpuContext_.enableSwitching();
+    }
+    if(status) {
+        return status;
+    }
+    NativeAdrenoTimeIo time{this,gpuRead};
+    status=timer_.attach(&time,NativeAdrenoTimeCp);
+    if(status) {
+        return status;
+    }
+    info_ = {};
+    info_.chip_id = resources_.chipId;
+    info_.gmem_bytes = resources_.gmemBytes;
+    info_.gmem_base = 0;
+    info_.uche_trap_base = 0x1fffffffff000;
+    info_.va_start = gpuContext_.clientVaStart();
+    info_.va_size = (UINT64_C(1)<<gpuContext_.inputBits())-info_.va_start;
+    info_.highest_bank_bit = resources_.highestBankBit;
+    info_.ubwc_swizzle = 6;
+    info_.macrotile_mode = 0;
+    info_.ubwc_version = 3;
+    info_.flags = NativeAdrenoDeviceClientIova|NativeAdrenoDeviceCachedCoherent|NativeAdrenoDeviceCachedCoherentImports;
+
+    return native_adreno_publish(gpuContext_.vm(),&submit_,&ring_,&clock_,&timer_,&info_,
+        gpuContext_.inputBits(),gpuContextReport_.output_bits,&gpuContext_);
+}
+
+IOReturn A642LState::fail(IOReturn status)
+{
+    NativeAdrenoGpuProfile::fault();
+    if(hardwareIrqEnabled_) {
+        native_adreno_smmu_disable_irq(resources_.gpuInterrupt);
+        hardwareIrqEnabled_=false;
+    }
+    smmuProvider_.observe();
+    smmuProvider_.disableInterrupts();
+    native_adreno_a6xx_stats[1]=uint32_t(status);
+    native_adreno_control_update(native_adreno_a6xx_stats[0],uint32_t(status),"failed");
+    failedPowerReport_=power_.report();
+    failedGmuReport_=gmu_.report();
+    failureCaptured_=true;
+    native_adreno_fault();
+    bool stopped=true;
+    if(cpTouched_) {
+        stopped=NativeAdrenoA6xxHwInit::stop(&ringIo_,1000)==kIOReturnSuccess;
+    }
+    if (stopped) {
+        const IOReturn releaseStatus = gmu_.releasePerformanceCounters();
+        if (releaseStatus) {
+            IOLog("NativeAdrenoGpuProfile: kind=error phase=fault_release status=%08x\n",
+                uint32_t(releaseStatus));
+        }
+    }
+    const IOReturn gmuStopped=gmu_.stop();
+    if (!gmuStopped) {
+        NativeAdrenoGpuProfile::hardwareStopped();
+    }
+    native_adreno_a6xx_stats[20]=stopped;
+    native_adreno_a6xx_stats[21]=uint32_t(gmuStopped);
+    if(stopped && !gmuStopped) {
+        native_adreno_dma_stopped();
+        power_.stop(true);
+    }
+    dump();
+    return status;
+}
+
+IOReturn A642LState::start()
+{
+    uint32_t fixedMhz = 0;
+    PE_parse_boot_argn("native-adreno-fixed-mhz", &fixedMhz, sizeof(fixedMhz));
+    if (fixedMhz) {
+        fixedPerformanceLevel_ = performanceLevelFor(uint64_t(fixedMhz) * 1000000);
+        if (NativeAdrenoA6xxOperatingPoints[fixedPerformanceLevel_ - 1].frequencyHz !=
+            uint64_t(fixedMhz) * 1000000) {
+            return fail(kIOReturnBadArgument);
+        }
+    }
+
+    native_adreno_a6xx_stats[0]=1;
+    native_adreno_control_update(1,0,"starting");
+    IOLog("NativeAdrenoA6xx: mapping SM7325 board resources\n");
+    IOReturn status=mapWindows();
+    if(status) {
+        return fail(status);
+    }
+    native_adreno_a6xx_stats[0]=2;
+    native_adreno_control_update(2,0,"starting");
+    IOLog("NativeAdrenoA6xx: enabling CX clocks and parent votes\n");
+    const NativeAdrenoA6xxIo io{this,read,write,delay};
+    status=power_.enableCx(io, resources_.ddrType);
+    if(status) {
+        return fail(status);
+    }
+    native_adreno_a6xx_stats[0]=3;
+    native_adreno_control_update(3,0,"starting");
+    IOLog("NativeAdrenoA6xx: programming GMU and GPU SMMU contexts\n");
+    status=contexts();
+    if(status) {
+        return fail(status);
+    }
+    NativeAdrenoGmuAllocator &memory=gmuContext_.allocator();
+    const auto &layout=memory.layout();
+    NativeAdrenoA6xxGmuConfig config{io,native_adreno_firmware_image,
+        size_t(native_adreno_firmware_image_size),{
+            {memory.icache().mapping(),layout.icache_iova,memory.icache().bytes()},
+            {memory.dummy().mapping(),layout.dummy_iova,memory.dummy().bytes()},
+            {memory.debug().mapping(),layout.debug_iova,memory.debug().bytes()},
+            {memory.log().mapping(),layout.log_iova,memory.log().bytes()},
+            {memory.hfi().mapping(),layout.hfi_iova,memory.hfi().bytes()}},&power_.tables()};
+    native_adreno_a6xx_stats[0]=4;
+    native_adreno_control_update(4,0,"starting");
+    IOLog("NativeAdrenoA6xx: loading A660 GMU and starting HFI\n");
+    status=gmu_.start(config);
+    if(!status) {
+        status=smmuProvider_.observe();
+    }
+    if(status) {
+        return fail(status);
+    }
+    native_adreno_a6xx_stats[0]=5;
+    native_adreno_control_update(5,0,"starting");
+    IOLog("NativeAdrenoA6xx: requesting GX at 315 MHz\n");
+    status=power_.enableGx();
+    if(!status) {
+        status=gmu_.keepAlive(true);
+    }
+    if(status) {
+        return fail(status);
+    }
+    native_adreno_a6xx_stats[0]=6;
+    native_adreno_control_update(6,0,"starting");
+    IOLog("NativeAdrenoA6xx: starting A642L CP and GPU memory write\n");
+    status=startCp();
+    cpTrace_=false;
+    if(status) {
+        return fail(status);
+    }
+    status=native_adreno_smmu_register_irq(resources_.gpuInterrupt,gpuInterrupt,this);
+    if(!status) {
+        hardwareIrqEnabled_=true;
+        status=native_adreno_smmu_enable_irq(resources_.gpuInterrupt);
+    }
+    if(status) {
+        return fail(status);
+    }
+    lastActiveUs_ = now(nullptr);
+    __atomic_store_n(&activityKick_, 0, __ATOMIC_RELEASE);
+    status = pollPerformance(false);
+    if (status) {
+        return fail(status);
+    }
+    IOLog("NativeAdrenoDvfs: ready ddr=%u levels=315,450,550 interval_us=16000 fixed_mhz=%u ack_mhz=%u cap_mhz=%u\n",
+        resources_.ddrType, fixedMhz, performance_.acknowledged_hz / 1000000,
+        performance_.thermal_cap_hz / 1000000);
+
+    ready_=true;
+    native_adreno_a6xx_stats[0]=7;
+    native_adreno_control_update(7,0,"ready");
+    dump();
+    return kIOReturnSuccess;
+}
+
+void A642LState::poll()
+{
+    if(!ready_) {
+        return;
+    }
+
+    const uint64_t current = now(nullptr);
+    if (current >= nextHealthPollUs_) {
+        nextHealthPollUs_ = current + 10000;
+        IOReturn gmuStatus = smmuProvider_.observe();
+        if (!gmuStatus) {
+            gmuStatus = gmu_.poll();
+        }
+        if (gmuStatus) {
+            ready_ = false;
+            native_adreno_a6xx_stats[0] = 8;
+            fail(gmuStatus);
+            return;
+        }
+    }
+
+    const IOReturn status=__atomic_load_n(&hardwareIrqFailed_,__ATOMIC_ACQUIRE)?
+        kIOReturnIOError:kIOReturnSuccess;
+    uint32_t submitted=0,completed=0;
+    const int progress=native_adreno_progress(&submitted,&completed);
+    if(completed!=watchedFence_ || submitted==completed) {
+        watchedFence_=completed;
+        watchedSince_=current;
+    }
+    const bool timeout=submitted!=completed && current-watchedSince_>500000;
+    if(status || progress || timeout) {
+        ready_=false;
+        native_adreno_a6xx_stats[0]=8;
+        fail(status?status:(timeout?kIOReturnTimeout:kIOReturnIOError));
+        return;
+    }
+
+    uint32_t captureHz = 0;
+    bool captureEnabled = NativeAdrenoGpuProfile::captureFrequency(&captureHz);
+    if (current >= nextPerformancePollUs_ || activityPending() ||
+        captureEnabled != capturePerformanceEnabled_ || captureHz != capturePerformanceHz_) {
+        const IOReturn performanceStatus = pollPerformance(submitted != completed);
+        if (performanceStatus) {
+            ready_ = false;
+            native_adreno_a6xx_stats[0] = 8;
+            fail(performanceStatus);
+            return;
+        }
+    }
+
+    const IOReturn profileStatus = NativeAdrenoGpuProfile::poll();
+    if (profileStatus) {
+        ready_ = false;
+        native_adreno_a6xx_stats[0] = 8;
+        fail(profileStatus);
+        return;
+    }
+
+    // The last retired capture job releases its fixed GPU/DDR selection here.
+    captureEnabled = NativeAdrenoGpuProfile::captureFrequency(&captureHz);
+    if (captureEnabled != capturePerformanceEnabled_ || captureHz != capturePerformanceHz_) {
+        const IOReturn performanceStatus = pollPerformance(submitted != completed);
+        if (performanceStatus) {
+            ready_ = false;
+            native_adreno_a6xx_stats[0] = 8;
+            fail(performanceStatus);
+        }
+    }
+}
+
+uint32_t A642LState::waitMilliseconds() const
+{
+    if (!ready_) {
+        return 10;
+    }
+
+    const uint64_t current = now(nullptr);
+    const uint64_t deadline = nextHealthPollUs_ < nextPerformancePollUs_ ?
+        nextHealthPollUs_ : nextPerformancePollUs_;
+    if (deadline <= current) {
+        return 1;
+    }
+
+    return uint32_t((deadline - current + 999) / 1000);
+}
+
+bool A642LState::activityPending() const
+{
+    return ready_ && __atomic_load_n(&activityKick_, __ATOMIC_ACQUIRE) != 0;
+}
+
+void A642LState::dump() const
+{
+    const auto &power=failureCaptured_?failedPowerReport_:power_.report();
+    const auto &gmu=failureCaptured_?failedGmuReport_:gmu_.report();
+    IOLog("NativeAdrenoA6xx: step=%u status=%08x cp_fence=%u/%u readback=%08x irq=%08x cp=%08x protect=%08x\n",
+        native_adreno_a6xx_stats[0],native_adreno_a6xx_stats[1],native_adreno_a6xx_stats[8],
+        native_adreno_a6xx_stats[9],native_adreno_a6xx_stats[10],native_adreno_a6xx_stats[11],
+        native_adreno_a6xx_stats[12],native_adreno_a6xx_stats[13]);
+    IOLog("NativeAdrenoA6xx: power=%u/%08x domain=%u offset=%x value=%x expected=%x mask=%x\n",
+        power.phase,power.status,power.domain,power.offset,power.value,power.expected,power.mask);
+    IOLog("NativeAdrenoA6xx: gmu=%u/%08x domain=%u offset=%x value=%x hfi=%x/%x ack=%u zap=%u scm=%lld/%lld\n",
+        gmu.phase,gmu.status,gmu.domain,gmu.offset,gmu.value,gmu.hfiMessage,gmu.hfiError,
+        gmu.acknowledged,zap_.phase(),zap_.transport(),zap_.result());
+    IOLog("NativeAdrenoDvfs: ack_hz=%u requested_hz=%u ddr_index=%u cap_hz=%u busy_permille=%u temperature_millic=%d thermal_valid=%x thermal_flags=%x flags=%x vote_status=%08x\n",
+        performance_.acknowledged_hz, performance_.requested_hz, performance_.bandwidth_index,
+        performance_.thermal_cap_hz, performance_.busy_permille, performance_.temperature_millic,
+        performance_.thermal_valid_mask, performance_.thermal_flags, performance_.flags,
+        performance_.vote_status);
+    if(gmuContextReport_.step) {
+        NativeAdrenoLogSmmuReport("gmu-retained",&gmuContextReport_);
+    }
+    if(gpuContextReport_.step) {
+        NativeAdrenoLogSmmuReport("gpu-retained",&gpuContextReport_);
+    }
+}
+
+uint64_t vmNow()
+{
+    uint64_t value=0;
+    NativeAdrenoKernelTime::now_us(nullptr,&value);
+    return value;
+}
+
+void registrationWorker(void *,wait_result_t)
+{
+    thread_set_thread_name(current_thread(),"adreno-control");
+    OSDictionary *matching=IOService::resourceMatching("IOBSD");
+    IOService *provider=matching?IOService::waitForMatchingService(matching,60000000000ULL):nullptr;
+    OSSafeReleaseNULL(matching);
+    if(!provider) {
+        IOLog("NativeAdrenoA6xx: IOBSD resource unavailable\n");
+        native_adreno_a6xx_stats[1]=uint32_t(kIOReturnNotReady);
+        return;
+    }
+    provider->release();
+    const IOReturn registered=native_adreno_initialize_classes();
+    if(registered) {
+        IOLog("NativeAdrenoA6xx: runtime class registration failed %08x\n",registered);
+        native_adreno_a6xx_stats[1]=uint32_t(registered);
+        return;
+    }
+    const IOReturn published=native_adreno_control_publish();
+    if(published) {
+        IOLog("NativeAdrenoA6xx: control service registration failed %08x\n",published);
+        native_adreno_a6xx_stats[1]=uint32_t(published);
+        return;
+    }
+    IOLog("NativeAdrenoA6xx: control ready, waiting for administrator Start request\n");
+}
+
+void hardwareWorker(void *,wait_result_t)
+{
+    thread_set_thread_name(current_thread(),"adreno-a642l");
+    IOLog("NativeAdrenoA6xx: hardware worker started by administrator request\n");
+    native_adreno_vm_now_us=vmNow;
+    native_adreno_pool_mib=0;
+    state=new A642LState;
+    if(!state) {
+        native_adreno_a6xx_stats[1]=uint32_t(kIOReturnNoMemory);
+        native_adreno_control_update(0,uint32_t(kIOReturnNoMemory),"failed");
+        return;
+    }
+    if(state->start()!=kIOReturnSuccess) {
+        return;
+    }
+    for(;;) {
+        uint64_t deadline = 0;
+        clock_interval_to_deadline(state->waitMilliseconds(), NSEC_PER_MSEC, &deadline);
+        assert_wait_deadline(&performanceWake, THREAD_UNINT, deadline);
+        if (state->activityPending()) {
+            thread_wakeup(&performanceWake);
+        }
+        thread_block(THREAD_CONTINUE_NULL);
+        state->poll();
+    }
+}
+}
+
+extern "C" void native_adreno_a6xx_start(void)
+{
+    unsigned enabled=0;
+    if(!PE_parse_boot_argn("native-adreno-a6xx",&enabled,sizeof(enabled)) || !enabled) {
+        return;
+    }
+
+    uint32_t expected=0;
+    if(!__atomic_compare_exchange_n(&launched,&expected,1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) {
+        return;
+    }
+    thread_t thread=nullptr;
+    const kern_return_t status=kernel_thread_start(registrationWorker,nullptr,&thread);
+    if(status==KERN_SUCCESS) {
+        thread_deallocate(thread);
+    } else {
+        native_adreno_a6xx_stats[1]=uint32_t(status);
+    }
+}
+
+extern "C" IOReturn native_adreno_a6xx_request_start(void)
+{
+    uint32_t expected=0;
+    if(!__atomic_compare_exchange_n(&hardwareLaunched,&expected,1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) {
+        return kIOReturnBusy;
+    }
+    IOLog("NativeAdrenoA6xx: administrator Start accepted\n");
+    native_adreno_control_update(0,0,"starting");
+    thread_t thread=nullptr;
+    const kern_return_t status=kernel_thread_start(hardwareWorker,nullptr,&thread);
+    if(status!=KERN_SUCCESS) {
+        native_adreno_a6xx_stats[1]=uint32_t(status);
+        native_adreno_control_update(0,uint32_t(status),"failed");
+        return kIOReturnNoResources;
+    }
+    thread_deallocate(thread);
+    return kIOReturnSuccess;
+}
+
+extern "C" void native_adreno_a6xx_dump_stats(void)
+{
+    IOLog("NativeAdrenoA6xx: registration_requested=%u hardware_requested=%u step=%u status=%08x\n",
+        launched,hardwareLaunched,native_adreno_a6xx_stats[0],native_adreno_a6xx_stats[1]);
+    if(state) {
+        state->dump();
+    }
 }

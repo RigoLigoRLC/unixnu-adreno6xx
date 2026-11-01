@@ -4,15 +4,17 @@
 #include <IOKit/IOTypes.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "NativeAdrenoGeneration.h"
 
-/* A7XX command processor ring and timestamp fence, not a scheduler.
+/* NativeAdrenoRing owns a command processor ring and its timestamp fence.
  * Register indices are dword offsets; the platform adds the MMIO base and
  * multiplies by four. Caller must already own an exclusive, powered GPU with
  * SQE microcode loaded (CP_SQE_INSTR_BASE), global reset released and all
  * masters quiesced while attach programs the ring. Ring and fence CPU
  * addresses must be actual writable mappings of the same IOVAs that were
- * mapped into the active native-4K GPU context. No MMIO base, IRQ, power,
- * GMU, context switching or per-client validation is implemented here.
+ * mapped into every native-4K GPU context. The A642L prologue switches TTBR0
+ * and its ASID before executing a process's IBs. The service owns IRQ, power
+ * and GMU control; NativeAdrenoUserClient validates client resources.
  * Every submit publishes ring memory before advancing WPTR and completes
  * only when the CP timestamp value is observed at the fence address.
  * A failed WPTR write or cache publication is uncertain: the ring is poisoned
@@ -23,16 +25,18 @@ struct NativeAdrenoRingIo {
     int (*write32)(void *,uint32_t reg,uint32_t value);
     int (*read32)(void *,uint32_t reg,uint32_t *value);
     int (*barrier)(void *);
-    /* Optional: the GMU's AHB fence status (bit 0: a write to a fenced GPU register was dropped while the GPU power domain was not
-     * ready); with clear set, also clears it. Without it, WPTR writes are not checked. */
-    void *fence_cookie;
-    int (*fence_status)(void *,int clear,uint32_t *status);
+    /* The A642L platform retries a dropped WPTR write through the GMU fence. */
+    int (*writeWptr)(void *,uint32_t value);
+    /* The GMU AO status uses bit 23 for GPU busy excluding AHB accesses. */
+    int (*readGpuBusy)(void *,uint32_t *status);
+    /* CPU timestamp reads use the GMU AO registers on GMU-equipped GPUs. */
+    int (*readAlwaysOn)(void *, uint64_t *ticks);
 };
 struct NativeAdrenoRingCache {
     void *cookie;
-    /* Clean owned ring bytes to PoC before the device reads them. */
+    /* Publish CPU stores before the device reads coherent ring memory. */
     int (*publish)(void *,const volatile uint32_t *words,size_t bytes);
-    /* Invalidate the fence page before the CPU reads CP-written values. */
+    /* Order the CPU's reads of coherent CP-written fence values. */
     int (*acquire)(void *,volatile uint32_t *words,size_t bytes);
 };
 struct NativeAdrenoRingClock {
@@ -47,7 +51,6 @@ enum NativeAdrenoRingFence {
     NativeAdrenoRingFencePoisoned,
     NativeAdrenoRingFenceArgument
 };
-enum : uint32_t {NativeAdrenoRingStallWords = 22};   /* NativeAdrenoRing::stallState */
 class NativeAdrenoRing final {
     NativeAdrenoRingIo io_{};
     NativeAdrenoRingCache cache_{};
@@ -56,36 +59,23 @@ class NativeAdrenoRing final {
     uint64_t ring_iova_=0,fence_iova_=0;
     uint32_t next_=0,rptr_shadow_=0,seqno_=0,completed_=0,submissions_=0;
     bool attached_=false,poisoned_=false,reset_pending_=false;
-    uint32_t context_=0;
-    /* The GPU page table the CP runs (TTBR0 with its ASID in bits 63:48) and whether the next framed prologue must switch to it. */
-    uint64_t table_=0;
-    bool table_pending_=false;
-    /* Timeline stamps: a framed submission reads the CP's always-on counter (19.2 MHz) into the fence page before its user buffers and after
-     * them, as a6xx_submit() does for its stats (CP_REG_TO_MEM, REG 0x0980, 64 bit). Slot fence % 64 at +512, 16 bytes: start, end. */
-    bool stamps_=false;
-    /* CP preemption between rings (NativeAdrenoPreempt): every framed submission ends by yielding the floor, and the prologue
-     * names the ring's preemption record with CP_SET_PSEUDO_REG so the CP can save this ring's state into it. A ring that is not
-     * the one the CP runs appends its words without moving CP_RB_WPTR: the switch writes it after the CP arrives (msm's
-     * ring->restore_wptr), which restoreWptr() does. secondary_: this ring never programs CP_RB_* (the CP has one ring register
-     * set; the second ring's base, read-pointer shadow and control word reach it through its preemption record). */
-    bool preempt_=false,secondary_=false,restore_wptr_=false;
-    /* Whether this ring's write pointer may be written to the register now: the CP runs this ring and no switch is in flight (msm's
-     * a6xx_flush writes CP_RB_WPTR only for cur_ring, and not while a6xx_in_preempt). The first ring starts as the one the CP runs. A
-     * ring that is not current appends its words and leaves restore_wptr_ for the switch's arrival. */
-    bool current_=true;
-    uint64_t record_iova_=0,smmu_iova_=0,bv_rptr_iova_=0;
-    void initPreemptPage();
-    uint32_t control_=0;
+    bool bootstrap_pending_=false;
+    uint64_t selected_table_=0,issued_table_=0;
+    unsigned table_bank_=0;
+    uint32_t profileWindows_[16]{};
+    uint32_t profileFences_[16]{};
+    uint32_t profileIssueTicks_[16]{};
+    bool profileIssueValid_[16]{};
+    NativeAdrenoGeneration generation_=NativeAdrenoA740;
     IOReturn poison();
-    IOReturn writeWptr(uint32_t value);
     IOReturn readRptr(uint32_t *);
-    IOReturn emitPrologue(uint32_t at,bool reset,bool table,uint32_t *end,uint32_t number);
+    IOReturn reserveA6xx(uint32_t words,uint32_t *at);
+    IOReturn commit(uint32_t end,uint32_t serial);
+    void logBootstrap(uint32_t target,uint32_t rptr,uint32_t busy,const char *result);
+    IOReturn emitPrologue(uint32_t at,bool reset,uint32_t *end);
     IOReturn emitFence(uint32_t at,uint32_t seqno,uint32_t *end);
     IOReturn emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *end);
-    IOReturn emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *end,bool yield);
-    /* The one submission path: `number` is the fence this submission issues (the ring's next, or the caller's). */
-    IOReturn submitWords(const uint32_t *words,size_t word_count,uint32_t number,bool framed,bool give_wptr,uint32_t *issued);
-    IOReturn program();
+    IOReturn submitWords(const uint32_t *words,size_t word_count,uint32_t *fence,bool framed);
 public:
     NativeAdrenoRing()=default;
     ~NativeAdrenoRing()=default;
@@ -97,96 +87,34 @@ public:
      * All outputs are prevalidated before any register write. */
     IOReturn attach(const NativeAdrenoRingIo *,const NativeAdrenoRingCache *,
         void *ring,size_t ring_bytes,uint64_t ring_iova,
-        void *fence,size_t fence_bytes,uint64_t fence_iova);
+        void *fence,size_t fence_bytes,uint64_t fence_iova,
+        NativeAdrenoGeneration generation=NativeAdrenoA740);
     /* Programs nothing. Refuses while submissions are unobserved or poisoned,
      * because only the caller can establish real GPU quiescence and unmap. */
     IOReturn detach();
     /* Emit an entire command stream followed by the timestamp fence and commit
      * it with one WPTR update. Returns a nonzero fence value on success. The
-     * words are copied; the caller's buffer is never retained. A secondary ring
-     * (attachSecondary) never moves CP_RB_WPTR: its fence is written when the CP
-     * is switched to it and restoreWptr() gives the pointer. */
-    /* A second ring of the same GPU (NativeAdrenoPreempt): its memory is mapped and its read pointer read, but no CP_RB_* register
-     * is written, because the CP has one set and learns this ring from its preemption record on each switch. The register and cache
-     * callbacks are the first ring's: a submission publishes its words and orders them through them. */
-    IOReturn attachSecondary(const NativeAdrenoRingIo *io,const NativeAdrenoRingCache *cache,
-        void *ring,size_t ring_bytes,uint64_t ring_iova,void *fence,size_t fence_bytes,uint64_t fence_iova);
-    /* CP preemption for this ring: the GPU addresses of its preemption record (NativeAdrenoPreempt::writeRecord) and of the
-     * a7xx_cp_smmu_info page its switch reads, and the read-pointer shadow of the BV thread. A ring without it never yields and
-     * never carries the record packet, as before. */
-    IOReturn setPreempt(uint64_t record,uint64_t smmu_info,uint64_t bv_rptr_addr);
-    bool preemption() const {return preempt_;}
-    /* Initialize while idle, or read the TTBR0 the CP last installed, not the last queued table. */
-    IOReturn resetExecutedTable(uint64_t ttbr0);
-    IOReturn executedTable(uint64_t *ttbr0);
-    /* The write pointer that waits for a switch (a ring that is not the CP's own appends without moving CP_RB_WPTR). */
-    bool restorePending() const {return restore_wptr_;}
-    void setCurrent(bool current) {current_=current;}
-    bool current() const {return current_;}
-    /* Gives the waiting write pointer again; after a switch into this ring, and after a restart. */
-    IOReturn restoreWptr();
-    /* Fills this ring's preemption record (msm's a6xx_preempt_record): its base, its read-pointer shadow, its BV shadow, its CP_RB_CNTL
-     * and the write pointer the CP resumes at. */
-    IOReturn writePreemptRecord(uint8_t *record) const;
-    /* The write pointer the CP resumes this ring at, written into its record before a switch to it. */
-    IOReturn writePreemptWptr(uint8_t *record) const;
-    /* The register values the record repeats, for the caller's own record writes. */
-    uint32_t controlValue() const {return control_;}
-    uint64_t ringIova() const {return ring_iova_;}
-    uint64_t fenceIova() const {return fence_iova_;}
-    uint64_t bvRptrIova() const {return fence_iova_+8;}
-    uint64_t recordIova() const {return record_iova_;}
-    uint64_t smmuInfoIova() const {return smmu_iova_;}
+     * words are copied; the caller's buffer is never retained. */
     IOReturn submit(const uint32_t *words,size_t word_count,uint32_t *fence);
-    /* User command buffers: the A7XX BR/BV thread framing of a7xx_submit() around the words (CP init and the kernel's own
-     * bring-up packets keep the plain submit() above, as Linux sends them outside a7xx_submit()). */
+    /* A642L bootstrap commands run before timestamp memory is usable. The
+     * returned WPTR is completed only by waitBootstrap's hardware-idle check. */
+    IOReturn submitBootstrap(const uint32_t *words,size_t word_count,uint32_t *wptr);
+    NativeAdrenoRingFence waitBootstrap(uint32_t wptr,const NativeAdrenoRingClock *,
+        uint32_t timeout_us,uint32_t *observed);
+    /* A642L user buffers receive A6xx IB-list markers and CACHE_FLUSH_TS.
+     * A740 user buffers receive its BR/BV thread synchronization packets. */
     IOReturn submitFramed(const uint32_t *words,size_t word_count,uint32_t *fence);
-    /* The same with the fence number chosen by the caller, for rings that share one numbering (NativeAdrenoSubmit's queues):
-     * `fence` must rise past every value this ring has issued, and becomes the ring's newest. The value the ring used is in
-     * `issued` (0 where it refused). */
-    IOReturn submitFramed(const uint32_t *words,size_t word_count,uint32_t fence,uint32_t *issued);
-    /* The next framed submission starts with the A7XX context entry of a6xx_set_pagetable() (BR/BV counters, on-chip
-     * timestamps and resource table cleared between thread syncs); a new user client requests it, as Linux does per context. */
+    void selectAddressSpace(uint64_t ttbr0,unsigned bank) {
+        selected_table_=ttbr0;
+        table_bank_=bank;
+    }
+    /* The submission owner calls this after a normal fence observation, or
+     * with complete=false after stopping DMA for a failed job. */
+    void collectGpuProfile(uint32_t fence, uint32_t queue, bool complete,
+        uint64_t completion = 0);
+    /* The next user submission waits for idle on A642L or clears the A740
+     * thread counters, timestamps and resource table between thread syncs. */
     void requestContextReset() {reset_pending_=true;}
-    /* Turns the timeline stamps on or off for the framed submissions after this call; off by default. */
-    void setTimeline(bool on) {stamps_=on;}
-    /* The always-on counter ticks the CP read before and after the user buffers of a fence's submission (a status word: 1 attached, 2 stamps on, 4 page big enough, 8 page acquired, 16 slot read). Invalidates the fence page first. */
-    uint32_t timeline(uint32_t fence,uint64_t *start,uint64_t *end);
-    /* The client whose submission comes next. A change of client is a context switch: as a6xx_set_pagetable() does whenever the
-     * submitting context differs from the ring's last one, the next framed prologue carries the context entry. Turnip's BR/BV barriers
-     * keep on-chip timestamps and counters that only that entry resets, so clients sharing the ring without it left one client's
-     * counters to the next, and the threads waited on each other for good (int-249..254: BR in a later IB than BV, no fault). */
-    void useContext(uint32_t context) {if(context!=context_) {context_=context;reset_pending_=true;}}
-    /* The GPU page table of the submission that comes next (a process's own table: TTBR0 with its ASID in bits 63:48). A change is
-     * a context switch with a table switch: the next framed prologue carries a6xx_set_pagetable()'s CP_SMMU_TABLE_UPDATE, which the CP
-     * executes after every earlier submission has finished (its CP_WAIT_TIMESTAMP), so each submission runs on its own table. */
-    void useTable(uint64_t ttbr0) {if(ttbr0 && ttbr0!=table_) {table_=ttbr0;table_pending_=true;reset_pending_=true;}}
-    /* What the bank holds now, set by the CPU (bring-up, or a table written while the GPU was idle): no packet is due for it. */
-    void tableInstalled(uint64_t ttbr0) {table_=ttbr0;table_pending_=false;}
-    uint32_t context() const {return context_;}
-    /* After a GPU reset (the board's restart, NativeAdrenoSubmit::recover): programs the ring registers again as attach() does, empties
-     * the ring and sets the memptrs fences to `completed`, as msm's recover_worker advances memptrs->fence past the hung submission. The
-     * next submission gets fence completed + 1 and starts with a context entry; no table switch is pending (the caller installs one).
-     * Clears poison. The CP must be halted or reset. */
-    IOReturn restart(uint32_t completed);
-    /* The same for a secondary ring, after the GPU restart programmed the first one: no register is written, the ring is emptied and
-     * its numbering continues at `completed`; its write pointer waits for the switch that brings the CP back. */
-    IOReturn restartSecondary(uint32_t completed);
-    /* The fence value the CP last wrote, read even when the ring is poisoned (the recovery's starting point). */
-    IOReturn fenceValue(uint32_t *value);
-    /* Words without a timestamp fence, for the restart's CP init and secure-mode packets (a7xx_cp_init and a6xx_hw_init send theirs
-     * outside any submission and wait with a6xx_idle); no fence number is used, so the replayed submissions keep theirs. */
-    IOReturn submitUnfenced(const uint32_t *words,size_t word_count);
-    /* a6xx_idle: the CP read every ring word (RPTR == WPTR), then RBBM_STATUS GPU_BUSY_IGN_AHB clear. */
-    IOReturn idle(const NativeAdrenoRingClock *,uint32_t timeout_us);
-    /* a6xx_progress's CP state: IB1 base (lo, hi), IB2 base (lo, hi), IB1 remaining and IB2 remaining dwords, each remaining count plus
-     * what the ROQ fetched but the SQE has not consumed (CP_ROQ_AVAIL_IB1/IB2 bits 31:16). */
-    IOReturn progressState(uint32_t out[6]);
-    /* a6xx_bus_clear_pending_transactions(gx_off): with gx_off the GX side of GBIF first (RBBM_GBIF_HALT), then new client requests and
-     * all AXI requests, each until acknowledged (spin_until: bounded here by `spins` reads), then the halt cleared. */
-    IOReturn busHalt(bool gx_off,unsigned spins);
-    uint64_t table() const {return table_;}
-    bool tablePending() const {return table_pending_;}
     /* Polls the CP-written timestamp after invalidating the fence page. Never
      * writes registers and never advances the ring. Timeout is not poison. */
     NativeAdrenoRingFence wait(uint32_t fence,const NativeAdrenoRingClock *,
@@ -196,26 +124,13 @@ public:
      * this ring issued are accepted. Never writes a register. */
     NativeAdrenoRingFence observeFence(uint32_t fence,const NativeAdrenoRingClock *,
         uint32_t timeout_us,uint32_t *observed);
-    /* Reads the CP's state for a fence that stopped advancing into out[NativeAdrenoRingStallWords]: RBBM_STATUS..STATUS3,
-     * RBBM_INT_0_STATUS, CP_HW_FAULT, CP_STATUS_1, CP_PROTECT_STATUS, CP_RB_RPTR, CP_RB_WPTR, CP_IB1_BASE (lo, hi),
-     * CP_IB1_REM_SIZE, CP_IB2_BASE (lo, hi), CP_IB2_REM_SIZE, CP_BV_RB_RPTR, CP_BV_IB1_BASE lo, CP_BV_IB1_REM_SIZE,
-     * CP_BV_IB2_REM_SIZE. Never writes a register; a failed read is poison. */
-    IOReturn stallState(uint32_t *out);
-    /* Writes CP_RB_WPTR again with the value already published: for a CP that went idle with work in the ring (a lost write pointer
-     * notification); harmless when the CP already saw it. */
-    IOReturn kick();
-    /* a6xx_bus_clear_pending_transactions without the GX side: GBIF client requests halted, then all AXI requests, each until its
-     * acknowledge or a bounded spin, then the halt cleared. ack[0] and ack[1] are the acknowledge words (bit 0 client, bit 1 arbiter). */
-    IOReturn drainBus(uint32_t *ack);
-    /* The CP_INDIRECT_BUFFER packet that ends just before ring index rptr (what a thread whose read pointer is rptr executes): its GPU
-     * address and size in dwords. kIOReturnUnsupported when the words there are not that packet. */
-    IOReturn ibBefore(uint32_t rptr,uint64_t *iova,uint32_t *dwords) const;
     bool poisoned() const {return poisoned_;}
-    uint32_t outstanding() const {return seqno_-completed_;}
+    /* A fatal GPU fault prevents further WPTR updates and retains live DMA. */
+    void recordFault() {poisoned_=true;}
+    uint32_t outstanding() const {return seqno_-completed_+(bootstrap_pending_?1:0);}
     uint32_t lastSubmitted() const {return seqno_;}      /* the newest fence number handed out */
     uint32_t completedFence() const {return completed_;}
     uint32_t submissions() const {return submissions_;}
     uint32_t readPointer() const {return rptr_shadow_;}
-    uint32_t writePointer() const {return next_;}
 };
 #endif

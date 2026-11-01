@@ -2,7 +2,8 @@
 #include "NativeAdrenoSmmuContext.h"
 #include <IOKit/IOLib.h>
 IOReturn NativeAdrenoSmmuContext::prepare(NativeAdrenoTablePages *tables,unsigned upper,uint64_t iova,
-    uint64_t bytes,size_t leaf_budget,unsigned bank,unsigned asid,unsigned poll_budget,unsigned output_bits,unsigned input_bits)
+    uint64_t bytes,size_t leaf_budget,unsigned bank,unsigned asid,unsigned poll_budget,unsigned output_bits,unsigned input_bits,
+    bool continueAfterFault)
 {
     if(prepared_ || poisoned_)return kIOReturnBusy;
     if(!tables || upper>1 || !bytes || (iova&4095) || !leaf_budget || input_bits<32 || input_bits>48 ||
@@ -11,10 +12,13 @@ IOReturn NativeAdrenoSmmuContext::prepare(NativeAdrenoTablePages *tables,unsigne
     const IOReturn prepared=NativeAdrenoPrepareSmmuMemory(tables,input_bits,output_bits,iova,bytes,upper,leaf_budget,
         &arena_,&state_,&visibility_);
     if(prepared!=kIOReturnSuccess)return prepared==kIOReturnNoResources?prepared:kIOReturnBadArgument;
-    /* The adreno SMMU node is dma-coherent at the pinned tree, so table walks are inner write-back. */
+    /* SM7325 uses coherent outer-shareable walks and the stock transaction
+     * shareability overrides for GPU and GMU streams. */
     config_=(ArmSmmu4KContextConfig){.lower=upper?nullptr:&arena_.config,.upper=upper?&arena_.config:nullptr,
         .lower_tables=upper?nullptr:&state_.tables,.upper_tables=upper?&state_.tables:nullptr,.id0=0,.id2=0,
-        .asid=asid,.coherent_walk=1,.stall_on_fault=0,.continue_after_fault=1};
+        .asid=asid,.coherent_walk=1,.stall_on_fault=0,.continue_after_fault=unsigned(continueAfterFault),
+        .ttbr0_switched=0,.stream_shareability=ArmSmmu4KShareabilityNonShareable,
+        .bypass_shareability=ArmSmmu4KShareabilityNonShareable};
     tables_=tables;bank_=bank;poll_budget_=poll_budget;prepared_=true;
     return kIOReturnSuccess;
 }
@@ -25,6 +29,20 @@ IOReturn NativeAdrenoSmmuContext::program(const ArmSmmu4KIo *io)
         poll_budget_,&program_);
     program_status_=status;
     if(status!=ArmSmmu4KSuccess) {poisoned_=true;return kIOReturnIOError;}
+    const size_t actlrOffset=size_t(program_.context_offset)+4;
+    if(io->write32(io->cookie,actlrOffset,0x32b) || io->barrier(io->cookie) ||
+        io->read32(io->cookie,actlrOffset,&actlr_)) {
+        actlr_status_=ArmSmmu4KIoError;
+    } else if(actlr_!=0x32b) {
+        actlr_status_=ArmSmmu4KStateMismatch;
+    } else {
+        ArmSmmu4KProgramResult sync{};
+        actlr_status_=ArmSmmu4KSyncContextTlb(io,program_.context_offset,config_.asid,1,poll_budget_,&sync);
+    }
+    if(actlr_status_!=ArmSmmu4KSuccess) {
+        poisoned_=true;
+        return kIOReturnIOError;
+    }
     io_=*io;programmed_=true;
     return kIOReturnSuccess;
 }

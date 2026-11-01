@@ -25,6 +25,8 @@ class NativeAdrenoSmmuContext final {
     unsigned bank_=0,poll_budget_=0;
     ArmSmmu4KStatus program_status_=ArmSmmu4KSuccess,attach_status_=ArmSmmu4KSuccess;
     bool prepared_=false,programmed_=false,attached_=false,poisoned_=false;
+    uint32_t actlr_=0;
+    ArmSmmu4KStatus actlr_status_=ArmSmmu4KSuccess;
 public:
     NativeAdrenoSmmuContext()=default;
     ~NativeAdrenoSmmuContext()=default;
@@ -34,7 +36,8 @@ public:
      * input_bits: the region's input size (NativeAdrenoSmmuInputBits of ID2); output_bits: the context's output size, at most the
      * SMMU's ID2.OAS (Linux uses OAS for stage 1). tables must be empty: prepare takes the root from them. */
     IOReturn prepare(NativeAdrenoTablePages *tables,unsigned upper,uint64_t iova,uint64_t bytes,
-        size_t leaf_budget,unsigned bank,unsigned asid,unsigned poll_budget,unsigned output_bits,unsigned input_bits);
+        size_t leaf_budget,unsigned bank,unsigned asid,unsigned poll_budget,unsigned output_bits,unsigned input_bits,
+        bool continueAfterFault=true);
     /* Reads actual IDs, programs and enables exactly this bank. */
     IOReturn program(const ArmSmmu4KIo *);
     /* Attach the caller's exact stream routes to the programmed bank. */
@@ -60,5 +63,7 @@ public:
     /* The kit's own status of the last program/attach, which IOReturn folds into one error. */
     ArmSmmu4KStatus programStatus() const {return program_status_;}
     ArmSmmu4KStatus attachStatus() const {return attach_status_;}
+    uint32_t actlr() const {return actlr_;}
+    ArmSmmu4KStatus actlrStatus() const {return actlr_status_;}
 };
 #endif

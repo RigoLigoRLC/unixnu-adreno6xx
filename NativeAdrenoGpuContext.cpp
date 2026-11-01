@@ -6,12 +6,33 @@
 #include <kern/task.h>
 #include "AdrenoPM4.h"
 
-static const uint64_t kIovas[GpuBufferCount]={GpuSqeIova,GpuRingIova,GpuMemptrsIova,GpuPwrupIova,GpuScratchIova,
-    GpuPreemptRecordIova,GpuPreemptRecord1Iova,GpuPreemptSmmuIova,GpuPreemptSmmu1Iova,GpuRing1Iova,GpuMemptrs1Iova};
-static const size_t kBytes[GpuBufferCount]={GpuSqeBytes,GpuRingBytes,GpuPageBytes,GpuPageBytes,GpuPageBytes,
-    GpuPreemptRecordBytes,GpuPreemptRecordBytes,GpuPageBytes,GpuPageBytes,GpuRingBytes,GpuPageBytes};
+static const uint64_t kIovas[GpuBufferCount]={GpuSqeIova,GpuRingIova,GpuMemptrsIova,GpuPwrupIova,GpuScratchIova};
+static const size_t kBytes[GpuBufferCount]={GpuSqeBytes,GpuRingBytes,GpuPageBytes,GpuPageBytes,GpuPageBytes};
+static const unsigned kPermissions[GpuBufferCount]={
+    ArmSmmu4KRead|ArmSmmu4KExecute,
+    ArmSmmu4KRead|ArmSmmu4KPrivileged,
+    ArmSmmu4KRead|ArmSmmu4KWrite|ArmSmmu4KPrivileged,
+    ArmSmmu4KRead|ArmSmmu4KWrite|ArmSmmu4KPrivileged,
+    ArmSmmu4KRead|ArmSmmu4KWrite
+};
 IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,const unsigned slots[2],
     const uint16_t sids[2],void (*progress)(uint32_t),NativeAdrenoGmuContextReport *report)
+{
+    return initialize(io,bank,asid,slots,sids,progress,report,nullptr);
+}
+
+IOReturn NativeAdrenoGpuContext::bringUpShared(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,
+    const unsigned slots[2],const uint16_t sids[2],NativeAdrenoGpuContext *source,NativeAdrenoGmuContextReport *report)
+{
+    if(!source || source==this || !source->ready()) {
+        return kIOReturnBadArgument;
+    }
+    return initialize(io,bank,asid,slots,sids,nullptr,report,source);
+}
+
+IOReturn NativeAdrenoGpuContext::initialize(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,
+    const unsigned slots[2],const uint16_t sids[2],void (*progress)(uint32_t),
+    NativeAdrenoGmuContextReport *report,NativeAdrenoGpuContext *shared)
 {
     if(!report)return kIOReturnBadArgument;
     *report={};
@@ -19,6 +40,12 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
     if(!io || !slots || !sids || bank>63 || !asid || asid>0xffff || slots[0]>127 || slots[1]>127 ||
         slots[0]==slots[1])return kIOReturnBadArgument;
     used_=true;kernel_asid_=asid;
+    shared_=shared;
+    report->bank=bank;
+    report->asid=asid;
+    report->stream_count=2;
+    report->streams[0]={slots[0],sids[0]};
+    report->streams[1]={slots[1],sids[1]};
     IOReturn status=kIOReturnSuccess;
     auto step=[&](Step s) {report->step=s;if(progress)progress(s);};
     step(Allocate);
@@ -32,12 +59,21 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
         /* Stage-1 input size: smmu->va_size from ID2.UBS (arm_smmu_init_domain_context: ias = smmu->va_size for AArch64 stage 1). */
         input_bits_=NativeAdrenoSmmuInputBits(report->id2);
     }
-    for(unsigned i=0;!status && i<GpuBufferCount;++i)
+    for(unsigned i=0;!status && !shared_ && i<GpuBufferCount;++i) {
         status=buffers_[i].allocate(kBytes[i],report->output_bits,true,kBytes[i]);
+    }
     if(!status) {
         step(Prepare);
         const uint64_t aperture=UINT64_C(1)<<input_bits_;
         status=smmu_.prepare(&tables_,0,0,aperture,size_t(aperture/4096),bank,asid,1000,report->output_bits,input_bits_);
+    }
+    if(!status) {
+        step(Ownership);
+        report->ownership_status=ArmSmmu4KCheckFaultedStreams(io,report->streams,
+            report->stream_count,bank,smmu_.configuration()->stream_shareability,&report->ownership);
+        if(report->ownership_status!=ArmSmmu4KSuccess) {
+            status=kIOReturnIOError;
+        }
     }
     if(!status) {
         step(Program);
@@ -59,15 +95,16 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
     if(!status) {
         step(VmAttach);
         NativeAdrenoVmRegion lower={&tables_,smmu_.arenaHandle(),smmu_.stateHandle()};
-        /* 65536 spans: 256 MiB of BOs even when every page is its own span. The Metal runtime pools its memory in 64 MiB blocks,
-         * which XNU rarely finds physically contiguous; one scattered block is 16384 spans (int-070 ran out at 16384). */
-        status=vm_.attach(io,smmu_.configHandle(),smmu_.streamsHandle(),&lower,nullptr,1048576,262144);
+        status=vm_.attach(io,smmu_.configHandle(),smmu_.streamsHandle(),&lower,nullptr,NativeAdrenoVmMaxObjects,262144);
+        if(!status) {
+            status=vm_.enableCachedCoherentImports(0x06030500);
+        }
     }
     if(!status) {
         step(Map);
-        /* adreno_fw_create_bo maps the SQE MSM_BO_GPU_READONLY without NOEXEC; every other kernel BO read/write. */
-        for(unsigned i=0;!status && i<GpuBufferCount;++i)
-            status=vm_.map(&buffers_[i],0,kIovas[i],i?3u:5u,0,2,&handles_[i]);
+        for(unsigned i=0;!status && i<GpuBufferCount;++i) {
+            status=vm_.map(&buffer(i),0,kIovas[i],kPermissions[i],0,2,&handles_[i]);
+        }
         report->spans=uint32_t(vm_.spanCount());
     }
     if(!status) {
@@ -75,9 +112,10 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
         ready_=true;
     }
     report->status=status;
+    NativeAdrenoCaptureSmmuReport(io,&smmu_,report);
     return status;
 }
-extern "C" volatile uint32_t native_adreno_table_switches[8];
+extern "C" {volatile uint32_t native_adreno_table_switches[8];}
 IOReturn NativeAdrenoGpuContext::enableSwitching()
 {
     if(!ready_)return kIOReturnNotReady;
@@ -114,13 +152,19 @@ IOReturn NativeAdrenoGpuContext::createVm(NativeAdrenoProcessVm **out)
         p->state_.detached=1;p->state_.context_offset=smmu_.stateHandle()->context_offset;
         NativeAdrenoVmRegion lower={&p->tables_,&p->arena_,&p->state_};
         p->vm_.keepStreamsOnFailure();
-        status=p->vm_.attach(smmu_.ioHandle(),&p->config_,smmu_.streamsHandle(),&lower,nullptr,1048576,262144);
+        status=p->vm_.shareResources(&vm_);
+        if(!status) {
+            status=p->vm_.attach(smmu_.ioHandle(),&p->config_,smmu_.streamsHandle(),&lower,nullptr,NativeAdrenoVmMaxObjects,262144);
+        }
         if(status)native_adreno_table_switches[7]=0x30|uint32_t(p->vm_.lastResult().operation)<<8;
-        if(!status)p->attached_=true;
+        if(!status) {
+            p->attached_=true;
+            status=p->vm_.enableCachedCoherentImports(0x06030500);
+        }
     }
     for(unsigned i=0;!status && i<GpuBufferCount;++i) {
         native_adreno_table_switches[7]=4+i;
-        status=p->vm_.map(&buffers_[i],0,kIovas[i],i?3u:5u,0,2,&p->handles_[i]);
+        status=p->vm_.map(&buffer(i),0,kIovas[i],kPermissions[i],0,2,&p->handles_[i]);
     }
     if(status) {
         native_adreno_table_switches[6]=uint32_t(status);
