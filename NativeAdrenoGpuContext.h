@@ -3,35 +3,21 @@
 #define NATIVE_ADRENO_GPU_CONTEXT_H
 #include "NativeAdrenoGmuContext.h"
 
-/* The GPU's own SMMU context, built like the GMU's (NativeAdrenoGmuContext): a native4K lower-region (TTBR0) table
- * for a 0..2^ias GPU space (ias: the bank's input size from ID2.UBS, NativeAdrenoSmmuInputBits), its pages taken on demand, one context bank, the GPU's two streams routed to it, then the kernel buffers the
- * command processor needs at fixed GPU addresses below the A740 GMEM window (UCHE_GMEM_RANGE_MIN 16 MiB):
- *   sqe      the SQE microcode (a740_sqe.fw without its first dword, as adreno_fw_create_bo copies it), R+X
- *   ring     ring buffer 0, 32 KiB, aligned to its size, R+W
- *   memptrs  msm_rbmemptrs layout: +0 rptr, +4 fence, +8 bv_rptr, +12 bv_fence, R+W
- *   pwrup    the a7xx power-up register list (cpu_gpu_lock header + pairs), R+W
- *   scratch  one page the first submissions may write, R+W
- * All mappings are Normal non-cacheable (Linux maps kernel BOs write-combined) and outer shareable; the CPU must use
- * a matching non-cacheable view. Bank, ASID, SMR slots and stream IDs are caller inputs. Nothing is torn down. */
+/* NativeAdrenoGpuContext owns the A642L GPU context bank, kernel buffers and
+ * per-process page tables. The board supplies bank, ASID and stream routes.
+ * Tables allocate 4 KiB WB pages on demand; CPU and GPU buffer views use
+ * coherent WB mappings. Process tables retain the same privileged ring,
+ * firmware and fence mappings while each client owns its address space. */
 enum : uint64_t {
     GpuSqeIova=0x100000, GpuRingIova=0x200000, GpuMemptrsIova=0x300000, GpuPwrupIova=0x301000,
     GpuScratchIova=0x302000,
-    /* The two rings' CP preemption state (NativeAdrenoPreempt): a record per ring of PREEMPT_RECORD_SIZE (4192 KiB, what the CP
-     * writes its save area into; msm's PREEMPT_RECORD_SIZE) and the a7xx_cp_smmu_info page its switch reads, then the second
-     * ring and its memptrs. */
-    GpuPreemptRecordIova=0x10000000, GpuPreemptRecord1Iova=0x10000000+0x418000,
-    GpuPreemptSmmuIova=0x20000000, GpuPreemptSmmu1Iova=0x20001000,
-    GpuRing1Iova=0x30000000, GpuMemptrs1Iova=0x30008000,
     /* Where every process's own buffers start, as msm's per-process VM (adreno_gpu.h ADRENO_VM_START), above the kernel buffers and
      * the GMEM window; the window ends at 2^ias (adreno_private_vm_size: BIT(ias) - ADRENO_VM_START). */
     GpuClientVaStart=0x100000000
 };
 enum : size_t {
     GpuSqeBytes=0x13000, GpuRingBytes=0x8000, GpuPageBytes=0x1000,
-    /* PREEMPT_RECORD_SIZE(adreno_gpu) = info->preempt_record_size, 4192 KiB where the catalog has none (a6xx_gpu.h); the CP stores
-     * its save area in it, so the size is the firmware's, not ours. */
-    GpuPreemptRecordBytes=4192*1024,
-    GpuBufferCount=11
+    GpuBufferCount=5
 };
 struct NativeAdrenoGpuBuffer {uint64_t physical,bytes,iova;};
 /* One GPU process's own address space: a table of the kernel table's shape (the same 0..2^ias aperture and attributes) under its
@@ -60,20 +46,31 @@ class NativeAdrenoGpuContext final {
     uint64_t handles_[GpuBufferCount]{};
     NativeAdrenoSmmuContext smmu_;
     NativeAdrenoVm vm_;
+    NativeAdrenoGpuContext *shared_=nullptr;
     unsigned input_bits_=0;
     bool ready_=false,used_=false;
 public:
-    enum Step : uint32_t {Allocate=1,Prepare,Program,Attach,VmAttach,Map,Ready};
+    enum Step : uint32_t {Allocate=1,Prepare,Program,Attach,VmAttach,Map,Ready,Ownership};
     NativeAdrenoGpuContext()=default;
     NativeAdrenoGpuContext(const NativeAdrenoGpuContext &)=delete;
     NativeAdrenoGpuContext &operator=(const NativeAdrenoGpuContext &)=delete;
     /* The report is the GMU context's: route counts cover both streams. */
     IOReturn bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,const unsigned slots[2],
         const uint16_t sids[2],void (*progress)(uint32_t step),NativeAdrenoGmuContextReport *report);
+    IOReturn bringUpShared(const ArmSmmu4KIo *,unsigned bank,unsigned asid,
+        const unsigned slots[2],const uint16_t sids[2],NativeAdrenoGpuContext *,NativeAdrenoGmuContextReport *);
     bool ready() const {return ready_;}
     /* The GPU address size of every table of this bank (ias). */
     unsigned inputBits() const {return input_bits_;}
-    const NativeAdrenoMemory &buffer(unsigned index) const {return buffers_[index];}
+    uint64_t clientVaStart() const {
+        return input_bits_>32?GpuClientVaStart:UINT64_C(0x20000000);
+    }
+    NativeAdrenoMemory &buffer(unsigned index) {
+        return shared_?shared_->buffer(index):buffers_[index];
+    }
+    const NativeAdrenoMemory &buffer(unsigned index) const {
+        return shared_?shared_->buffer(index):buffers_[index];
+    }
     NativeAdrenoVm *vm() {return ready_?&vm_:nullptr;}
     /* From now on the bank's TTBR0 may hold a process table: the kernel table's updates stop comparing the bank's TTBR0 with it. */
     IOReturn enableSwitching();
@@ -81,7 +78,7 @@ public:
     IOReturn writeTtbr0(uint64_t ttbr0);
     /* A new process address space (ASIDs 16..65535: the kernel's is the bring-up input); null when memory or ASIDs ran out. */
     IOReturn createVm(NativeAdrenoProcessVm **out);
-    /* Only with every BO unmapped, the GPU idle and the table not installed (NativeAdrenoSubmit::forgetVm): drops its TLB entries, frees
+    /* Only with every BO unmapped and the kernel-table fence complete (NativeAdrenoSubmit::retireVm): drops its TLB entries, frees
      * the table and the ASID. A failure keeps the object (and its memory) for good. */
     IOReturn destroyVm(NativeAdrenoProcessVm *);
     uint32_t liveVms() const {return live_vms_;}
@@ -99,6 +96,8 @@ public:
     /* A one-dword indirect buffer (CP_NOP) in the scratch page of p's address space, for the CP table-switch check. */
     IOReturn probeBuffer(NativeAdrenoProcessVm *p,uint64_t *handle,uint64_t *iova,size_t *bytes);
 private:
+    IOReturn initialize(const ArmSmmu4KIo *,unsigned,unsigned,const unsigned[2],
+        const uint16_t[2],void (*)(uint32_t),NativeAdrenoGmuContextReport *,NativeAdrenoGpuContext *);
     uint64_t asids_[1024]{};   /* bit n: ASID n in use */
     uint32_t live_vms_=0;
     unsigned kernel_asid_=0;

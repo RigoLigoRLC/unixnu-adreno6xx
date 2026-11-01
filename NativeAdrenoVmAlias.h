@@ -26,7 +26,10 @@ template<class Range> class NativeAdrenoPhysicalIndex final {
         }
     }
 public:
-    NativeAdrenoPhysicalIndex(const Range *ranges,uint32_t *order,size_t count):ranges_(ranges),order_(order),count_(count) {
+    NativeAdrenoPhysicalIndex(const Range *ranges,uint32_t *order,size_t count,bool sorted=false):ranges_(ranges),order_(order),count_(count) {
+        if(sorted) {
+            return;
+        }
         for(size_t i=count/2;i-->0;)sift(i,count);
         for(size_t n=count;n>1;) {--n;uint32_t t=order_[0];order_[0]=order_[n];order_[n]=t;sift(0,n);}
         /* Discard an interval contained by an earlier interval. The remaining
@@ -39,10 +42,30 @@ public:
         }
         count_=kept;
     }
+    size_t count() const {
+        return count_;
+    }
     bool overlaps(uint64_t physical,uint64_t bytes) const {
         size_t lo=0,hi=count_;
         while(lo<hi) {size_t mid=lo+(hi-lo)/2;if(end(order_[mid])<=physical)lo=mid+1;else hi=mid;}
         return lo<count_ && ranges_[order_[lo]].physical<physical+bytes;
+    }
+    bool conflictingCache(uint64_t physical,uint64_t bytes,unsigned writeback) const {
+        size_t lo=0,hi=count_;
+        while(lo<hi) {
+            const size_t mid=lo+(hi-lo)/2;
+            if(end(order_[mid])<=physical) {
+                lo=mid+1;
+            } else {
+                hi=mid;
+            }
+        }
+        for(size_t at=lo;at<count_ && ranges_[order_[at]].physical<physical+bytes;++at) {
+            if(ranges_[order_[at]].writeback!=writeback) {
+                return true;
+            }
+        }
+        return false;
     }
 };
 #endif

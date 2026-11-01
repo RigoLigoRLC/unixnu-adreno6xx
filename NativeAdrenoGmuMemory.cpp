@@ -27,8 +27,10 @@ IOReturn NativeAdrenoGmuAllocator::allocate(const NativeAdrenoGmuSizes &sizes,un
         {&log_,sizes.log,&layout_.log_iova,GmuUncachedBase+sizes.dummy},
         {&hfi_,sizes.hfi,&layout_.hfi_iova,GmuUncachedBase+sizes.dummy+sizes.log}};
     for(const Selection &selection:selections) {
-        const IOReturn status=selection.memory->allocate(static_cast<size_t>(selection.bytes),
-            address_bits,true,static_cast<size_t>(selection.bytes));
+        IOLog("NativeAdrenoGmuMemory: allocate iova=%llx bytes=%llx\n",
+            selection.at,selection.bytes);
+        IOReturn status=selection.memory->allocate(static_cast<size_t>(selection.bytes),
+            address_bits,true,static_cast<size_t>(selection.bytes),false,false,true);
         if(status) {
             (void)releaseAll();
             return status;

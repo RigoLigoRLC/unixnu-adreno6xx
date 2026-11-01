@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #ifndef NATIVE_ADRENO_KERNEL_TIME_H
 #define NATIVE_ADRENO_KERNEL_TIME_H
-#include "NativeAdrenoGmuPlatform.h"
+#include <stdint.h>
 
 /* Real kernel time for the GMU startup: monotonic microseconds from
  * mach_absolute_time and a bounded busy wait. This is the only production

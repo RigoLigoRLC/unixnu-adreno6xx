@@ -11,7 +11,9 @@
  * debug and log buffers, HFI queues, plus the native4K table pages that will
  * translate them (taken on demand, no IOVA). Sizes are the ones the qualified GMU startup uses. All
  * objects are physically contiguous and page aligned; the allocator only
- * assigns addresses and never maps them or touches the SMMU. Any failure
+ * assigns addresses and sets payload CPU mappings non-cacheable before any
+ * VM reference is acquired. The page-table allocation keeps its cacheable CPU
+ * mapping and uses coherent SMMU table walks with store barriers. Any allocation failure
  * releases what it allocated and leaves no layout. */
 enum : uint64_t {
     GmuIcacheIova=0x4000, GmuUncachedBase=0x60000000, GmuDebugIova=0x60400000,

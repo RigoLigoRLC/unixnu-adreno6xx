@@ -4,10 +4,9 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <kern/task.h>
 #include <string.h>
-/* The GPU SMMU walks its tables coherently (sm8550.dtsi: dma-coherent; Linux then cleans no descriptor): once the board proved it
- * (GpuPowerProbe coherenceProbe), a changed table page needs its stores ordered before the walk, not cleaned. [0] proved, [1] pages
- * published by ordering alone, [2] pages cleaned. */
-extern "C" {volatile uint32_t native_adreno_walk_coherent[3];}
+/* SM7325 GPU and GMU SMMUs read WB table pages through coherent walks.
+ * Counters record enabled coherence, ordered publications and cache cleans. */
+extern "C" {volatile uint32_t native_adreno_walk_coherent[3]={1,0,0};}
 /* Table pages of every GPU address space: [0] live, [1] taken, [2] freed, [3] refused by the system. */
 extern "C" {volatile uint32_t native_adreno_table_pages[4];}
 unsigned NativeAdrenoSmmuInputBits(uint32_t id2)
@@ -101,16 +100,13 @@ IOReturn NativeAdrenoTablePages::release()
 }
 static int publishTable(void *cookie,volatile uint64_t *page,size_t bytes)
 {
-    if(native_adreno_walk_coherent[0]) {
-        __asm__ volatile("dsb st":::"memory");
-        native_adreno_walk_coherent[1]=native_adreno_walk_coherent[1]+1;
-        return 0;
-    }
-    native_adreno_walk_coherent[2]=native_adreno_walk_coherent[2]+1;
     auto *pages=static_cast<NativeAdrenoTablePages *>(cookie);
-    if(!pages || !page || bytes!=4096 || ((uintptr_t)page&4095) || !pages->contains(page))return 1;
-    NativeAdrenoNotePhase(NativeAdrenoPhaseTable,bytes);
-    return NativeAdrenoMaintainOwnedPages(const_cast<uint64_t *>(page),bytes,NativeAdrenoClean)==kIOReturnSuccess?0:1;
+    if(!pages || pages->quarantined() || !page || bytes!=4096 || ((uintptr_t)page&4095)) {
+        return 1;
+    }
+    __asm__ volatile("dsb st":::"memory");
+    native_adreno_walk_coherent[1]=native_adreno_walk_coherent[1]+1;
+    return 0;
 }
 IOReturn NativeAdrenoBindSmmuVisibility(NativeAdrenoTablePages *pages,ArmSmmu4KLiveVisibility *visibility)
 {
