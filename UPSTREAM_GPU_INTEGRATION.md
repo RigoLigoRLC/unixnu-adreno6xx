@@ -31,8 +31,11 @@ ABI v1 selectors 1 through 42 retain their layout. SetPriority is selector 43
 with two uint32 fields, foreground and background. Note is selector 44 with
 kind, count and 30 uint32 words; pass kind is 1 and pipeline kind is 2. Each
 kind retains 512 rows. Query flags add OwnedCoherent=64 and MemoryPressure=128.
-The scheduler applies the submitting task's GPU role when selecting priority,
-preserves queue order and promotes ready work waiting 250 ms.
+The scheduler reads the submitting task's effective role and Darwin background
+state through XNU's `proc_get_effective_task_policy`. Background, non-UI,
+throttled and Darwin-background applications select the background priority;
+the other roles select the foreground priority. It preserves queue order and
+promotes ready work waiting 250 ms.
 
 The A642L runtime uses one ring. The upstream optional dual-ring preemption
 controller remains unselected: its A7xx SMMU save record and restore procedure

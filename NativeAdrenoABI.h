@@ -150,7 +150,7 @@ struct NativeAdrenoAbiBoAllocReply {
 };
 /* NativeAdrenoAbiPriority carries the strongest queue priority selected by
  * Metal, using MTLGPUPriority values 0 through 5. The kernel selects foreground
- * or background according to the submitting task's GPU role. */
+ * or background according to the submitting task's effective scheduling policy. */
 struct NativeAdrenoAbiPriority {
     uint32_t foreground;
     uint32_t background;
