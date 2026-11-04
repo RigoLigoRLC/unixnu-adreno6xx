@@ -30,6 +30,7 @@
 #include "NativeAdrenoDisplay.h"
 #include "NativeAdrenoScheduler.h"
 #include "NativeAdrenoGpuProfile.h"
+#include "NativeGpuTrace.inc"
 
 static NativeAdrenoIntegration integration = {};
 extern "C" kmod_info_t g_kernel_kmod_info;
@@ -1465,6 +1466,20 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
 }
 IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size)
 {
+    if(method==NativeGpuTraceMethod) {
+        if(!input || input_size!=sizeof(NativeGpuTraceRecord) || output_size) {
+            return kIOReturnBadArgument;
+        }
+        const auto *record=static_cast<const NativeGpuTraceRecord *>(input);
+        if(record->event!=GpuTraceThread && record->event!=GpuTraceProblem &&
+            record->event!=GpuTraceTurnipPass && record->event!=GpuTraceTurnipGmemSide &&
+            record->event!=GpuTraceTurnipAttachment) {
+            return kIOReturnBadArgument;
+        }
+        const uint32_t caller=uint32_t(proc_selfpid());
+        native_gpu_trace_record(record->event,caller?caller:traceProcessId_,record->value,12);
+        return kIOReturnSuccess;
+    }
     if(method==NativeAdrenoMethodNote) {
         if(!input || input_size!=sizeof(NativeAdrenoAbiNote) || output_size) {
             return kIOReturnBadArgument;
@@ -1812,6 +1827,10 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
         copied.structureInputDescriptor=nullptr;
         arguments=&copied;
     }
+    if(selector==NativeGpuTraceMethod && arguments) {
+        return run(selector,arguments->structureInput,arguments->structureInputSize,
+            arguments->structureOutput,arguments->structureOutputSize);
+    }
     /* One entry per ABI method; sizes are the exact wire records. */
     static const IOExternalMethodDispatch table[]={
         {&action,0,0,0,sizeof(NativeAdrenoAbiParams)},
@@ -2096,6 +2115,35 @@ static uint64_t profileContinuousMicroseconds()
     return nanoseconds / 1000;
 }
 
+extern "C" bool native_adreno_fences_detail(uint32_t *submitted,uint32_t *retired,uint32_t *detail)
+{
+    if(detail) {
+        detail[0]=0;
+        detail[1]=0;
+        detail[2]=0;
+    }
+    if(!g.published || !g.submit || !submitted || !retired) {
+        return false;
+    }
+    if(!IOLockTryLock(g.lock)) {
+        if(detail) {
+            detail[2]=1;
+        }
+        return false;
+    }
+    const bool known=g.submit->fenceProgress(submitted,retired,detail);
+    if(detail) {
+        detail[2]=known?2:3;
+    }
+    IOLockUnlock(g.lock);
+    return known;
+}
+
+extern "C" bool native_adreno_fences(uint32_t *submitted,uint32_t *retired)
+{
+    return native_adreno_fences_detail(submitted,retired,nullptr);
+}
+
 /* Publishes the service once. Everything passed in must outlive the system (the board probe keeps them in statics) and
  * the VM, submit object and ring must already be attached to the live GPU context. The core must not be open. */
 extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit *submit,NativeAdrenoRing *ring,
@@ -2126,7 +2174,13 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
     g.vm=vm;g.submit=submit;g.ring=ring;g.clock=*clock;g.timer=timer;g.info=info;g.input_bits=input_bits;g.output_bits=output_bits;
     g.context=context;
     native_adreno_profile_set_continuous_clock(profileContinuousMicroseconds);
+    gpuTraceInit();
     g.service=service;g.published=true;
+    gpuTraceEvent(GpuTraceConfig,0,1,2,0,input_bits,output_bits,0);
+#ifdef NATIVE_GPU_BUILD_ID
+    const uint64_t build[]={NATIVE_GPU_BUILD_ID};
+    native_gpu_trace_record(GpuTraceBuild,0,build,1);
+#endif
     service->setName("NativeAdrenoGpu");
     service->registerService();
 

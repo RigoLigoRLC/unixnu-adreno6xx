@@ -124,6 +124,9 @@ public:
     /* Wait for an earlier fence without touching job references; a timeout
      * leaves every job and reference exactly as they were. */
     IOReturn observeFence(uint32_t fence,const NativeAdrenoRingClock *,uint32_t timeout_us);
+    /* The caller holds the service lock while reading the single ring's
+     * issued fence and contiguous hardware completion prefix. */
+    bool fenceProgress(uint32_t *submitted,uint32_t *retired,uint32_t *rings=nullptr);
     bool poisoned() const {return poisoned_;}
     size_t outstanding() const;
     NativeAdrenoSubmitStats stats() const {return stats_;}

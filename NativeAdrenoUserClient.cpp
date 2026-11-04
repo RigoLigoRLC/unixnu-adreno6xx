@@ -143,6 +143,7 @@ IOReturn NativeAdrenoUserClient::open(uint32_t abi_version,NativeAdrenoVm *vm,
     free_head_=0;
     live_count_=0;
     vm_=vm;submit_=submit;ring_=ring;input_bits_=input_bits;output_bits_=output_bits;
+    process_id_=uint32_t(proc_selfpid());
     vm_->addClient();
     open_=true;
     queues_[0]={0,true};
@@ -449,10 +450,12 @@ IOReturn NativeAdrenoUserClient::freeBo(const NativeAdrenoAbiBoFree *request)
     returnEntry(*entry);
     return kIOReturnSuccess;
 }
-int32_t NativeAdrenoUserClient::submitPriority() const
+void NativeAdrenoUserClient::updateSchedulerPriority()
 {
-    return int32_t(NativeAdrenoTaskUsesBackgroundPriority()?
-        priority_background_:priority_foreground_);
+    int role=0;
+    const bool background=NativeAdrenoTaskUsesBackgroundPriority(&role)!=0;
+    const int32_t priority=int32_t(background?priority_background_:priority_foreground_);
+    submit_->scheduler()->setOwnerPriority(queue_base_,priority,process_id_,uint32_t(role));
 }
 
 IOReturn NativeAdrenoUserClient::setPriority(uint32_t foreground,uint32_t background)
@@ -465,7 +468,8 @@ IOReturn NativeAdrenoUserClient::setPriority(uint32_t foreground,uint32_t backgr
     }
     priority_foreground_=foreground;
     priority_background_=background;
-    return kIOReturnSuccess;
+    updateSchedulerPriority();
+    return submit_->scheduler()->advance();
 }
 
 IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
@@ -511,7 +515,7 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
     }
     uint32_t fence=0;
     used_=true;
-    submit_->scheduler()->setOwnerPriority(queue_base_,submitPriority());
+    updateSchedulerPriority();
     const IOReturn status=submit_->scheduler()->submitLegacy(
         queue_base_+static_cast<uint32_t>(request->queue),buffers,request->buffer_count,
         submit_resources_,resource_count,NativeAdrenoFallbackLegacySubmit,&fence);
@@ -718,14 +722,14 @@ IOReturn NativeAdrenoUserClient::submitV2(const void *input,size_t input_size,
         const auto *packet=reinterpret_cast<const uint8_t *>(async);
         const auto *waits=reinterpret_cast<const NativeAdrenoAbiSyncPoint *>(packet+async->wait_offset);
         const auto *signals=reinterpret_cast<const NativeAdrenoAbiSyncPoint *>(packet+async->signal_offset);
-        submit_->scheduler()->setOwnerPriority(queue_base_,submitPriority());
+        updateSchedulerPriority();
         const IOReturn result=submit_->scheduler()->accept(queue_base_,queue_base_+uint32_t(header.queue),
             submit_buffers_,header.ib_count,submit_resources_,resource_count,header.fallback_reason,
             waits,async->wait_count,signals,async->signal_count,&reply->fence);
         reply->epoch=submit_->scheduler()->epoch();
         return result;
     }
-    submit_->scheduler()->setOwnerPriority(queue_base_,submitPriority());
+    updateSchedulerPriority();
     const IOReturn result=submit_->scheduler()->submitLegacy(queue_base_+uint32_t(header.queue),
         submit_buffers_,header.ib_count,submit_resources_,resource_count,header.fallback_reason,&fence);
     if(!result) {

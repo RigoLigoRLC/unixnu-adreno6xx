@@ -36,7 +36,22 @@ state through XNU's `proc_get_effective_task_policy` in NativeAdrenoTaskPolicy.c
 NativeAdrenoUserClient uses its C-compatible declaration. Background, non-UI,
 throttled and Darwin-background applications select the background priority;
 the other roles select the foreground priority. It preserves queue order and
-promotes ready work waiting 250 ms.
+promotes ready work waiting 250 ms. Priority updates apply to accepted work
+still waiting in those queues and immediately reconsider runnable queue heads.
+
+The independent trace selector is 0x7102. NativeGpuTrace.h defines its 120-byte
+record and the shared Metal/Turnip event numbers. The
+native-adreno-gpu-trace=1 boot argument enables bounded storage; sheng-gpu-trace
+is also accepted. The service records actual dispatch and completed hardware
+fences with the connection PID, Metal priority and XNU effective task role.
+This trace's retirement event leaves GPU timestamp validity clear: the separate
+A642L hardware capture owns CP/RB timestamps and GMU performance OOB. The
+native_gpu_trace_snapshot entry point copies committed records for the caller's
+export mechanism. No automatic console or disk output is added.
+
+native_adreno_fences_detail exposes the single ring's issued fence and completed
+prefix under a nonblocking service lock. A busy or failed query returns false
+with its reason. DPU presentation continues to use per-surface read reservations.
 
 The A642L runtime uses one ring. The upstream optional dual-ring preemption
 controller remains unselected: its A7xx SMMU save record and restore procedure

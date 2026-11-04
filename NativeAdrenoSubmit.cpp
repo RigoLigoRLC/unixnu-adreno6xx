@@ -1167,6 +1167,24 @@ IOReturn NativeAdrenoSubmit::observeFence(uint32_t fence,const NativeAdrenoRingC
     profileNoteComplete(fence);
     return kIOReturnSuccess;
 }
+bool NativeAdrenoSubmit::fenceProgress(uint32_t *submitted,uint32_t *retired,uint32_t *rings)
+{
+    if(!attached_ || poisoned_ || !submitted || !retired) {
+        return false;
+    }
+    uint32_t done=0;
+    if(ring_->fenceValue(&done)) {
+        return false;
+    }
+
+    *submitted=ring_->lastSubmitted();
+    *retired=done;
+    if(rings) {
+        rings[0]=done;
+        rings[1]=0;
+    }
+    return true;
+}
 IOReturn NativeAdrenoSubmit::wait(uint32_t fence,const NativeAdrenoRingClock *clock,
     uint32_t timeout_us)
 {

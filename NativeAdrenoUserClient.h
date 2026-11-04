@@ -64,7 +64,8 @@ class NativeAdrenoUserClient final {
     bool open_=false;
     bool memory_pressure_=false;
     uint32_t priority_foreground_=1,priority_background_=3;
-    int32_t submitPriority() const;
+    uint32_t process_id_=0;
+    void updateSchedulerPriority();
     Entry *find(uint64_t);
     const Entry *find(uint64_t) const;
     Entry *takeEntry();

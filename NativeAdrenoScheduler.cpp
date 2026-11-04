@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #include "NativeAdrenoScheduler.h"
+#define NATIVE_GPU_TRACE_OPTIONAL
+#include "NativeGpuTrace.h"
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 extern "C" uint64_t (*native_adreno_vm_now_us)(void);
@@ -440,7 +442,10 @@ IOReturn NativeAdrenoScheduler::accept(uint32_t owner, uint32_t queue,
     sample.completion=job->completion;
     sample.acceptedUs=schedulerNow();
     job->acceptedUs=sample.acceptedUs;
-    job->priority=priorities_[queue];
+    job->priority=policies_[queue].rank;
+    job->requestedPriority=policies_[queue].priority;
+    job->process=policies_[queue].process;
+    job->role=policies_[queue].role;
     sample.aliasQueries=queries;
     sample.aliasHits=hits;
     sample.queue=queue;
@@ -528,6 +533,8 @@ void NativeAdrenoScheduler::destroyJob(Job &job, bool completed)
 
 void NativeAdrenoScheduler::finishJob(Job &job)
 {
+    gpuTraceEvent(GpuTraceRetire,job.process,job.hardware,job.queue,0,
+        job.issuedUs,0,0,0,0);
     NativeAdrenoSchedulerSample &sample=samples_[(job.completion-1)%256];
     if(sample.completion==job.completion) {
         sample.completedUs=schedulerNow();
@@ -599,6 +606,10 @@ IOReturn NativeAdrenoScheduler::advance()
                 break;
             }
             submit_->associateGpuProfileCompletion(job.hardware, job.completion);
+            job.issuedUs=schedulerNow();
+            gpuTraceEvent(GpuTraceSubmit,job.process,job.hardware,job.queue,0,
+                job.requestedPriority,job.role,0,0,
+                job.queue/NativeAdrenoAbiMaxQueues,job.issuedUs,job.resourceCount);
             heads_[job.queue] = job.next;
             if (!job.next) {
                 tails_[job.queue] = nullptr;
@@ -607,7 +618,7 @@ IOReturn NativeAdrenoScheduler::advance()
             NativeAdrenoSchedulerSample &sample=samples_[(job.completion-1)%256];
             if(sample.completion==job.completion) {
                 sample.hardware=job.hardware;
-                sample.issuedUs=schedulerNow();
+                sample.issuedUs=job.issuedUs;
             }
         }
     }
@@ -618,12 +629,18 @@ IOReturn NativeAdrenoScheduler::advance()
     return status;
 }
 
-void NativeAdrenoScheduler::setOwnerPriority(uint32_t first,int32_t priority)
+void NativeAdrenoScheduler::setOwnerPriority(uint32_t first,int32_t priority,
+    uint32_t process,uint32_t role)
 {
     static const uint8_t order[6]={1,3,4,5,2,0};
     const uint8_t rank=priority>=0 && priority<6?order[priority]:3;
     for(uint32_t queue=first;queue<256 && queue-first<NativeAdrenoAbiMaxQueues;++queue) {
-        priorities_[queue]=rank;
+        policies_[queue]={rank,priority,process,role};
+        for(Job *job=heads_[queue];job;job=job->next) {
+            job->priority=rank;
+            job->requestedPriority=priority;
+            job->role=role;
+        }
     }
 }
 

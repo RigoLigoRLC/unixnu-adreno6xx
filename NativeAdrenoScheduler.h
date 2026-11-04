@@ -63,7 +63,10 @@ private:
     struct Job {
         uint64_t completion = 0;
         uint64_t acceptedUs = 0;
+        uint64_t issuedUs = 0;
         uint32_t priority = 3;
+        int32_t requestedPriority = -1;
+        uint32_t process = 0, role = 0;
         uint64_t producers = 0, readers = 0;
         uint32_t queue = 0, hardware = 0, fallback = 0;
         NativeAdrenoSubmitBuffer *buffers = nullptr;
@@ -88,7 +91,11 @@ private:
     Sync *syncs_ = nullptr;
     Job jobs_[NativeAdrenoAsyncMaxJobs]{};
     Job *heads_[256]{}, *tails_[256]{};
-    uint8_t priorities_[256]{};
+    struct QueuePolicy {
+        uint32_t rank = 3;
+        int32_t priority = -1;
+        uint32_t process = 0, role = 0;
+    } policies_[256]{};
     NativeAdrenoSurfaceRead *reads_[64]{};
     NativeAdrenoSurfaceBacking *backings_[64]{};
     uint64_t nextCompletion_ = 1, nextSync_ = 1;
@@ -115,7 +122,7 @@ private:
 public:
     IOReturn attach(NativeAdrenoVm *, NativeAdrenoSubmit *, NativeAdrenoRing *);
     IOReturn detach();
-    void setOwnerPriority(uint32_t first,int32_t priority);
+    void setOwnerPriority(uint32_t first,int32_t priority,uint32_t process,uint32_t role);
     IOReturn createSync(uint32_t, const NativeAdrenoAbiSyncCreate &, uint64_t *);
     IOReturn releaseSync(uint32_t, uint64_t);
     IOReturn signalSync(uint32_t, const NativeAdrenoAbiSyncPoint &);

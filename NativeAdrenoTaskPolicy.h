@@ -7,8 +7,9 @@ extern "C" {
 #endif
 
 /* The submitting task's effective role and Darwin background state select
- * the connection's background priority when this function returns nonzero. */
-int NativeAdrenoTaskUsesBackgroundPriority(void);
+ * the connection's background priority when this function returns nonzero.
+ * effectiveRole receives the XNU task role for diagnostic records. */
+int NativeAdrenoTaskUsesBackgroundPriority(int *effectiveRole);
 
 #ifdef __cplusplus
 }
