@@ -1169,15 +1169,20 @@ IOReturn NativeAdrenoSubmit::observeFence(uint32_t fence,const NativeAdrenoRingC
 }
 bool NativeAdrenoSubmit::fenceProgress(uint32_t *submitted,uint32_t *retired,uint32_t *rings)
 {
-    if(!attached_ || poisoned_ || !submitted || !retired) {
+    if(!attached_ || poisoned_ || ring_->poisoned() || !submitted || !retired) {
         return false;
     }
+    const uint32_t issued=ring_->lastSubmitted();
     uint32_t done=0;
-    if(ring_->fenceValue(&done)) {
-        return false;
+    if(issued) {
+        const NativeAdrenoRingFence state=ring_->observeFence(issued,nullptr,0,&done);
+        /* A pending newest fence still supplies the observed completed prefix. */
+        if(state!=NativeAdrenoRingFenceComplete && state!=NativeAdrenoRingFenceTimeout) {
+            return false;
+        }
     }
 
-    *submitted=ring_->lastSubmitted();
+    *submitted=issued;
     *retired=done;
     if(rings) {
         rings[0]=done;
